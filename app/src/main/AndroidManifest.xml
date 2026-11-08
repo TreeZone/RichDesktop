@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Android 11+ 需要它才能列出所有可启动应用 -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- 设置静态壁纸（normal 级权限） -->
+    <uses-permission android:name="android.permission.SET_WALLPAPER" />
+
+    <!-- 「跟随时间」按日落/日出切换：联网查一次当日日落时刻 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 取最后已知位置来算日落（拿不到就退回默认坐标，不影响功能） -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- 以下均为 signature|privileged 级权限：普通安装拿不到，
+         需要放进 priv-app（见 README-权限.md），否则 createVirtualDisplay 会抛 SecurityException -->
+    <uses-permission android:name="android.permission.CAPTURE_VIDEO_OUTPUT" />
+    <uses-permission android:name="android.permission.CAPTURE_SECURE_VIDEO_OUTPUT" />
+    <uses-permission android:name="android.permission.ADD_TRUSTED_DISPLAY" />
+    <uses-permission android:name="android.permission.INJECT_EVENTS" />
+    <uses-permission android:name="android.permission.MANAGE_ACTIVITY_STACKS" />
+    <uses-permission android:name="android.permission.MANAGE_ACTIVITY_TASKS" />
+
+    <!-- 切换深浅色时联动系统夜间模式（signature 级，uid 1000 才有） -->
+    <uses-permission android:name="android.permission.MODIFY_DAY_NIGHT_MODE" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <application
+        android:allowBackup="true"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PipDesk"
+        tools:targetApi="34">
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|uiMode|density"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:theme="@style/Theme.PipDesk"
+            android:windowSoftInputMode="adjustResize">
+            <!-- HOME：装好后可在「设置 → 主屏幕 / 默认应用」里选它当桌面 -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 调试：adb 广播方式向任意 display 注入点击（验证触摸转发链路用） -->
+        <receiver
+            android:name=".DebugTapReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.cz.richdesk.DEBUG_TAP" />
+                <action android:name="com.cz.richdesk.DEBUG_UI" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 关闭画中画时，用它把虚拟屏上的目标应用顶回后台，避免残影 -->
+        <activity
+            android:name=".BlankActivity"
+            android:exported="false"
+            android:theme="@style/Theme.PipDesk.Blank" />
+
+        <!-- 桌面设置：半透明窗 + 壁纸底，整页毛玻璃 -->
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="true"
+            android:label="桌面设置"
+            android:theme="@style/Theme.PipDesk.Settings" />
+    </application>
+
+</manifest>

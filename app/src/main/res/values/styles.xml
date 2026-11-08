@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 界面全部用代码构建（多屏、圆角、图标尺寸都要随配置变化），这里不再声明样式 -->
+</resources>

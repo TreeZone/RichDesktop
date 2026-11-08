@@ -1,0 +1,1236 @@
+package com.cz.richdesk;
+
+import android.app.ActivityManager;
+import android.app.ActivityOptions;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.graphics.SurfaceTexture;
+import android.graphics.drawable.Drawable;
+import android.hardware.display.DisplayManager;
+import android.hardware.display.VirtualDisplay;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
+import android.view.Gravity;
+import android.view.Surface;
+import android.view.TextureView;
+import android.view.View;
+import android.widget.FrameLayout;
+import android.widget.TextView;
+
+import java.util.List;
+
+/**
+ * 一个画中画面板 = 一块虚拟屏 + 一个 TextureView。
+ *
+ * 为什么用 TextureView 而不是 SurfaceView：
+ *   SurfaceView 的画面在单独的图层里，圆角裁切对它无效（会露出黑色直角块），
+ *   而 TextureView 是普通 View，父容器 setClipToOutline(true) 就能精确切圆角，
+ *   空闲时只要把它 alpha 归零即可露出下面的玻璃背景。
+ *   代价是多一次 GPU 合成，对桌面这种静态场景可接受。
+ */
+public class PipPane {
+
+    public interface Callback {
+        void onPaneOpened(PipPane pane, String pkg);
+        void onPaneClosed(PipPane pane);
+        /**
+         * 这个包名是不是还跑在**别的**屏上（按 displayId 排除当前屏）。
+         * 换应用/关闭画中画时要回收旧应用的 task，但如果它同时在另一块屏上跑着，
+         * 就不能动 —— 那会把用户在用的另一块屏一起关掉。
+         */
+        boolean isPkgUsedElsewhere(String pkg, int exceptDisplay);
+    }
+
+    private static final String TAG = "PipDesk";
+    /** DisplayManager.VIRTUAL_DISPLAY_FLAG_TRUSTED（隐藏常量） */
+    private static final int FLAG_TRUSTED = 1 << 10;
+
+    public int index;   // 位置序号：调换顺序时由 PipManager.swap 改写
+    public final FrameLayout root;
+    private final TextureView texture;
+    private final TextView hint;
+    private final TextView loading;
+
+    private final Context app;
+    private final DisplayManager dm;
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final Callback cb;
+
+    private VirtualDisplay vd;
+    private int displayId = -1;
+    /** 虚拟屏当前像素尺寸（触摸坐标换算用） */
+    private int displayW, displayH;
+    private String pkg;
+    private int dpi;
+    private int cornerDp;
+
+    private boolean surfaceReady;
+    private int surfaceW, surfaceH;
+    /** 纹理出帧计数 / 最后一次出帧时刻：画面"冻结"的判断依据（重启日志里带上） */
+    private long frames;
+    private long lastFrameAt;
+    /** 这块屏上当前跑着的应用：换应用时必须清屏，否则旧应用的 task 还留在栈里会串台 */
+    private String livePkg;
+    /** 应用被「全屏打开」搬去主屏了：回到桌面时要搬回本屏继续显示 */
+    private boolean fullscreened;
+    /**
+     * 比例动画中：先不给虚拟屏 resize。
+     * 拖动分隔条时视图尺寸每帧都在变，如果每帧都 resize 虚拟屏，屏内应用会收到
+     * 几十次 config change（疯狂重排，卡顿且观感很糟）。这里改成动画期间只让
+     * TextureView 拉伸预览，动画结束再一次性对齐虚拟屏尺寸。
+     */
+    private boolean deferResize;
+    /** 被折叠隐藏（权重 0）：整块不参与触摸，但虚拟屏与 TextureView 都留着，恢复是热的 */
+    private boolean collapsed;
+
+    public PipPane(Context ctx, int index, int dpi, int cornerDp, Callback cb) {
+        this.app = ctx.getApplicationContext();
+        this.dm = (DisplayManager) app.getSystemService(Context.DISPLAY_SERVICE);
+        this.index = index;
+        this.dpi = dpi;
+        this.cornerDp = cornerDp;
+        this.cb = cb;
+
+        root = new FrameLayout(ctx);
+        root.setBackground(Ui.glass(ctx, cornerDp));
+        Ui.clipRounded(root, cornerDp, ctx);
+        root.setClipChildren(true);
+
+        texture = new TextureView(ctx);
+        texture.setOpaque(false);
+        texture.setAlpha(0f);
+        root.addView(texture, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+        // 兜底：insets 变化（状态栏/导航栏留白变化）后纹理尺寸变了但回调没来，
+        // 虚拟屏就会停留在旧尺寸上，画面被横向压扁。布局后对齐一次。
+        root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            int w = texture.getWidth();
+            int h = texture.getHeight();
+            if (w > 0 && h > 0 && !deferResize && (w != surfaceW || h != surfaceH)) {
+                surfaceW = w;
+                surfaceH = h;
+                android.graphics.SurfaceTexture st = texture.getSurfaceTexture();
+                if (st != null) st.setDefaultBufferSize(w, h);
+                if (vd != null && !resizeDisplay(w, h, dpi)) scheduleRecreate();
+            }
+        });
+
+        hint = new TextView(ctx);
+        hint.setText("轻点选择应用\n也可点 Dock 图标");
+        hint.setGravity(Gravity.CENTER);
+        hint.setTextSize(12);
+        hint.setTextColor(0xB3FFFFFF);
+        hint.setShadowLayer(4, 0, 1, 0x99000000);
+        root.addView(hint, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+
+        loading = new TextView(ctx);
+        loading.setText("正在启动…");
+        loading.setGravity(Gravity.CENTER);
+        loading.setTextSize(12);
+        loading.setTextColor(0xCCFFFFFF);
+        loading.setShadowLayer(4, 0, 1, 0x99000000);
+        loading.setVisibility(View.GONE);
+        root.addView(loading, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+
+        texture.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+            @Override
+            public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) {
+                st.setDefaultBufferSize(Math.max(1, w), Math.max(1, h));
+                surfaceReady = true;
+                surfaceW = w;
+                surfaceH = h;
+                if (pkg != null && vd == null) recreateNow();
+            }
+
+            @Override
+            public void onSurfaceTextureSizeChanged(SurfaceTexture st, int w, int h) {
+                surfaceReady = true;
+                // 比例动画/拖动中：不改 buffer 尺寸，纹理先拉伸（结束由 applyDeferredResize 对齐）
+                if (deferResize) return;
+                st.setDefaultBufferSize(Math.max(1, w), Math.max(1, h));
+                if (w != surfaceW || h != surfaceH) {
+                    surfaceW = w;
+                    surfaceH = h;
+                    // 旋转/分屏：优先原地 resize（等价于设备旋转，应用收到 config change），
+                    // 销毁重建会让屏内应用掉到手机主屏上（不 resize 时才有这个兜底）
+                    if (vd != null && !resizeDisplay(w, h, dpi)) scheduleRecreate();
+                }
+            }
+
+            @Override
+            public boolean onSurfaceTextureDestroyed(SurfaceTexture st) {
+                surfaceReady = false;
+                releaseDisplay();
+                return true;
+            }
+
+            @Override
+            public void onSurfaceTextureUpdated(SurfaceTexture st) {
+                frames++;
+                lastFrameAt = android.os.SystemClock.uptimeMillis();
+            }
+        });
+
+        hideLoading = () -> {
+            loading.setVisibility(View.GONE);
+            hint.setVisibility(pkg == null ? View.VISIBLE : View.GONE);
+            // 有应用在跑 = 内容是不透明的：告诉合成器这一层不透明，可以跳过
+            // 与底下玻璃背景的混合。三块屏都在出帧时这一项能省掉整屏的混合带宽。
+            texture.setOpaque(pkg != null);
+            texture.setAlpha(pkg == null ? 0f : 1f);
+            if (pkg != null && cb != null) cb.onPaneOpened(this, pkg);
+        };
+    }
+
+    public void setCorner(int dp) {
+        cornerDp = dp;
+        root.setBackground(Ui.glass(root.getContext(), dp));
+        Ui.clipRounded(root, dp, root.getContext());
+    }
+
+    /** 深浅色外观变化：玻璃底和提示文字一起换配色 */
+    public void refreshAppearance() {
+        root.setBackground(Ui.glass(root.getContext(), cornerDp));
+        hint.setTextColor(Ui.tintHint());
+        hint.setShadowLayer(4, 0, 1, Ui.shadow());
+        loading.setTextColor(Ui.tintDim());
+        loading.setShadowLayer(4, 0, 1, Ui.shadow());
+    }
+
+    public void setDpi(int dpi) {
+        if (this.dpi == dpi) return;
+        this.dpi = dpi;
+        if (vd != null && !resizeDisplay(surfaceW, surfaceH, dpi)) scheduleRecreate();
+    }
+
+    /**
+     * 比例动画期间冻结虚拟屏 resize（见字段 deferResize 的说明）。
+     * 传 false 表示动画结束：立刻把虚拟屏对齐到纹理的最终尺寸（一次即可）。
+     */
+    public void setDeferResize(boolean defer) {
+        if (defer) {
+            deferResize = true;
+            return;
+        }
+        if (!deferResize) return;
+        deferResize = false;
+        applyDeferredResize();
+    }
+
+    /** 把虚拟屏尺寸对齐到 TextureView 的当前尺寸（比例动画结束后调用） */
+    public void applyDeferredResize() {
+        if (deferResize) return;
+        int w = texture.getWidth();
+        int h = texture.getHeight();
+        if (w <= 0 || h <= 0) return;
+        // 被拖到折叠的那块屏只剩几像素：不要拿这个尺寸去 resize 虚拟屏，
+        // 否则屏内应用会被踢成畸形配置（下次恢复还要重新排版）。留着旧尺寸，恢复时再对齐。
+        int min = Ui.dp(app, 24);
+        if (w < min || h < min) return;
+        if (w == surfaceW && h == surfaceH) return;
+        surfaceW = w;
+        surfaceH = h;
+        SurfaceTexture st = texture.getSurfaceTexture();
+        if (st != null) st.setDefaultBufferSize(w, h);
+        if (vd != null && !resizeDisplay(w, h, dpi)) scheduleRecreate();
+    }
+
+    /**
+     * 折叠（被相邻屏挤掉，权重 0）：整块 alpha 由 PaneBox 归零，这里负责
+     * 「不参与触摸」（否则它那块旧矩形会挡住旁边扩出来的屏 —— 只把 OnTouchListener
+     * 返回 false 是不够的：root 挂了长按监听后 View 自己会把 DOWN 吞掉）。
+     */
+    public void setCollapsed(boolean c) {
+        boolean changed = collapsed != c;
+        collapsed = c;
+        // 每次都重设（幂等）：宿主给 root 挂长按监听时会把 longClickable 又置成 true
+        root.setClickable(!c);
+        root.setLongClickable(!c);
+        if (changed && !c && pkg != null) {
+            hint.setVisibility(View.GONE);
+            texture.setAlpha(1f);
+        }
+    }
+
+    /** 折叠隐藏的屏不吃触摸（否则会挡住旁边那块屏的手势） */
+    public boolean isInteractive() {
+        return !collapsed;
+    }
+
+    public boolean isCollapsed() {
+        return collapsed;
+    }
+
+    /** VirtualDisplay#resize（隐藏 API）：只查一次，别每次布局回调都做一遍反射查找 */
+    private static java.lang.reflect.Method resizeMethod;
+    private static boolean resizeLookupDone;
+
+    /** 就地调整虚拟屏尺寸/密度（VirtualDisplay#resize 是隐藏 API，反射调用） */
+    private boolean resizeDisplay(int w, int h, int density) {
+        if (vd == null || w <= 0 || h <= 0) return false;
+        try {
+            if (!resizeLookupDone) {
+                resizeLookupDone = true;
+                try {
+                    resizeMethod = VirtualDisplay.class
+                            .getDeclaredMethod("resize", int.class, int.class, int.class);
+                    resizeMethod.setAccessible(true);
+                } catch (Throwable ignored) { }
+            }
+            if (resizeMethod == null) return false;
+            resizeMethod.invoke(vd, w, h, density);
+            displayW = w;
+            displayH = h;
+            Log.i(TAG, "pane " + index + " resize -> " + w + "x" + h + " dpi=" + density);
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "VirtualDisplay#resize 不可用，退回重建", t);
+            return false;
+        }
+    }
+
+    public String pkg() {
+        return pkg;
+    }
+
+    public boolean isBusy() {
+        return pkg != null;
+    }
+
+    public int displayId() {
+        return displayId;
+    }
+
+    /** 虚拟屏的像素尺寸（触摸坐标要按它换算） */
+    public int displayWidth() {
+        return displayW;
+    }
+
+    public int displayHeight() {
+        return displayH;
+    }
+
+    /** 面板视图的像素尺寸 */
+    public int viewWidth() {
+        return texture.getWidth();
+    }
+
+    public int viewHeight() {
+        return texture.getHeight();
+    }
+
+    /**
+     * 视图本地坐标 → 虚拟屏像素坐标 的映射矩阵（方向固定 View→VD，可直接传给
+     * TouchBridge.send）。当前是纯缩放（display/view）；将来若对面板施加旋转/
+     * 斜切等仿射，把变换并进这里即可，注入端不用动。
+     * 注意：displayW/H 是 VD 的逻辑宽高（createVirtualDisplay/resize 的 w/h），
+     * 与 SurfaceTexture buffer 分辨率在 resize 瞬间可能短暂不一致。
+     */
+    public android.graphics.Matrix viewToDisplayMatrix() {
+        android.graphics.Matrix m = new android.graphics.Matrix();
+        int vw = viewWidth();
+        int vh = viewHeight();
+        if (vw > 0 && vh > 0 && displayW > 0 && displayH > 0) {
+            m.postScale(displayW / (float) vw, displayH / (float) vh);
+        }
+        return m;
+    }
+
+    /** 延迟重建（旋转后调用；等布局稳定再建，否则拿到的是旧尺寸） */
+    public void postRebuild(long delayMs) {
+        if (pkg == null || !surfaceReady) return;
+        main.removeCallbacks(recreateTask);
+        main.postDelayed(recreateTask, Math.max(0, delayMs));
+    }
+
+    public Drawable background() {
+        return root.getBackground();
+    }
+
+    // ------------------------------------------------------------ 打开 / 关闭
+
+    public void open(String targetPkg) {
+        if (targetPkg == null) return;
+        // 已经在这块屏上跑着：不重建、不重开（否则虚拟屏重建 + 重新拉起，观感是"闪一下又重进"）
+        if (targetPkg.equals(pkg) && vd != null && displayId >= 0) {
+            Log.i(TAG, "pane " + index + " 已在运行 " + targetPkg + "，跳过重建");
+            texture.setOpaque(true);
+            texture.setAlpha(1f);
+            return;
+        }
+        // 兜底：TextureView 已经可用但回调被漏掉（例如先 attach 后注册）
+        if (!surfaceReady && texture.isAvailable()) {
+            surfaceReady = true;
+            surfaceW = Math.max(1, texture.getWidth());
+            surfaceH = Math.max(1, texture.getHeight());
+        }
+        android.util.Log.i("PipDesk", "open pane " + index + " pkg=" + targetPkg
+                + " surfaceReady=" + surfaceReady + " size=" + surfaceW + "x" + surfaceH);
+        pkg = targetPkg;
+        hint.setVisibility(View.GONE);
+        loading.setText("正在启动…");   // 重启应用会把文案改成「正在重启…」，这里复位
+        loading.setVisibility(View.VISIBLE);
+        texture.setOpaque(false);
+        texture.setAlpha(0f);
+        main.removeCallbacks(hideLoading);
+
+        final String stale = livePkg;
+        if (vd != null && displayId >= 0) {
+            if (livePkg == null || livePkg.equals(targetPkg)) {
+                livePkg = targetPkg;
+                launchOn(targetPkg, displayId);
+                ensureOnDisplay(targetPkg, displayId);
+                showContentAfter(450);
+            } else {
+                // 换了应用：**不再销毁重建虚拟屏**（旧方案会黑屏一大截，还会触发
+                // task 被搬去主屏 → 桌面被顶掉 → 又拉回来的连锁反应）。
+                // 直接在同一块屏上拉起新应用：新应用画好第一帧前旧画面仍然显示，
+                // 用户看到的是"旧画面无缝变成新画面"。
+                // 旧应用的 task 会留在栈底，新应用按返回键时才会露出来，可接受。
+                livePkg = targetPkg;
+                launchOn(targetPkg, displayId);
+                ensureOnDisplay(targetPkg, displayId);
+                keepContentVisible();
+                // 但栈底的旧应用不能留着：虚拟屏是 ON 的，系统会一直把它算作
+                // 「可见的 task」，进程留着不放、surface 也占着 —— 换几次应用之后
+                // 三块屏能堆出十几个常驻进程，内存越用越紧（表现就是跑一阵子开始卡）。
+                scheduleReap(stale, 2500);
+            }
+            return;
+        }
+        if (surfaceReady) {
+            createDisplay();
+            if (vd != null && displayId >= 0) {
+                livePkg = targetPkg;
+                launchOn(targetPkg, displayId);
+                ensureOnDisplay(targetPkg, displayId);
+                showContentAfter(450);
+            } else {
+                // 建屏失败：不吞掉，交给上层决定是否全屏兜底
+                failOpen(targetPkg);
+            }
+        }
+        // surface 没就绪会在 onSurfaceTextureAvailable 里补上
+    }
+
+    private void showContentAfter(long ms) {
+        main.postDelayed(hideLoading, ms);
+    }
+
+    /**
+     * 同屏换应用：内容保持可见（不闪 loading、不把纹理变黑），
+     * 只在新应用把 loading 文案/占位清掉之后把回调补上。
+     */
+    private void keepContentVisible() {
+        loading.setVisibility(View.GONE);
+        hint.setVisibility(View.GONE);
+        texture.setOpaque(true);
+        texture.setAlpha(1f);
+        main.removeCallbacks(hideLoading);
+        main.postDelayed(() -> {
+            if (pkg != null && cb != null) cb.onPaneOpened(this, pkg);
+        }, 450);
+    }
+
+    private final Runnable hideLoading;
+
+    private void failOpen(String p) {
+        pkg = null;
+        loading.setVisibility(View.GONE);
+        hint.setVisibility(View.VISIBLE);
+        texture.setAlpha(0f);
+        launchFullScreen(p);
+    }
+
+    public void close() {
+        // 应用正全屏跑在主屏上（罕见：桌面在前台时 onResume 已把标记清掉）：
+        // 只解绑，不 blank 虚拟屏（应用不在本屏，blank 没意义）
+        if (fullscreened) fullscreened = false;
+        String p = pkg;
+        pkg = null;
+        livePkg = null;
+        main.removeCallbacks(hideLoading);
+        loading.setVisibility(View.GONE);
+        hint.setVisibility(View.VISIBLE);
+        texture.setOpaque(false);
+        texture.setAlpha(0f);
+        // 用空白页把目标应用顶回后台（否则它还显示在虚拟屏上）
+        clearDisplayApp(p);
+        // **不销毁虚拟屏**：销毁会把屏内 task 搬去主屏、触发 restoreDesktop 拉回桌面，
+        // 用户看到的就是"桌面闪一下"。屏留着（盖着空白页），下次 open 直接复用，秒开。
+        // 但被关掉的应用的 task 要收掉：否则它会一直留在栈底当"可见 task"常驻内存。
+        scheduleReap(p, 1500);
+        if (cb != null) cb.onPaneClosed(this);
+    }
+
+    /** 释放（Activity 销毁时调用，必须先于 TextureView 销毁） */
+    public void release() {
+        main.removeCallbacksAndMessages(null);
+        releaseDisplay();
+    }
+
+    // ------------------------------------------------------------ 重启应用（卡死急救）
+
+    /**
+     * 重启本屏上的应用。
+     *
+     * 为什么需要它：部分系统应用（车机上实测是系统蓝牙 HMI）在虚拟屏上适配不良，
+     * 跑一段时间后会整体卡死 —— 画面停在最后一帧、触摸注入进去也毫无反应，
+     * 而且**只坏自己这一块屏**，其他画中画正常。这类卡死发生在应用进程内部，
+     * 宿主侧无论怎么重绑 surface 都救不回来；实测唯一可靠的恢复手段是重启该进程。
+     * 系统应用改不了，只能在宿主侧提供这条一键恢复通道（长按菜单 / ANR 自动兜底）。
+     */
+    public void restartApp() {
+        final String p = pkg;
+        if (p == null) {
+            Log.i(TAG, "pane " + index + " 空闲，无需重启");
+            return;
+        }
+        Log.i(TAG, "pane " + index + " 重启应用 " + p + " frames=" + frames
+                + " 距上次出帧=" + (lastFrameAt == 0 ? "从未"
+                : (android.os.SystemClock.uptimeMillis() - lastFrameAt) + "ms"));
+        FileLog.append("RESTART pane=" + index + " pkg=" + p + " frames=" + frames
+                + " lastFrameAgo=" + (lastFrameAt == 0 ? "never"
+                : (android.os.SystemClock.uptimeMillis() - lastFrameAt) + "ms")
+                + " @ " + FileLog.nowStamp());
+        fullscreened = false;   // 重启后应用回到本屏，不再算"全屏中"
+        main.removeCallbacks(hideLoading);
+        loading.setText("正在重启…");
+        loading.setVisibility(View.VISIBLE);
+        hint.setVisibility(View.GONE);
+        texture.setAlpha(0f);
+        relaunchAfterStop(p, 350);
+    }
+
+    /** 先杀掉进程（否则 startActivity 只会把卡死的旧进程顶到前台），再在后台线程重新拉起 */
+    private void relaunchAfterStop(final String p, final long launchDelay) {
+        new Thread(() -> {
+            boolean stopped = forceStop(p);
+            Log.i(TAG, "pane " + index + " force-stop " + p + " ok=" + stopped);
+            main.postDelayed(() -> {
+                if (!p.equals(pkg) || displayId < 0) return;
+                livePkg = p;
+                launchOn(p, displayId);
+                ensureOnDisplay(p, displayId);
+                showContentAfter(800);
+            }, launchDelay);
+        }, "pipdesk-restart").start();
+    }
+
+    /** 反射 forceStopPackage（uid 1000 有 FORCE_STOP_PACKAGES），失败退回 am 命令 */
+    private boolean forceStop(String p) {
+        try {
+            ActivityManager am = (ActivityManager) app.getSystemService(Context.ACTIVITY_SERVICE);
+            java.lang.reflect.Method m = ActivityManager.class
+                    .getMethod("forceStopPackage", String.class);
+            m.invoke(am, p);
+            return true;
+        } catch (Throwable ignored) { }
+        return Shell.runSync("am force-stop " + p);
+    }
+
+    public long frames() {
+        return frames;
+    }
+
+    /**
+     * 虚拟屏当前的电平状态（ON / OFF / DOZE…）。
+     *
+     * 为什么关心它：车机上"点蓝牙播放 → 三块画中画一起冻住、但音乐还在响"，
+     * 一个强假设是 SurfaceFlinger 因为同时存在主屏 + 多块虚拟屏（音频捕获还会
+     * 额外建镜像屏）而停止合成其中几块 —— 那种情况下 display 的 state 会被改成
+     * OFF。日志里 state 从 ON 变 OFF，就等于拿到了"是系统把屏关掉的"直接证据，
+     * 而不是应用自己画不出来。
+     */
+    public String displayState() {
+        if (displayId < 0) return "none";
+        try {
+            android.view.Display d = dm.getDisplay(displayId);
+            if (d == null) return "gone";
+            switch (d.getState()) {
+                case android.view.Display.STATE_ON: return "ON";
+                case android.view.Display.STATE_OFF: return "OFF";
+                case android.view.Display.STATE_DOZE: return "DOZE";
+                case android.view.Display.STATE_DOZE_SUSPEND: return "DOZE_SUSPEND";
+                case android.view.Display.STATE_ON_SUSPEND: return "ON_SUSPEND";
+                case android.view.Display.STATE_UNKNOWN: return "UNKNOWN";
+                default: return "S" + d.getState();
+            }
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
+    /** 应用是不是正被"全屏打开"（在主屏上）：此时本屏只是停着最后一帧，不算卡死 */
+    public boolean isFullscreened() {
+        return fullscreened;
+    }
+
+    // ------------------------------------------------------------ 虚拟屏
+
+    private void createDisplay() {
+        releaseDisplay();
+        if (!surfaceReady) return;
+        SurfaceTexture st = texture.getSurfaceTexture();
+        if (st == null) return;
+        int w = Math.max(1, surfaceW);
+        int h = Math.max(1, surfaceH);
+        Surface surface = new Surface(st);
+        int baseFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
+                | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
+        try {
+            vd = dm.createVirtualDisplay("PipDesk-" + index, w, h, dpi, surface, baseFlags | FLAG_TRUSTED);
+        } catch (Throwable t1) {
+            Log.w(TAG, "trusted display 失败，退回普通屏", t1);
+            try {
+                vd = dm.createVirtualDisplay("PipDesk-" + index, w, h, dpi, surface, baseFlags);
+            } catch (Throwable t2) {
+                Log.w(TAG, "createVirtualDisplay 失败", t2);
+                vd = null;
+            }
+        }
+        // 虚拟屏已持有 producer 引用，本地 Surface 可以立即释放
+        try {
+            surface.release();
+        } catch (Throwable ignored) { }
+        displayId = (vd == null || vd.getDisplay() == null) ? -1 : vd.getDisplay().getDisplayId();
+        displayW = w;
+        displayH = h;
+        Log.i(TAG, "pane " + index + " display=" + displayId + " " + w + "x" + h + " dpi=" + dpi);
+        if (displayId >= 0) ignoreOrientationRequest(displayId);
+    }
+
+    /**
+     * 让这块虚拟屏「忽略应用的方向请求」。
+     *
+     * 竖屏锁定的应用（头条、QQ 这类）在横屏虚拟屏上会被系统 letterbox 成中间
+     * 一条窄带（实测 1176 宽的屏只给 604 宽，两侧全是死区，点了没反应）。
+     * Android 12+ 的 WindowManager 提供 per-display 的 ignoreOrientationRequest，
+     * uid 1000 可以调；调不通就保持系统默认的 letterbox（不影响功能）。
+     */
+    private void ignoreOrientationRequest(int display) {
+        try {
+            Class<?> sm = Class.forName("android.os.ServiceManager");
+            Object binder = sm.getMethod("getService", String.class).invoke(null, "window");
+            Class<?> stub = Class.forName("android.view.IWindowManager$Stub");
+            Object wm = stub.getMethod("asInterface", android.os.IBinder.class).invoke(null, binder);
+            for (java.lang.reflect.Method m : wm.getClass().getMethods()) {
+                if (!"setIgnoreOrientationRequest".equals(m.getName())) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                if (pt.length == 2 && pt[0] == int.class) {   // 只接受 per-display 版本
+                    m.invoke(wm, display, true);
+                    Log.i(TAG, "pane " + index + " 已忽略方向请求 display=" + display);
+                    return;
+                }
+            }
+            Log.i(TAG, "pane " + index + " 无 per-display 忽略方向接口");
+        } catch (Throwable t) {
+            Log.i(TAG, "pane " + index + " 忽略方向请求失败：" + t.getClass().getSimpleName());
+        }
+    }
+
+    private void releaseDisplay() {
+        boolean hadApp = livePkg != null || pkg != null;
+        livePkg = null;
+        boolean released = false;
+        if (vd != null) {
+            try {
+                vd.release();
+                released = true;
+            } catch (Throwable ignored) { }
+            vd = null;
+        }
+        displayId = -1;
+        displayW = displayH = 0;
+        // 屏被销毁后，原本跑在这块屏上的 task 会被系统搬到主屏并顶到最前
+        // （用户看到的就是"画中画没了，应用变成全屏把桌面盖住"）。
+        // 桌面在前台时把桌面重新拉回最前，应用就退回后台，不再抢屏幕。
+        if (hadApp && released) restoreDesktop();
+    }
+
+    /** 把桌面拉回前台。设置页在前台时不抢焦点 */
+    private void restoreDesktop() {
+        // 注意：任务被搬到主屏的瞬间，系统会把桌面 pause 掉（MainActivity.mainResumed 变 false），
+        // 所以这里必须在释放前就把"桌面当时是否在前台"记下来，不能等延迟任务里再判断。
+        if (!AppState.mainResumed) return;
+        for (long delay : new long[]{180, 600}) {
+            main.postDelayed(() -> {
+                try {
+                    // 明确拉自己的桌面（singleTask，只会前置不会重建），
+                    // 用 CATEGORY_HOME 的话会被系统默认桌面接管
+                    Intent h = new Intent(app, MainActivity.class);
+                    h.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    app.startActivity(h);
+                } catch (Throwable t) {
+                    Log.w(TAG, "拉回桌面失败", t);
+                }
+            }, delay);
+        }
+    }
+
+    private final Runnable recreateTask = this::recreateNow;
+
+    private void scheduleRecreate() {
+        main.removeCallbacks(recreateTask);
+        main.postDelayed(recreateTask, 250);
+    }
+
+    private void recreateNow() {
+        final String keep = pkg;
+        clearDisplayApp(keep);
+        // 先把屏内应用压后台 → 释放旧屏 → 建新屏 → 重新拉起，顺序不能交叉
+        main.postDelayed(() -> {
+            releaseDisplay();
+            if (keep == null || !surfaceReady) return;
+            main.postDelayed(() -> {
+                if (!keep.equals(pkg) || !surfaceReady) return;
+                createDisplay();
+                if (displayId >= 0) {
+                    livePkg = keep;
+                    launchOn(keep, displayId);
+                    ensureOnDisplay(keep, displayId);
+                    showContentAfter(450);
+                }
+            }, 120);
+        }, 220);
+    }
+
+    // ------------------------------------------------------------ 启动应用
+
+    private void launchOn(String targetPkg, int display) {
+        Intent i = app.getPackageManager().getLaunchIntentForPackage(targetPkg);
+        if (i == null) return;
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            ActivityOptions o = ActivityOptions.makeBasic();
+            o.setLaunchDisplayId(display);
+            // 注：试过用 freeform（setLaunchBounds + windowingMode=5）消除竖屏应用的
+            // letterbox，结果 MIUI 会把它当成浮动窗口（带黑色装饰边、还把窗口挪到主屏），
+            // 观感更差，已回退。竖屏锁定应用在横屏虚拟屏上被系统 letterbox 是 Android
+            // 的标准行为，内容区之外的窄边不属于应用，点了本来就不会有反应。
+            app.startActivity(i, o.toBundle());
+            return;
+        } catch (Throwable t) {
+            Log.w(TAG, "进程内启动到 display " + display + " 失败，改走 su", t);
+        }
+        ComponentName cn = i.getComponent();
+        if (cn != null) {
+            Shell.run("am start --user 0 --display " + display + " -n " + cn.flattenToString());
+        }
+    }
+
+
+    /**
+     * 兜底校验（需求 7）：个别应用（例如小米指南针，manifest 里标了不可 resize）被启动到虚拟屏后，
+     * 系统的任务分配可能把它的 task 仍落在主屏 —— 表现出来的就是"画中画闪一下，应用跑到全屏"。
+     * 启动 1.2s 后查一次该应用在主屏上的任务；有就搬到本面板的虚拟屏上。
+     * 全程 try/catch：拿不到系统接口（非系统 uid / 高版本改了隐藏接口）时只记日志，不影响正常使用。
+     */
+    private void ensureOnDisplay(final String targetPkg, final int display) {
+        if (display < 0) return;
+        main.postDelayed(() -> {
+            if (!targetPkg.equals(pkg)) return;
+            int taskId = findTaskId(targetPkg);
+            if (taskId >= 0 && taskId != -1 && !taskOnDisplay(taskId, display)) {
+                // moveTask 现在可能绕道 shell（几百 ms），丢后台线程别卡主线程
+                final int fTid = taskId;
+                new Thread(() -> {
+                    if (moveTask(fTid, display)) {
+                        Log.w(TAG, "任务 " + fTid + " 不在 display " + display
+                                + "，已搬回 (" + targetPkg + ")");
+                    }
+                }, "pipdesk-movetask").start();
+            }
+        }, 1200);
+    }
+
+    /**
+     * 找应用当前所在 task 的 id；找不到返回 -1。
+     *
+     * 查找顺序（实测踩坑记录）：
+     *   1) 公共 API ActivityManager.getRunningTasks() —— 本应用 uid 1000 + PRIVILEGED，
+     *      能拿到全部 task（含虚拟屏）。零反射，优先用；
+     *   2) getAllRootTaskInfos()（Android 12+，唯一确定覆盖所有 display 的口）；
+     *   3) getTasks(maxNum)，任意形参数量都接受。
+     *
+     * 【重要】入口 binder 不能用 ActivityTaskManager.getService()：它在这台
+     * HyperOS 的隐藏 API blocklist 上，反射直接 NoSuchMethodException（logcat 里有
+     * "blocked, reflection, denied"）。必须走 ServiceManager + Stub.asInterface，
+     * 这条链路实测可用（IWindowManager 同款写法已经跑通）。
+     */
+    private int findTaskId(String targetPkg) {
+        // 1) 公共 API，无隐藏 API 风险
+        try {
+            ActivityManager am = (ActivityManager) app.getSystemService(Context.ACTIVITY_SERVICE);
+            Integer found = scanTaskInfos(am.getRunningTasks(30), targetPkg);
+            if (found != null) {
+                Log.i(TAG, "findTaskId(" + targetPkg + ")=" + found + " (getRunningTasks)");
+                return found;
+            }
+        } catch (Throwable t) {
+            Log.i(TAG, "getRunningTasks 不可用：" + t.getClass().getSimpleName());
+        }
+        try {
+            Object atm = activityTaskManager();
+            if (atm != null) {
+                Class<?> iface = atm.getClass();   // binder 代理，接口方法在代理类上可查
+                // 2) getAllRootTaskInfos()（Android 12+，返回 ParceledListSlice）
+                for (java.lang.reflect.Method m : iface.getMethods()) {
+                    if ("getAllRootTaskInfos".equals(m.getName())
+                            && m.getParameterTypes().length == 0) {
+                        Integer found = scanTaskInfos(unwrapSlice(invokeQuiet(m, atm)), targetPkg);
+                        if (found != null) {
+                            Log.i(TAG, "findTaskId(" + targetPkg + ")=" + found + " (rootTasks)");
+                            return found;
+                        }
+                    }
+                }
+                // 3) getTasks(maxNum)：老版本签名不定，按第一个 int 形参填 30，其余填默认值
+                for (java.lang.reflect.Method m : iface.getMethods()) {
+                    if (!"getTasks".equals(m.getName())) continue;
+                    Class<?>[] pt = m.getParameterTypes();
+                    if (pt.length < 1 || pt[0] != int.class) continue;
+                    Object[] args = defaultArgs(pt);
+                    args[0] = 30;
+                    Integer found = scanTaskInfos(unwrapSlice(invokeQuiet(m, atm, args)), targetPkg);
+                    if (found != null) {
+                        Log.i(TAG, "findTaskId(" + targetPkg + ")=" + found + " (getTasks)");
+                        return found;
+                    }
+                }
+            }
+            Log.i(TAG, "findTaskId(" + targetPkg + ") 未找到（接口全试过）");
+        } catch (Throwable t) {
+            Log.i(TAG, "查 task 跳过：" + t.getClass().getSimpleName());
+        }
+        return -1;
+    }
+
+    /** ParceledListSlice → List；本来就是 List 就直接用，解不开返回 null */
+    private static List<?> unwrapSlice(Object r) {
+        if (r == null) return null;
+        if (r instanceof List) return (List<?>) r;
+        try {
+            return (List<?>) r.getClass().getMethod("getList").invoke(r);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static Object invokeQuiet(java.lang.reflect.Method m, Object obj, Object... args) {
+        try {
+            return m.invoke(obj, args);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 按形参类型填默认值：int/long → 0，boolean → false，其余 → null */
+    private static Object[] defaultArgs(Class<?>[] pt) {
+        Object[] args = new Object[pt.length];
+        for (int i = 0; i < pt.length; i++) {
+            Class<?> t = pt[i];
+            if (t == int.class || t == long.class || t == short.class || t == byte.class) args[i] = 0;
+            else if (t == boolean.class) args[i] = false;
+            else if (t == float.class) args[i] = 0f;
+            else if (t == double.class) args[i] = 0d;
+            else if (t == char.class) args[i] = (char) 0;
+            else args[i] = null;
+        }
+        return args;
+    }
+
+    /**
+     * 在 task 信息列表里找目标包名。
+     * 命中：topActivity 的包名，或 childTaskNames（根 task 的子任务名，
+     * 形如 "com.xx.app/.ui.MainActivity"）里有该包 —— RootTaskInfo 的
+     * topActivity 经常是 null，childTaskNames 是更稳的字段。
+     * 多个命中时优先**非主屏**的那个（全屏打开要搬的就是虚拟屏上那个）。
+     */
+    private static Integer scanTaskInfos(List<?> tasks, String targetPkg) {
+        if (tasks == null) return null;
+        int fallback = -1;
+        for (Object t : tasks) {
+            if (t == null) continue;
+            Integer tid = intField(t, "taskId");
+            if (tid == null || tid < 0) continue;
+            Integer disp = intField(t, "displayId");
+            boolean hit = false;
+            Object top = objField(t, "topActivity");
+            if (top instanceof ComponentName
+                    && targetPkg.equals(((ComponentName) top).getPackageName())) hit = true;
+            if (!hit) {
+                Object names = objField(t, "childTaskNames");
+                if (names instanceof String[]) {
+                    for (String n : (String[]) names) {
+                        if (n != null && n.startsWith(targetPkg + "/")) { hit = true; break; }
+                    }
+                }
+            }
+            if (!hit) continue;
+            if (disp != null && disp != android.view.Display.DEFAULT_DISPLAY) return tid;
+            if (fallback < 0) fallback = tid;
+        }
+        return fallback >= 0 ? fallback : null;
+    }
+
+    private static Integer intField(Object o, String name) {
+        try {
+            return o.getClass().getField(name).getInt(o);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static Object objField(Object o, String name) {
+        try {
+            return o.getClass().getField(name).get(o);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * 拿系统任务栈服务的 binder 代理（IActivityTaskManager / 老 IActivityManager）。
+     * 返回 null 表示全都没走通。
+     *
+     * 【为什么绕开 ActivityTaskManager.getService()】它在这台 HyperOS（Android 13）
+     * 的隐藏 API blocklist 上，反射直接被拒（NoSuchMethodException）。而
+     * ServiceManager.getService + Stub.asInterface 这条链路不被拦 —— IWindowManager
+     * 同款写法已在 setIgnoreOrientationRequest 里跑通。
+     */
+    private static Object activityTaskManager() {
+        try {
+            Class<?> sm = Class.forName("android.os.ServiceManager");
+            java.lang.reflect.Method getService = sm.getMethod("getService", String.class);
+            // 12+ 服务名叫 "activity_task"，老版本叫 "activity"；接口对应两个 Stub
+            String[] services = {"activity_task", "activity"};
+            String[] stubs = {"android.app.IActivityTaskManager$Stub",
+                    "android.app.IActivityManager$Stub"};
+            for (String s : services) {
+                Object b = invokeQuiet(getService, null, s);
+                if (b == null) continue;
+                for (String st : stubs) {
+                    try {
+                        Object atm = Class.forName(st)
+                                .getMethod("asInterface", android.os.IBinder.class)
+                                .invoke(null, b);
+                        if (atm != null) return atm;
+                    } catch (Throwable ignored) { }
+                }
+            }
+        } catch (Throwable t) {
+            Log.i(TAG, "binder 入口不可用：" + t.getClass().getSimpleName());
+        }
+        // 兜底：老入口（部分版本可行；被 blocklist 拦就返回 null）
+        try {
+            return Class.forName("android.app.ActivityTaskManager")
+                    .getMethod("getService").invoke(null);
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    private static boolean taskOnDisplay(int taskId, int display) {
+        try {
+            Object atm = activityTaskManager();
+            if (atm == null) return true;   // 拿不到服务就别乱搬
+            for (java.lang.reflect.Method m : atm.getClass().getMethods()) {
+                if (!"getTaskForTaskId".equals(m.getName())) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                if (pt.length == 1 && pt[0] == int.class) {
+                    Object task = invokeQuiet(m, atm, taskId);
+                    if (task == null) return true;
+                    Integer disp = intField(task, "displayId");
+                    return disp == null || disp == display;
+                }
+            }
+            return true;   // 接口不在，别乱搬
+        } catch (Throwable t) {
+            return true;   // 查不到就别乱搬
+        }
+    }
+
+    /**
+     * 把 task 搬到指定 display。moveTaskToDisplay 的形参在不同版本不一样：
+     * 新版本是 (taskId, displayId, moveHomeAlongside)，老版本只有 (taskId, displayId)，
+     * 两种都试，哪个匹配用哪个。
+     */
+    private static boolean moveTask(int taskId, int display) {
+        try {
+            Object atm = activityTaskManager();
+            if (atm == null) {
+                Log.i(TAG, "搬 task 失败：拿不到任务栈服务");
+                return false;
+            }
+            // moveTaskToDisplay 的形参在不同版本不一样：新版本是
+            // (taskId, displayId, moveHomeAlongside)，老版本只有 (taskId, displayId)
+            for (java.lang.reflect.Method m : atm.getClass().getMethods()) {
+                if (!"moveTaskToDisplay".equals(m.getName())) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                if (pt.length == 3 && pt[0] == int.class && pt[1] == int.class) {
+                    m.invoke(atm, taskId, display, pt[2] == boolean.class);
+                    Log.i(TAG, "moveTask " + taskId + " -> display " + display);
+                    return true;
+                }
+                if (pt.length == 2 && pt[0] == int.class && pt[1] == int.class) {
+                    m.invoke(atm, taskId, display);
+                    Log.i(TAG, "moveTask " + taskId + " -> display " + display);
+                    return true;
+                }
+            }
+            Log.i(TAG, "moveTaskToDisplay 无匹配签名（可能被隐藏 API blocklist 过滤）");
+        } catch (Throwable t) {
+            Log.i(TAG, "搬 task 反射失败：" + t.getClass().getSimpleName());
+        }
+        // 反射走不通（MIUI 把 moveTaskToDisplay 也 blocklist 了）就用 shell 命令搬。
+        // 命令在 system_server 里调同一个 binder，不受**本进程**隐藏 API 限制；
+        // uid 1000 有 MANAGE_TASKS，过得了权限检查。实测（HyperOS V140 / A13）：
+        //   - `am move-task <id> <display>`：已移除，报 Unknown command；
+        //   - `am display move-stack <id> <display>`：可用 —— 画中画里的应用一定是
+        //     虚拟屏上的根 task（rootOfTask），根 task 的 id 就是 stackId。
+        if (Shell.runSync("am display move-stack " + taskId + " " + display)) {
+            Log.i(TAG, "moveTask(shell move-stack) " + taskId + " -> display " + display);
+            return true;
+        }
+        if (Shell.runSync("am move-task " + taskId + " " + display)) {
+            Log.i(TAG, "moveTask(shell move-task) " + taskId + " -> display " + display);
+            return true;
+        }
+        Log.i(TAG, "moveTask shell 命令全部失败 " + taskId + " -> display " + display);
+        return false;
+    }
+
+    // ------------------------------------------------------------ 旧应用 task 回收
+
+    /**
+     * 换应用 / 关闭画中画之后，把**旧应用在本屏上的 task** 移除。
+     *
+     * 为什么必须做：虚拟屏是 ON 的，栈里那些"曾经打开过"的 task 会被系统当成
+     * 可见任务 —— 进程常驻、surface 常驻，LMK 也不轻易回收。用户每换一次应用就
+     * 往栈底压一个，三块屏一起攒，跑一阵子内存就被吃光，表现出来就是越来越卡、
+     * 屏内应用还会被系统冻住（画面停在最后一帧、点了没反应）。
+     *
+     * 只移除 task（不 force-stop 进程），并且这个包名还在别的屏上跑时不动。
+     */
+    private void scheduleReap(final String targetPkg, long delayMs) {
+        if (targetPkg == null) return;
+        final int display = displayId;
+        if (display < 0) return;
+        main.postDelayed(() -> {
+            if (targetPkg.equals(pkg)) return;              // 又切回来了
+            if (cb != null && cb.isPkgUsedElsewhere(targetPkg, display)) {
+                Log.i(TAG, "reap 跳过 " + targetPkg + "：还在别的屏上用着");
+                return;
+            }
+            new Thread(() -> {
+                int tid = findTaskIdOnDisplay(targetPkg, display);
+                if (tid < 0) {
+                    Log.i(TAG, "reap " + targetPkg + "：本屏已无 task（d=" + display + "）");
+                    return;
+                }
+                if (removeTask(tid)) {
+                    Log.i(TAG, "reap 已移除旧任务 " + targetPkg + " task=" + tid + " d=" + display);
+                } else {
+                    Log.i(TAG, "reap 失败（removeTask 不可用）" + targetPkg + " task=" + tid);
+                }
+            }, "pipdesk-reap").start();
+        }, Math.max(300, delayMs));
+    }
+
+    /** 在指定屏上找某应用的 task（只看这块屏，避免误伤主屏/别的屏上的同一个应用） */
+    private static int findTaskIdOnDisplay(String targetPkg, int display) {
+        try {
+            Object atm = activityTaskManager();
+            if (atm != null) {
+                for (java.lang.reflect.Method m : atm.getClass().getMethods()) {
+                    if ("getAllRootTaskInfos".equals(m.getName())
+                            && m.getParameterTypes().length == 0) {
+                        int tid = scanTasksOnDisplay(unwrapSlice(invokeQuiet(m, atm)),
+                                targetPkg, display);
+                        if (tid >= 0) return tid;
+                    }
+                }
+            }
+        } catch (Throwable ignored) { }
+        return -1;
+    }
+
+    /** 在 task 列表里找「指定屏 + 指定包名」的 taskId */
+    private static int scanTasksOnDisplay(List<?> tasks, String targetPkg, int display) {
+        if (tasks == null) return -1;
+        for (Object t : tasks) {
+            if (t == null) continue;
+            Integer disp = intField(t, "displayId");
+            if (disp == null || disp != display) continue;
+            Integer tid = intField(t, "taskId");
+            if (tid == null || tid < 0) continue;
+            Object top = objField(t, "topActivity");
+            boolean hit = top instanceof ComponentName
+                    && targetPkg.equals(((ComponentName) top).getPackageName());
+            if (!hit) {
+                Object names = objField(t, "childTaskNames");
+                if (names instanceof String[]) {
+                    for (String n : (String[]) names) {
+                        if (n != null && n.startsWith(targetPkg + "/")) { hit = true; break; }
+                    }
+                }
+            }
+            if (hit) return tid;
+        }
+        return -1;
+    }
+
+    /** 移除一个 task（IActivityTaskManager.removeTask，签名随版本不同，两种都试） */
+    private static boolean removeTask(int taskId) {
+        try {
+            Object atm = activityTaskManager();
+            if (atm == null) return false;
+            for (java.lang.reflect.Method m : atm.getClass().getMethods()) {
+                if (!"removeTask".equals(m.getName())) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                if (pt.length == 1 && pt[0] == int.class) {
+                    m.invoke(atm, taskId);
+                    return true;
+                }
+                if (pt.length == 2 && pt[0] == int.class && pt[1] == boolean.class) {
+                    m.invoke(atm, taskId, false);
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            Log.i(TAG, "removeTask 不可用：" + t.getClass().getSimpleName());
+        }
+        return false;
+    }
+
+    public void launchFullScreen(String targetPkg) {
+        launchFullScreen(targetPkg, null);
+    }
+
+    /**
+     * 全屏打开，可带一个「搬完并前置之后」的回调。
+     *
+     * 注意：**不关画中画、不清屏**。应用 task 被搬到主屏全屏显示，
+     * 画中画这边保留 pkg（纹理停在最后一帧）；用户回到桌面时由
+     * {@link #bringBackIfFullscreened()} 把应用搬回本屏继续显示。
+     */
+    public void launchFullScreen(String targetPkg, Runnable after) {
+        Intent i = app.getPackageManager().getLaunchIntentForPackage(targetPkg);
+        if (i == null) {
+            Log.w(TAG, "全屏打开失败：没有启动 Intent " + targetPkg);
+            if (after != null) main.post(after);
+            return;
+        }
+        // 关键：应用 task 还挂在虚拟屏上时，直接 startActivity 到主屏只会把
+        // 虚拟屏上的旧 task 顶到前台（看起来像"全屏打开没反应"）。
+        // 必须先把 task 搬回主屏（display 0），再 startActivity 前置它。
+        int tid = findTaskId(targetPkg);
+        if (tid < 0) {
+            Log.w(TAG, "全屏打开 " + targetPkg + "：未找到 task，直接 startActivity 兜底");
+            startFullscreenIntent(i, tid);
+            if (after != null) main.postDelayed(after, 400);
+            return;
+        }
+        // 标记：这块屏的应用去主屏全屏了（只有本屏的应用才标记，别的应用全屏与本屏无关）
+        if (targetPkg.equals(pkg)) fullscreened = true;
+        // 搬 task 在 MIUI 上要绕道 shell（`am display move-stack`），可能耗时几百毫秒，
+        // 放后台线程执行，完成后回主线程再前置 —— 不能卡住桌面。
+        final Intent intent = i;
+        final int fTid = tid;
+        new Thread(() -> {
+            boolean moved = moveTask(fTid, android.view.Display.DEFAULT_DISPLAY);
+            // 校验是否真的搬过去了：搬失败的话 startActivity 只会顶起虚拟屏上的
+            // 旧 task（看起来"没反应"），日志里要能直接看出是哪一步断了
+            Log.i(TAG, "全屏打开 " + targetPkg + " taskId=" + fTid
+                    + " move=" + moved
+                    + " onDisplay0=" + (moved && taskOnDisplay(fTid, android.view.Display.DEFAULT_DISPLAY)));
+            main.post(() -> {
+                startFullscreenIntent(intent, fTid);
+                // 等应用在主屏画好第一帧再收画中画，避免中间露出空白虚拟屏
+                if (after != null) main.postDelayed(after, 500);
+            });
+        }, "pipdesk-fullscreen").start();
+    }
+
+    /**
+     * 桌面回到前台时调用：把「全屏打开」过、现在还挂在主屏的应用
+     * 搬回本虚拟屏继续显示（用户需求：返回虚拟屏后应用还在）。
+     */
+    public void bringBackIfFullscreened() {
+        if (!fullscreened) return;
+        fullscreened = false;
+        final String p0 = pkg;
+        if (p0 == null || displayId < 0) return;
+        new Thread(() -> {
+            int tid = findTaskId(p0);
+            if (tid < 0) {
+                // 应用在主屏上已经被关掉：画中画回到空闲态
+                Log.i(TAG, "全屏应用已退出：" + p0 + "，画中画回空闲");
+                main.post(this::resetAfterExternalClose);
+                return;
+            }
+            moveTask(tid, displayId);
+            Log.i(TAG, "全屏返回：" + p0 + " task " + tid + " 搬回 display " + displayId);
+        }, "pipdesk-bringback").start();
+    }
+
+    /** 应用在外部被关掉/找不到 task：画中画回到空闲玻璃态 */
+    public void resetAfterExternalClose() {
+        pkg = null;
+        livePkg = null;
+        main.removeCallbacks(hideLoading);
+        loading.setVisibility(View.GONE);
+        hint.setVisibility(View.VISIBLE);
+        texture.setOpaque(false);
+        texture.setAlpha(0f);
+        if (cb != null) cb.onPaneClosed(this);
+    }
+
+    /** 本屏最后一次出帧距今多久（0 = 从未出帧）：排查"画面冻住"用 */
+    public long msSinceLastFrame() {
+        long t = lastFrameAt;
+        return t == 0 ? -1 : android.os.SystemClock.uptimeMillis() - t;
+    }
+
+    /** 前置已搬到主屏的 task（moveTask 完成/失败后都会走到这里兜底） */
+    private void startFullscreenIntent(Intent i, int tid) {
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+        // 明确指定主屏：否则可能复用虚拟屏上的那个 task，看起来像"没反应"
+        try {   // setLaunchDisplayId 是 @SystemApi，公开 SDK 里没有，反射调
+            java.lang.reflect.Method m = Intent.class.getDeclaredMethod(
+                    "setLaunchDisplayId", int.class);
+            m.invoke(i, android.view.Display.DEFAULT_DISPLAY);
+        } catch (Throwable ignored) { }
+        try {
+            app.startActivity(i);
+            Log.i(TAG, "全屏打开 -> display 0 (taskId=" + tid + ")");
+        } catch (Throwable t) {
+            Log.w(TAG, "全屏打开异常 pkg=" + i.getPackage(), t);
+        }
+    }
+
+    /** 关闭前先在虚拟屏上顶一个空白页，避免目标应用被弹回主屏 */
+    private void clearDisplayApp(String targetPkg) {
+        if (displayId < 0) return;
+        try {
+            Intent i = new Intent(app, BlankActivity.class);
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            ActivityOptions o = ActivityOptions.makeBasic();
+            o.setLaunchDisplayId(displayId);
+            app.startActivity(i, o.toBundle());
+        } catch (Throwable ignored) { }
+    }
+
+    public TextureView textureView() {
+        return texture;
+    }
+
+    public FrameLayout rootView() {
+        return root;
+    }
+}

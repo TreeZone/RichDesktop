@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="blank_bg">#FF101014</color>
+    <color name="dock_bg">#D9101014</color>
+    <color name="dock_item_bg">#26FFFFFF</color>
+    <!-- 画中画空闲态：玻璃（透出壁纸） -->
+    <color name="pip_bg">#14FFFFFF</color>
+    <color name="pip_glass_top">#26FFFFFF</color>
+    <color name="pip_glass_bottom">#08FFFFFF</color>
+    <color name="pip_stroke">#4DFFFFFF</color>
+    <color name="text_main">#FFFFFFFF</color>
+    <color name="text_sub">#B3FFFFFF</color>
+</resources>

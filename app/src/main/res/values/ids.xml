@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 标记某个对话框的内容区已经加过内边距，避免重复叠加 -->
+    <item name="pipdesk_padded" type="id" />
+</resources>

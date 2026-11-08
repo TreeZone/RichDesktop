@@ -1,0 +1,6 @@
+id=pipdesk_sysapp
+name=PipDesk 系统身份补丁
+version=v2.0
+versionCode=4
+author=cuizhen
+description=只补一条 SELinux 域规则，让后装的 android.uid.system 应用能以 system_app 域运行。APK 不进 /system/priv-app，照常当普通应用安装。

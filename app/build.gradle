@@ -1,0 +1,99 @@
+plugins {
+    id 'com.android.application'
+}
+
+/*
+ * 两条构建线（源码完全一致，只差一个 Manifest 属性）：
+ *   常规：  gradle assembleDebug
+ *          → data app，靠 priv-app 白名单 / su 通道取权限
+ *   sysuid：gradle -Psysuid assembleDebug
+ *          → 加 android:sharedUserId="android.uid.system"，装进 priv-app 后与系统同 uid（1000），
+ *            所有 signature 权限（ADD_TRUSTED_DISPLAY / INJECT_EVENTS ...）天生就有，
+ *            这就是氢桌面的做法（它声明了同一个 sharedUserId）。
+ *            注意：只能以 priv-app 形式安装，单独装成 data app 会在 zygote 阶段被杀。
+ */
+def sysUid = project.hasProperty('sysuid')
+def sysUidManifest = layout.buildDirectory.file('generated/sysuid/AndroidManifest.xml').get().asFile
+
+if (sysUid) {
+    def base = file('src/main/AndroidManifest.xml').getText('UTF-8')
+    def tag = '<manifest xmlns:android="http://schemas.android.com/apk/res/android"'
+    if (!base.contains(tag)) throw new GradleException('Manifest 根标签格式变了，sysuid 注入失败')
+    sysUidManifest.parentFile.mkdirs()
+    sysUidManifest.setText(base.replace(tag,
+            tag + '\n    android:sharedUserId="android.uid.system"'), 'UTF-8')
+}
+
+android {
+    namespace 'com.cz.richdesk'
+    compileSdk 36
+
+    if (sysUid) {
+        sourceSets {
+            main {
+                manifest.srcFile sysUidManifest.absolutePath
+            }
+        }
+    }
+
+    defaultConfig {
+        applicationId "com.cz.richdesk"
+        minSdk 28
+        targetSdk 30
+        versionCode 50
+        versionName "0.13.0"
+    }
+
+    /*
+     * 固定签名证书：sysuid 路线的关键。
+     * 证书指纹要写进 /system/etc/selinux/plat_mac_permissions.xml 才能拿到 seinfo=platform
+     * （uid 1000 + seinfo=platform → SELinux 域 system_app，才不会被 zygote 杀掉）。
+     * 换证书 = 必须同步更新 mac_permissions，否则应用起不来。
+     */
+    signingConfigs {
+        pipdesk {
+            storeFile file('../pipdesk.jks')
+            storePassword 'pipdesk123'
+            keyAlias 'pipdesk'
+            keyPassword 'pipdesk123'
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.pipdesk
+        }
+        release {
+            signingConfig signingConfigs.pipdesk
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// 离线构建：把传递依赖统一对齐到本机已有缓存的版本
+configurations.all {
+    resolutionStrategy.force(
+            'androidx.activity:activity:1.8.2',
+            'androidx.savedstate:savedstate:1.2.1',
+            'androidx.core:core-ktx:1.13.1',
+            'androidx.core:core:1.13.1',
+            'androidx.annotation:annotation-experimental:1.4.0',
+            'androidx.lifecycle:lifecycle-common:2.6.2',
+            'androidx.lifecycle:lifecycle-runtime:2.6.2',
+            'androidx.lifecycle:lifecycle-viewmodel:2.6.2',
+            'androidx.lifecycle:lifecycle-viewmodel-savedstate:2.6.2',
+            'androidx.lifecycle:lifecycle-livedata:2.6.2',
+            'androidx.lifecycle:lifecycle-livedata-core:2.6.2',
+            'org.jetbrains.kotlin:kotlin-stdlib:2.2.10'
+    )
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.recyclerview:recyclerview:1.3.0'
+}

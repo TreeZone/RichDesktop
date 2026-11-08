@@ -1,0 +1,6 @@
+id=pipdesk_privapp
+name=PipDesk 画中画桌面（system uid · 氢桌面同款）
+version=v1.2
+versionCode=3
+author=cuizhen
+description=priv-app + android.uid.system + seinfo=platform 映射：与系统同 uid(1000)、SELinux 域 system_app，ADD_TRUSTED_DISPLAY / INJECT_EVENTS 等 signature 权限全部免检，运行期不需要 root/su
