@@ -82,9 +82,6 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         void onShortcutLongClick(String pkg);
     }
 
-    /** 自绘快捷图标实例缓存（伪包名 → Drawable）：绑定/列表 bind 高频取用 */
-    private static final java.util.Map<String, Drawable> SHORTCUT_ICON_CACHE = new java.util.HashMap<>();
-
     /** 伪包名 → 快捷方式的名字（Dock 里画标签也要用） */
     static String shortcutLabel(String pkg) {        if (AppInfo.SETTINGS_PKG.equals(pkg)) return "桌面设置";
         for (int i = 0; i < SHORTCUT_PKGS.length; i++) {
@@ -93,14 +90,14 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         return pkg;
     }
 
-    /** 伪包名 → 自绘图标（Dock 里显示它要用）。缓存实例：Dock/列表每次 bind 都会要，别重复 new */
+    /**
+     * 伪包名 → 自绘图标（Dock 里显示它要用）。
+     * 注意：**必须每次 new**，不能缓存共享——Drawable 的 bounds/callback 是单份状态，
+     * 一个实例同时挂到 Dock 和应用列表的多个 ImageView 上会互相改 bounds，
+     * 表现就是图标不显示或被拉成奇怪的形状（0.13.1 踩过）。
+     */
     static Drawable shortcutIcon(String pkg) {
-        Drawable d = SHORTCUT_ICON_CACHE.get(pkg);
-        if (d == null) {
-            d = newShortcutIcon(pkg);
-            if (d != null) SHORTCUT_ICON_CACHE.put(pkg, d);
-        }
-        return d;
+        return newShortcutIcon(pkg);
     }
 
     private static Drawable newShortcutIcon(String pkg) {
