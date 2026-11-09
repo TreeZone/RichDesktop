@@ -619,6 +619,17 @@ public class SettingsActivity extends AppCompatActivity {
         if (themeBox == null) return;
         themeBox.removeAllViews();
         actionTo(themeBox, "外观模式：" + themeLabel(Prefs.getThemeMode(this)), this::pickThemeMode);
+        toggleTo(themeBox, "屏内应用跟随深浅色", Prefs.syncAppsNightMode(this), b -> {
+            Prefs.setSyncAppsNightMode(this, b);
+            if (b) {
+                // 打开的瞬间先同步一次当前外观，别等下次切换才生效
+                Ui.applySystemNightMode(this, Ui.dark);
+                toast("已同步给系统；屏内应用会跟着变（个别应用会重启一遍）");
+            } else {
+                toast("已关闭：切深浅色只变桌面，屏内应用不再被切走");
+            }
+            rebuildThemeBox();
+        });
 
         if (Prefs.getThemeMode(this) != Prefs.THEME_TIME) return;
 

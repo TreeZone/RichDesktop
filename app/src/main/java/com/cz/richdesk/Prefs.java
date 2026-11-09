@@ -293,6 +293,21 @@ public class Prefs {
         sp(c).edit().putInt("theme_mode", clamp(mode, 0, 3)).apply();
     }
 
+    /**
+     * 深浅色切换是否把夜间模式同步给系统（屏内应用跟着变深/变浅）。
+     *
+     * 默认**关**：全局 uiMode 变更会销毁重建屏内应用，实测部分应用（QQ）
+     * 直接进程崩溃（AMS "has died: fg TOP"），用户看到的就是
+     * 「切个主题，画中画里的应用被切换掉了」。关掉后只切桌面外观，屏内应用不动。
+     */
+    public static boolean syncAppsNightMode(Context c) {
+        return sp(c).getBoolean("sync_apps_night_mode", false);
+    }
+
+    public static void setSyncAppsNightMode(Context c, boolean b) {
+        sp(c).edit().putBoolean("sync_apps_night_mode", b).apply();
+    }
+
     /** 定时模式：入夜时间（分钟数，0~1439），默认 18:30 */
     public static int getNightStart(Context c) {
         return clamp(sp(c).getInt("night_start", 18 * 60 + 30), 0, 1439);

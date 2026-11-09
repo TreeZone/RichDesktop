@@ -373,12 +373,13 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     /**
      * 把深浅色同步给系统（UiModeManager）。
      *
-     * setNightMode 是全局 uiMode 变更：屏内应用没声明 uiMode configChanges 的会被
-     * 销毁重建，这台 ROM 上重建后 task 偶尔被丢回主屏 —— 用户看到的就是
-     * 「切个深浅色，画中画里的应用被切走了」。所以同步完延迟 2s 逐屏校验：
-     * 被挪走的搬回、没了的重新拉起（PipPane.reensureTask）。
+     * 受「屏内应用跟随深浅色」开关控制（默认关，见 Ui.applySystemNightMode）：
+     * 全局 uiMode 变更会销毁重建屏内应用，实测 QQ 直接崩溃，用户看到的就是
+     * 「切个深浅色，画中画里的应用被切走了」。开关打开时才同步，且同步完
+     * 延迟 2s 逐屏校验：被挪走的搬回、没了的重新拉起（PipPane.reensureTask）。
      */
     private void syncSystemNightMode(boolean dark) {
+        if (!Prefs.syncAppsNightMode(this)) return;
         Ui.applySystemNightMode(this, dark);
         if (pip == null) return;
         new android.os.Handler(android.os.Looper.getMainLooper())

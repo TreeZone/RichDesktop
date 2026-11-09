@@ -147,9 +147,15 @@ public class Ui {
      *
      * uid 1000（system）持有 MODIFY_DAY_NIGHT_MODE，可以直接改；
      * 普通应用身份会被拒（SecurityException），此时静默降级只切桌面。
+     *
+     * **受「屏内应用跟随深浅色」开关控制（默认关）**：全局 uiMode 变更会销毁
+     * 重建屏内应用，实测 QQ 会直接崩溃（进程 died: fg TOP，task 被系统移除），
+     * 用户看到的就是"切个主题，画中画里的应用被切换掉"。关掉同步后
+     * 只切桌面玻璃/文字，屏内应用保持原样。
      */
     public static void applySystemNightMode(Context c, boolean dark) {
         try {
+            if (!Prefs.syncAppsNightMode(c)) return; // 不同步：屏内应用不动
             if (!isSystemUid()) return;              // 非系统身份做不到，别白折腾
             Object um = c.getSystemService(Context.UI_MODE_SERVICE);
             if (um == null) return;
