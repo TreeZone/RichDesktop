@@ -10,6 +10,7 @@ import android.widget.ImageView;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
+import androidx.recyclerview.widget.ItemTouchHelper;
 import androidx.recyclerview.widget.RecyclerView;
 
 import java.util.List;
@@ -28,6 +29,8 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
         void onDockClick(String pkg);
         void onDockAdd();
         void onDockLongClick(int pos, String pkg);
+        /** 拖动排序结束（真的换过位置）：持久化新顺序 */
+        void onDockOrderChanged();
     }
 
     private final Host host;
@@ -35,6 +38,9 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
     private int slotWidth;
     /** 图标大小（dp），设置里可调。Dock 高度由它反推（图标 + 24dp），不再单独设 */
     private int iconDp = 42;
+    private ItemTouchHelper dragHelper;
+    /** 本次拖动是否真的交换过位置：松手时用来区分「拖动」和「原地长按」 */
+    private boolean dragMoved;
 
     public DockAdapter(Host host, int cornerDp) {
         this.host = host;
@@ -140,9 +146,9 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
             vh.ivIcon.setImageDrawable(ai != null ? ai.icon
                     : vh.itemView.getContext().getDrawable(android.R.drawable.sym_def_app_icon));
             vh.itemView.setOnClickListener(v -> host.onDockClick(pkg));
+            // 长按不再直接弹菜单：先进入拖动待命，原地松手 = 菜单，拖走 = 排序
             vh.itemView.setOnLongClickListener(v -> {
-                int pos = vh.getBindingAdapterPosition();
-                if (pos >= 0 && pos < host.dockPkgs().size()) host.onDockLongClick(pos, pkg);
+                onLongPress(vh);
                 return true;
             });
         } else {
@@ -170,5 +176,78 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
             ivIcon = iv;
             tvAdd = add;
         }
+    }
+
+    // ------------------------------------------------------------ 长按拖动排序
+
+    /** 长按入口：进入拖动待命（手指没动就松手的话由 clearView 转成菜单） */
+    private void onLongPress(VH vh) {
+        if (dragHelper == null) return;
+        int pos = vh.getBindingAdapterPosition();
+        if (pos >= 0 && pos < host.dockPkgs().size()) dragHelper.startDrag(vh);
+    }
+
+    /** MainActivity 在 rvDock.setAdapter 之后调用一次 */
+    public void attachDragHelper(RecyclerView rv) {
+        ItemTouchHelper.Callback cb = new ItemTouchHelper.Callback() {
+            @Override
+            public int getMovementFlags(@NonNull RecyclerView rvc, @NonNull RecyclerView.ViewHolder vh) {
+                int pos = vh.getBindingAdapterPosition();
+                if (pos < 0 || pos >= host.dockPkgs().size()) return makeMovementFlags(0, 0);
+                // rvDock 是水平 LayoutManager（视觉上被旋转成竖排，坐标仍是数据坐标）
+                return makeMovementFlags(ItemTouchHelper.LEFT | ItemTouchHelper.RIGHT, 0);
+            }
+
+            @Override
+            public boolean onMove(@NonNull RecyclerView rvc,
+                                  @NonNull RecyclerView.ViewHolder a, @NonNull RecyclerView.ViewHolder b) {
+                int from = a.getBindingAdapterPosition(), to = b.getBindingAdapterPosition();
+                int used = host.dockPkgs().size();
+                if (from < 0 || to < 0 || from >= used || to >= used) return false;
+                List<String> pkgs = host.dockPkgs();
+                pkgs.add(to, pkgs.remove(from));
+                notifyItemMoved(from, to);
+                dragMoved = true;
+                return true;
+            }
+
+            @Override
+            public void onSwiped(@NonNull RecyclerView.ViewHolder vh, int dir) { }
+
+            @Override
+            public boolean isLongPressDragEnabled() {
+                return false;   // 长按由 adapter 手动 startDrag，才能和"长按弹菜单"共存
+            }
+
+            @Override
+            public void onSelectedChanged(RecyclerView.ViewHolder vh, int actionState) {
+                if (actionState == ItemTouchHelper.ACTION_STATE_DRAG && vh != null) {
+                    dragMoved = false;
+                    vh.itemView.animate().scaleX(1.14f).scaleY(1.14f).setDuration(120).start();
+                    vh.itemView.setElevation(Ui.dp(vh.itemView.getContext(), 10));
+                }
+                super.onSelectedChanged(vh, actionState);
+            }
+
+            @Override
+            public void clearView(@NonNull RecyclerView rv, @NonNull RecyclerView.ViewHolder vh) {
+                super.clearView(rv, vh);
+                vh.itemView.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
+                vh.itemView.setElevation(0);
+                boolean moved = dragMoved;
+                dragMoved = false;
+                if (moved) {
+                    host.onDockOrderChanged();   // 拖动过 → 只存新顺序
+                    return;
+                }
+                // 没拖动 = 长按原地松手 → 弹原来的长按菜单
+                int pos = vh.getBindingAdapterPosition();
+                if (pos >= 0 && pos < host.dockPkgs().size()) {
+                    host.onDockLongClick(pos, host.dockPkgs().get(pos));
+                }
+            }
+        };
+        dragHelper = new ItemTouchHelper(cb);
+        dragHelper.attachToRecyclerView(rv);
     }
 }

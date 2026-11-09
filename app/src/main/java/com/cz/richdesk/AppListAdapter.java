@@ -19,8 +19,10 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
+import androidx.recyclerview.widget.ItemTouchHelper;
 import androidx.recyclerview.widget.RecyclerView;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -36,6 +38,11 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         void onAppClick(AppInfo app);
         void onAppLongClick(AppInfo app);
         void onSettingsClick();
+        /**
+         * 长按拖动排序结束（真的换过位置）：宿主按新顺序持久化。
+         * picker 弹窗里禁用拖动，不会走到。
+         */
+        default void onAppOrderChanged(List<AppInfo> ordered) { }
     }
 
     private static final int TYPE_APP = 0;
@@ -58,6 +65,11 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
      * 否则按壁纸取色会拿到弹窗外面那块壁纸的亮度，反而更糊。
      */
     private final boolean overWallpaper;
+    /** 是否允许长按拖动排序（桌面应用页 = true，选择器弹窗 = false） */
+    private boolean dragEnabled;
+    private ItemTouchHelper dragHelper;
+    /** 本次拖动是否真的交换过位置：松手时用来区分「拖动」和「原地长按」 */
+    private boolean dragMoved;
 
     public AppListAdapter(List<AppInfo> data, Host host, boolean withSettings, int iconDp) {
         this(data, host, withSettings, iconDp, true);
@@ -252,7 +264,9 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         vh.tvLabel.setText(ai.label);
         vh.itemView.setOnClickListener(v -> host.onAppClick(ai));
         vh.itemView.setOnLongClickListener(v -> {
-            host.onAppLongClick(ai);
+            // 长按不再直接弹菜单：先进入拖动待命，原地松手 = 菜单，拖走 = 排序
+            if (dragEnabled) onLongPress(vh);
+            else host.onAppLongClick(ai);
             return true;
         });
     }
@@ -297,6 +311,86 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
             ivIcon = (ImageView) ll.getChildAt(0);
             tvLabel = (TextView) ll.getChildAt(1);
         }
+    }
+
+    // ------------------------------------------------------------ 长按拖动排序
+
+    /**
+     * 长按入口：进入拖动待命（手指没动就松手的话由 clearView 转成菜单）。
+     * 只有普通应用格子能拖；前 5 个快捷方式是功能位，固定在最前。
+     */
+    private void onLongPress(RecyclerView.ViewHolder vh) {
+        if (dragHelper == null) return;
+        int pos = vh.getBindingAdapterPosition();
+        if (pos < offset() || pos >= getItemCount()) return;
+        dragHelper.startDrag(vh);
+    }
+
+    /** 桌面应用页在 setAdapter 之后调用一次；picker 弹窗不调（无拖动） */
+    public void attachDragHelper(RecyclerView rv) {
+        dragEnabled = true;
+        ItemTouchHelper.Callback cb = new ItemTouchHelper.Callback() {
+            @Override
+            public int getMovementFlags(@NonNull RecyclerView rvc, @NonNull RecyclerView.ViewHolder vh) {
+                int pos = vh.getBindingAdapterPosition();
+                // 快捷方式区（前 offset 个）不可拖
+                if (pos < offset() || pos >= getItemCount()) return makeMovementFlags(0, 0);
+                return makeMovementFlags(ItemTouchHelper.UP | ItemTouchHelper.DOWN
+                        | ItemTouchHelper.LEFT | ItemTouchHelper.RIGHT, 0);
+            }
+
+            @Override
+            public boolean onMove(@NonNull RecyclerView rvc,
+                                  @NonNull RecyclerView.ViewHolder a, @NonNull RecyclerView.ViewHolder b) {
+                int sc = offset();
+                int from = a.getBindingAdapterPosition(), to = b.getBindingAdapterPosition();
+                if (from < sc || to < sc || data == null
+                        || from >= getItemCount() || to >= getItemCount()) return false;
+                data.add(to - sc, data.remove(from - sc));
+                notifyItemMoved(from, to);
+                dragMoved = true;
+                return true;
+            }
+
+            @Override
+            public void onSwiped(@NonNull RecyclerView.ViewHolder vh, int dir) { }
+
+            @Override
+            public boolean isLongPressDragEnabled() {
+                return false;   // 长按由 adapter 手动 startDrag，才能和"长按弹菜单"共存
+            }
+
+            @Override
+            public void onSelectedChanged(RecyclerView.ViewHolder vh, int actionState) {
+                if (actionState == ItemTouchHelper.ACTION_STATE_DRAG && vh != null) {
+                    dragMoved = false;
+                    vh.itemView.animate().scaleX(1.12f).scaleY(1.12f).setDuration(120).start();
+                    vh.itemView.setElevation(Ui.dp(vh.itemView.getContext(), 10));
+                }
+                super.onSelectedChanged(vh, actionState);
+            }
+
+            @Override
+            public void clearView(@NonNull RecyclerView rv, @NonNull RecyclerView.ViewHolder vh) {
+                super.clearView(rv, vh);
+                vh.itemView.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
+                vh.itemView.setElevation(0);
+                boolean moved = dragMoved;
+                dragMoved = false;
+                int pos = vh.getBindingAdapterPosition();
+                int idx = pos - offset();
+                if (moved) {
+                    if (data != null && idx >= 0 && idx < data.size()) {
+                        host.onAppOrderChanged(new ArrayList<>(data));
+                    }
+                    return;
+                }
+                // 没拖动 = 长按原地松手 → 弹原来的长按菜单
+                if (data != null && idx >= 0 && idx < data.size()) host.onAppLongClick(data.get(idx));
+            }
+        };
+        dragHelper = new ItemTouchHelper(cb);
+        dragHelper.attachToRecyclerView(rv);
     }
 
     /**

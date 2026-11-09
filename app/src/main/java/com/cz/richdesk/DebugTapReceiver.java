@@ -87,6 +87,7 @@ public class DebugTapReceiver extends BroadcastReceiver {
         int x2 = i.getIntExtra("x2", x);
         int y2 = i.getIntExtra("y2", y);
         int steps = i.getIntExtra("steps", 1);
-        TouchBridge.get(context).debugTap(d, x, y, x2, y2, steps);
+        TouchBridge.get(context).debugTap(d, x, y, x2, y2, steps,
+                i.getIntExtra("hold", 0));
     }
 }

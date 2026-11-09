@@ -442,6 +442,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         dockAdapter = new DockAdapter(this, Prefs.getDockCorner(this));
         dockAdapter.setIconDp(Prefs.getDockIcon(this));
         rvDock.setAdapter(dockAdapter);
+        dockAdapter.attachDragHelper(rvDock);   // 长按拖动排序（原地松手仍是菜单）
         rvDock.post(this::applyDockSlots);
         dockWrap.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> applyDockSlots());
         return pageHome;
@@ -482,6 +483,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
         appListAdapter = new AppListAdapter(null, this, true, Prefs.getIconSize(this));
         rvApps.setAdapter(appListAdapter);
+        appListAdapter.attachDragHelper(rvApps);   // 长按拖动排序（原地松手仍是菜单）
         // 列表滚动时 View 只是平移，硬件加速会复用绘制缓存、不重跑 onDraw，
         // 「在 onDraw 里按位置取色」在滚动过程中等于死代码 —— 所以由宿主定期主动刷新：
         // 滚动中每 90ms 一次（跟上手感），停下时再补一次（落在最终位置）。
@@ -864,6 +866,19 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 res.add(new AppInfo(label, ri.activityInfo.packageName, ri.loadIcon(pm)));
             }
             Collections.sort(res, (a, b) -> a.label.compareToIgnoreCase(b.label));
+            // 用户拖动过的顺序优先：拖过的按记录排，新装的应用（没记录）按字母序垫在已排序的后面
+            List<String> order = Prefs.getAppOrder(this);
+            if (!order.isEmpty()) {
+                java.util.Map<String, Integer> rank = new java.util.HashMap<>();
+                for (int i = 0; i < order.size(); i++) rank.put(order.get(i), i);
+                Collections.sort(res, (a, b) -> {
+                    Integer ra = rank.get(a.pkg), rb = rank.get(b.pkg);
+                    if (ra != null && rb != null) return Integer.compare(ra, rb);
+                    if (ra != null) return -1;
+                    if (rb != null) return 1;
+                    return a.label.compareToIgnoreCase(b.label);
+                });
+            }
             runOnUiThread(() -> {
                 appList = res;
                 if (appListAdapter != null) {
@@ -919,6 +934,13 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     @Override
     public List<String> dockPkgs() {
         return dockPkgs;
+    }
+
+    /** Dock 长按拖动排序结束：只持久化新顺序，不重建（notifyItemMoved 已把动画走完） */
+    @Override
+    public void onDockOrderChanged() {
+        Log.i("PipDesk", "Dock 排序 → " + dockPkgs);
+        Prefs.setDock(this, dockPkgs);
     }
 
     @Override
@@ -1050,6 +1072,15 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     @Override
     public void onAppClick(AppInfo app) {
         openPip(app.pkg, 0);
+    }
+
+    /** 应用列表长按拖动排序结束：持久化新顺序（只含普通应用，前 5 个快捷方式固定） */
+    @Override
+    public void onAppOrderChanged(List<AppInfo> ordered) {
+        List<String> pkgs = new ArrayList<>(ordered.size());
+        for (AppInfo a : ordered) pkgs.add(a.pkg);
+        Log.i("PipDesk", "应用列表排序 → 前5: " + pkgs.subList(0, Math.min(5, pkgs.size())));
+        Prefs.setAppOrder(this, pkgs);
     }
 
     @Override

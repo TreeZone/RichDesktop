@@ -65,6 +65,32 @@ public class Prefs {
         return clamp(sp(c).getInt("dock_count", 5), DOCK_MIN, DOCK_MAX);
     }
 
+    // ------------------------------------------------------------ 应用列表手动排序
+
+    /**
+     * 用户在应用列表里长按拖出来的顺序（普通应用的 pkg 序列，竖线分隔）。
+     * 没出现在序列里的应用（新装的）按字母序排在已排好的后面。
+     */
+    public static List<String> getAppOrder(Context c) {
+        List<String> r = new ArrayList<>();
+        String s = sp(c).getString("app_order", "");
+        if (s != null && !s.isEmpty()) {
+            for (String p : s.split("\\|")) {
+                if (!p.isEmpty()) r.add(p);
+            }
+        }
+        return r;
+    }
+
+    public static void setAppOrder(Context c, List<String> list) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < list.size(); i++) {
+            if (i > 0) sb.append('|');
+            sb.append(list.get(i));
+        }
+        sp(c).edit().putString("app_order", sb.toString()).apply();
+    }
+
     public static void setDockCount(Context c, int n) {
         sp(c).edit().putInt("dock_count", clamp(n, DOCK_MIN, DOCK_MAX)).apply();
     }

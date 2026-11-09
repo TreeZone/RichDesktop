@@ -926,6 +926,15 @@ public class TouchBridge {
      */
     public void debugTap(final int displayId, final int x, final int y,
                          final int x2, final int y2, final int steps) {
+        debugTap(displayId, x, y, x2, y2, steps, 0);
+    }
+
+    /**
+     * hold 毫秒：DOWN 后先按住再开始移动 —— 用来触发长按（拖动排序验证用）。
+     * 注入线程是专用的，sleep 不影响主线程。
+     */
+    public void debugTap(final int displayId, final int x, final int y,
+                         final int x2, final int y2, final int steps, final long hold) {
         injector.execute(new Frame(() -> {
             long now = SystemClock.uptimeMillis();
             activePointers.put(0, new float[]{x, y});
@@ -933,6 +942,9 @@ public class TouchBridge {
             gestureDown = now;
             gestureChannel = selectChannel();
             deliver(Snap.raw(displayId, MotionEvent.ACTION_DOWN, x, y), now);
+            if (hold > 0) {
+                try { Thread.sleep(hold); } catch (InterruptedException ignored) { }
+            }
             for (int s = 1; s <= steps; s++) {
                 int cx = x + (x2 - x) * s / steps;
                 int cy = y + (y2 - y) * s / steps;
