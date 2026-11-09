@@ -4,7 +4,9 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.content.res.ColorStateList;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.os.Bundle;
@@ -489,16 +491,52 @@ public class SettingsActivity extends AppCompatActivity {
         sb.setProgress(clamp((value - min) / step, 0, steps));
         sb.getProgressDrawable().setTint(Ui.tint());
         sb.getThumb().setTint(Ui.tint());
+
+        // 滑条 + 刻度层叠放：刻度点直接画在轨道线上
+        FrameLayout wrap = new FrameLayout(this);
+        wrap.addView(sb, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // 离散档位刻度：选项不多（≤20 个）时沿轨道画一排分隔点，与滑块中心
+        // 对齐（两端缩进半个滑块宽），一眼看出有几档可选。滑块压着的位置
+        // 不画（onProgressChanged 里重绘），点不会叠到滑块上。
+        // DPI/圆角/图标大小这类几十档的连续型滑条不画（点太密没有信息量）。
+        View ticks = null;
+        if (steps + 1 <= 20) {
+            ticks = new View(this) {
+                @Override protected void onDraw(Canvas canvas) {
+                    Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                    p.setColor(Ui.tintDim());
+                    float inset = sb.getThumb().getIntrinsicWidth() / 2f;
+                    float w = Math.max(1, getWidth() - inset * 2);
+                    float cy = getHeight() / 2f;
+                    float r = Ui.dp(getContext(), 2.5f);
+                    float thumbX = inset + w * sb.getProgress() / (float) steps;
+                    float hide = sb.getThumb().getIntrinsicWidth() / 2f + r;
+                    for (int i = 0; i <= steps; i++) {
+                        float x = inset + w * i / steps;
+                        if (Math.abs(x - thumbX) < hide) continue;
+                        canvas.drawCircle(x, cy, r, p);
+                    }
+                }
+            };
+            ticks.setContentDescription("共 " + (steps + 1) + " 档");
+            wrap.addView(ticks, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        }
+        final View ticksF = ticks;
+
         LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         slp.topMargin = Ui.dp(this, 4);
-        c.addView(sb, slp);
+        c.addView(wrap, slp);
 
         sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar s, int progress, boolean fromUser) {
                 int v = min + progress * step;
                 val.setText(fmt.format(v));
                 setter.set(v);
+                if (ticksF != null) ticksF.invalidate();
             }
             @Override public void onStartTrackingTouch(SeekBar s) { }
             @Override public void onStopTrackingTouch(SeekBar s) { }
