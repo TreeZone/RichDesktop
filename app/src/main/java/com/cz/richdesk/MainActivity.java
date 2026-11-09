@@ -186,6 +186,16 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         if (pkg != null) runBuiltin(pkg);
     }
 
+    /** 调试用：直接触发 Dock 第 pos 格的长按菜单（无手指时验证菜单项） */
+    void debugDockLongClick(int pos) {
+        if (pos >= 0 && pos < dockPkgs.size()) onDockLongClick(pos, dockPkgs.get(pos));
+    }
+
+    /** 调试用：注入按键（本机 adb shell input 被禁，唤醒屏幕/回主页都靠它） */
+    void debugKey(int keyCode) {
+        Keys.send(this, keyCode);
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -1000,9 +1010,21 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
     @Override
     public void onDockLongClick(int pos, String pkg) {
-        // 伪应用（内置快捷方式）：没有"全屏打开"这类操作，只能执行 / 从 Dock 移除
+        // 内置快捷方式（设置/深浅模式/重启/返回/主页）在 Dock 里长按：
+        // 菜单和普通应用一致 ——「重新选择应用」「删除绑定」。
+        // 没有「从 Dock 移除」（语义重复）；「全屏打开 / 指定画中画位置」它们也用不上。
         if (AppInfo.isBuiltin(pkg)) {
-            showBuiltinMenu(pkg);
+            GlassMenu.show(this, labelOf(pkg),
+                    new CharSequence[]{"重新选择应用", "删除绑定"},
+                    which -> {
+                        if (which == 0) {
+                            showPicker(pos, 0);     // 换绑：选中谁就占这个槽位
+                        } else if (pos >= 0 && pos < dockPkgs.size()) {
+                            dockPkgs.remove(pos);
+                            Prefs.setDock(this, dockPkgs);
+                            dockAdapter.notifyDataSetChanged();
+                        }
+                    });
             return;
         }
         GlassMenu.show(this, labelOf(pkg),

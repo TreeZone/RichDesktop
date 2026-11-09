@@ -40,6 +40,13 @@ public final class GlassMenu {
     }
 
     public static Dialog show(Context ctx, String title, CharSequence[] items, OnPick cb) {
+        // 菜单项打日志：没有手指（或屏幕被锁屏盖住）时也能确认弹的是哪几项
+        StringBuilder sb = new StringBuilder();
+        for (int k = 0; k < items.length; k++) {
+            if (k > 0) sb.append(" / ");
+            sb.append(items[k]);
+        }
+        android.util.Log.i("PipDesk", "菜单 标题=" + title + " 项=" + items.length + " [" + sb + "]");
         final Dialog d = new Dialog(Ui.dialogContext(ctx));
         // 主题里 windowNoTitle=false，Dialog 会在内容上方留一条**空的标题栏**（实测 45dp）。
         // 这条空栏就是"标题怎么调都靠不下来"的真凶：面板顶上先空掉 45dp，再才是我们的内容。

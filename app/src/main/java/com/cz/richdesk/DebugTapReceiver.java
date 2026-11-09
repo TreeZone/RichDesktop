@@ -70,6 +70,12 @@ public class DebugTapReceiver extends BroadcastReceiver {
             // 执行内置快捷方式：--es builtin pipdesk://nav-back
             String builtin = i.getStringExtra("builtin");
             if (builtin != null) a.debugBuiltin(builtin);
+            // 注入一个按键：--ei key 26（26=电源/224=唤醒/4=返回/3=主页）
+            int key = i.getIntExtra("key", -1);
+            if (key >= 0) a.debugKey(key);
+            // 模拟长按 Dock 第 pos 格：--ei docklong <pos>（触发 onDockLongClick）
+            int dockLong = i.getIntExtra("docklong", -1);
+            if (dockLong >= 0) a.debugDockLongClick(dockLong);
             if (i.getIntExtra("pick", 0) == 1) a.debugShowPicker();
             if (i.getIntExtra("wpdebug", 0) == 1) a.debugWallTint();
             return;
