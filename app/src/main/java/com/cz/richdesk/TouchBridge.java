@@ -137,6 +137,8 @@ public class TouchBridge {
     private float maxDrift;                   // 本手势已见最大位移
     private int heldMoves;
     private boolean streaming;                // true = 已判定拖动，MOVE 实时透传
+    /** cmd 兜底通道 MOVE 限频锚点（只在注入线程读写） */
+    private long lastCmdMoveAt;
 
     private TouchBridge(Context c) {
         app = c;
@@ -892,6 +894,13 @@ public class TouchBridge {
                 Shell.run("input tap " + x + " " + y);
             }
             return;
+        }
+        // MOVE 限频 30Hz：每条命令都是一次 fork/exec（50~150ms），不限频的话
+        // 一次拖拽会灌进几十上百条命令，队列只增不减，手指抬起了还在补发
+        if (masked == MotionEvent.ACTION_MOVE) {
+            long now = SystemClock.uptimeMillis();
+            if (now - lastCmdMoveAt < 33) return;
+            lastCmdMoveAt = now;
         }
         switch (masked) {
             case MotionEvent.ACTION_DOWN:

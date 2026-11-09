@@ -735,17 +735,17 @@ public class PipPane {
         if (display < 0) return;
         main.postDelayed(() -> {
             if (!targetPkg.equals(pkg)) return;
-            int taskId = findTaskId(targetPkg);
-            if (taskId >= 0 && taskId != -1 && !taskOnDisplay(taskId, display)) {
-                // moveTask 现在可能绕道 shell（几百 ms），丢后台线程别卡主线程
-                final int fTid = taskId;
-                new Thread(() -> {
-                    if (moveTask(fTid, display)) {
-                        Log.w(TAG, "任务 " + fTid + " 不在 display " + display
+            // findTaskId（getRunningTasks）和 taskOnDisplay 都是 binder 调用：
+            // 旧实现整段跑在主线程，每开一个应用主线程就顿一下，丢后台
+            new Thread(() -> {
+                int taskId = findTaskId(targetPkg);
+                if (taskId >= 0 && !taskOnDisplay(taskId, display)) {
+                    if (moveTask(taskId, display)) {
+                        Log.w(TAG, "任务 " + taskId + " 不在 display " + display
                                 + "，已搬回 (" + targetPkg + ")");
                     }
-                }, "pipdesk-movetask").start();
-            }
+                }
+            }, "pipdesk-findtask").start();
         }, 1200);
     }
 
@@ -1129,28 +1129,28 @@ public class PipPane {
         // 关键：应用 task 还挂在虚拟屏上时，直接 startActivity 到主屏只会把
         // 虚拟屏上的旧 task 顶到前台（看起来像"全屏打开没反应"）。
         // 必须先把 task 搬回主屏（display 0），再 startActivity 前置它。
-        int tid = findTaskId(targetPkg);
-        if (tid < 0) {
-            Log.w(TAG, "全屏打开 " + targetPkg + "：未找到 task，直接 startActivity 兜底");
-            startFullscreenIntent(i, tid);
-            if (after != null) main.postDelayed(after, 400);
-            return;
-        }
-        // 标记：这块屏的应用去主屏全屏了（只有本屏的应用才标记，别的应用全屏与本屏无关）
-        if (targetPkg.equals(pkg)) fullscreened = true;
-        // 搬 task 在 MIUI 上要绕道 shell（`am display move-stack`），可能耗时几百毫秒，
-        // 放后台线程执行，完成后回主线程再前置 —— 不能卡住桌面。
+        // findTaskId 是 binder 调用（getRunningTasks/反射遍历），连同搬 task
+        // 一起丢后台执行，完成后回主线程前置 —— 旧实现在主线程查 task，会顿一下。
         final Intent intent = i;
-        final int fTid = tid;
         new Thread(() -> {
-            boolean moved = moveTask(fTid, android.view.Display.DEFAULT_DISPLAY);
+            int tid = findTaskId(targetPkg);
+            if (tid < 0) {
+                Log.w(TAG, "全屏打开 " + targetPkg + "：未找到 task，直接 startActivity 兜底");
+                main.post(() -> startFullscreenIntent(intent, tid));
+                if (after != null) main.postDelayed(after, 400);
+                return;
+            }
+            // 标记：这块屏的应用去主屏全屏了（只有本屏的应用才标记，别的应用全屏与本屏无关）
+            if (targetPkg.equals(pkg)) fullscreened = true;
+            // 搬 task 在 MIUI 上要绕道 shell（`am display move-stack`），可能耗时几百毫秒
+            boolean moved = moveTask(tid, android.view.Display.DEFAULT_DISPLAY);
             // 校验是否真的搬过去了：搬失败的话 startActivity 只会顶起虚拟屏上的
             // 旧 task（看起来"没反应"），日志里要能直接看出是哪一步断了
-            Log.i(TAG, "全屏打开 " + targetPkg + " taskId=" + fTid
+            Log.i(TAG, "全屏打开 " + targetPkg + " taskId=" + tid
                     + " move=" + moved
-                    + " onDisplay0=" + (moved && taskOnDisplay(fTid, android.view.Display.DEFAULT_DISPLAY)));
+                    + " onDisplay0=" + (moved && taskOnDisplay(tid, android.view.Display.DEFAULT_DISPLAY)));
             main.post(() -> {
-                startFullscreenIntent(intent, fTid);
+                startFullscreenIntent(intent, tid);
                 // 等应用在主屏画好第一帧再收画中画，避免中间露出空白虚拟屏
                 if (after != null) main.postDelayed(after, 500);
             });

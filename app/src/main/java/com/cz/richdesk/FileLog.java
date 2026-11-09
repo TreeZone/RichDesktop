@@ -68,18 +68,30 @@ public final class FileLog {
                 SimpleDateFormat day = new SimpleDateFormat("yyyy-MM-dd", Locale.US);
                 String today = day.format(new Date());
                 BufferedWriter w = open(today);
+                long written = 0;
+                int lines = 0;
                 while ((line = r.readLine()) != null) {
                     String d = day.format(new Date());
                     if (!d.equals(today)) {       // 跨天：换文件
                         today = d;
                         closeQuietly(w);
                         w = open(today);
+                        written = 0;
+                        lines = 0;
                     }
                     if (w != null) {
                         synchronized (LOCK) {       // 与看门狗 dump 串行，避免多行内容交错
                             w.write(line);
                             w.newLine();
                             w.flush();              // 逐行 flush：被杀时也不丢最后的现场
+                        }
+                        written += line.length() + 1;
+                        // 日内轮转：旧实现只在 open() 时判 4MB，当天文件可以无限涨大；
+                        // 每 256 行查一次，超限就重开（open 内部会把旧文件轮转成 .old）
+                        if (++lines % 256 == 0 && written > MAX_BYTES) {
+                            closeQuietly(w);
+                            w = open(today);
+                            written = 0;
                         }
                     }
                 }
@@ -116,11 +128,29 @@ public final class FileLog {
     }
 
     /**
+     * 单线程日志 IO：append 由调用线程转投这里执行。
+     * 旧实现直接在调用线程 open+write+flush —— PipPane.restartApp 这类 UI 回调
+     * 触发的调用会在主线程等磁盘。现在统一丢后台，调用方零等待。
+     */
+    private static final java.util.concurrent.ExecutorService IO =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "pipdesk-filelog-io");
+                t.setDaemon(true);
+                t.setPriority(Thread.MIN_PRIORITY);
+                return t;
+            });
+
+    /**
      * 追加一段多行文本（看门狗 dump 堆栈用）。与 logcat 抓取线程并行写入，
      * 必须加锁，否则多行内容会互相插进对方中间，堆栈就读不出来了。
+     * 任何线程都可调用（内部转后台），不会阻塞调用方。
      */
     public static void append(String text) {
         if (text == null || text.isEmpty() || dir == null) return;
+        IO.execute(() -> appendSync(text));
+    }
+
+    private static void appendSync(String text) {
         synchronized (LOCK) {
             BufferedWriter w = open(today());
             try {

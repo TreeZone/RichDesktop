@@ -49,8 +49,13 @@ public class Ui {
     /** 当前是否深色外观（深玻璃 + 白字）。updateAppearance() 里计算 */
     public static volatile boolean dark = true;
 
-    /** 壁纸亮度缓存：null = 还没测过 */
-    private static Boolean wallpaperDarkCache;
+    /** 壁纸亮度缓存：null = 还没测过。只在后台线程解码时写入 */
+    private static volatile Boolean wallpaperDarkCache;
+    /** 上一次测得的壁纸亮度：后台重算期间拿它顶住外观，不让主线程等解码 */
+    private static volatile Boolean lastKnownWallpaperDark;
+    private static volatile boolean wallpaperRecheckPending;
+    /** 后台重算完成后的回调（主线程执行）——MainActivity 用它触发外观刷新 */
+    public static volatile Runnable onWallpaperRechecked;
 
     public static float density(Context c) {
         return c.getResources().getDisplayMetrics().density;
@@ -98,8 +103,37 @@ public class Ui {
                 return;
             }
         } catch (Throwable ignored) { }
-        // 系统没开深色 → 按壁纸亮度
-        dark = wallpaperDark(c);
+        // 系统没开深色 → 按壁纸亮度。
+        // 有缓存直接用；没缓存先用上一次的值顶住、同时丢后台线程重算。
+        // 绝不在调用线程（onCreate / TIME_TICK 都是主线程）同步解码整张壁纸 ——
+        // 那是启动卡顿和 ANR 的老根因。
+        Boolean cached = wallpaperDarkCache;
+        if (cached != null) {
+            dark = cached;
+        } else {
+            Boolean last = lastKnownWallpaperDark;
+            dark = last != null ? last : true;
+            requestWallpaperRecheck(c);
+        }
+    }
+
+    /** 后台重算壁纸亮度（去重：已有重算在跑就不重复起）；完成后回调主线程 */
+    private static void requestWallpaperRecheck(Context c) {
+        if (wallpaperRecheckPending) return;
+        wallpaperRecheckPending = true;
+        final Context app = c.getApplicationContext();
+        new Thread(() -> {
+            boolean r = computeWallpaperDark(app);
+            wallpaperDarkCache = r;
+            lastKnownWallpaperDark = r;
+            wallpaperRecheckPending = false;
+            Runnable cb = onWallpaperRechecked;
+            if (cb != null) {
+                try {
+                    new android.os.Handler(android.os.Looper.getMainLooper()).post(cb);
+                } catch (Throwable ignored) { }
+            }
+        }, "pipdesk-wallpaper-lum").start();
     }
 
     // ------------------------------------------------------------ 系统夜间模式联动
@@ -141,8 +175,7 @@ public class Ui {
     }
 
     /** 只在后台线程调用：取系统壁纸，缩到 32x32 求平均亮度 */
-    private static boolean wallpaperDark(Context c) {
-        if (wallpaperDarkCache != null) return wallpaperDarkCache;
+    private static boolean computeWallpaperDark(Context c) {
         boolean result = true;
         try {
             Drawable dw = WallpaperManager.getInstance(c).getDrawable();
@@ -158,24 +191,24 @@ public class Ui {
                 }
                 if (b != null) {
                     int w = Math.min(32, b.getWidth()), h = Math.min(32, b.getHeight());
-                    long lum = 0;
+                    double lum = 0;
                     int n = 0;
                     for (int y = 0; y < h; y += 2) {
                         for (int x = 0; x < w; x += 2) {
                             int p = b.getPixel(x, y);
-                            lum += Color.red(p) * 2126 + Color.green(p) * 7152
-                                    + Color.blue(p) * 722;
+                            // sRGB 感知灰度 0~1（旧实现阈值量纲错了 255 倍，几乎恒判浅色）
+                            lum += (Color.red(p) * 0.2126 + Color.green(p) * 0.7152
+                                    + Color.blue(p) * 0.0722) / 255.0;
                             n++;
                         }
                     }
-                    // 平均亮度 > 0.58 → 浅色壁纸
-                    result = n == 0 || (lum / (double) n) < 0.58 * 10000;
+                    // 平均灰度 < 0.58 → 深色壁纸
+                    result = n == 0 || (lum / n) < 0.58;
                 }
             }
         } catch (Throwable t) {
             Log.w(TAG, "壁纸亮度检测失败，按深色处理", t);
         }
-        wallpaperDarkCache = result;
         return result;
     }
 

@@ -192,7 +192,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         instance = this;
         FileLog.start(this);       // 日志落盘（排查车机问题用），越早启动越完整
         Watchdog.start();          // 主线程卡死自动 dump 堆栈，车机上不用连 adb 也能取到现场
-        DataDirFix.ensure(this);   // 安装后数据目录标签可能不对，先自愈
+        // 数据目录自愈（可能要跑递归 chcon，秒级）：丢后台线程，别挡启动首帧
+        new Thread(() -> DataDirFix.ensure(MainActivity.this), "pipdesk-datafix").start();
         // 铺满全屏：否则隐藏状态栏后窗口也不会往上长，画中画顶部永远差一条状态栏的高度
         if (Build.VERSION.SDK_INT >= 30) {
             getWindow().setDecorFitsSystemWindows(false);
@@ -299,6 +300,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
         // 深浅色外观：先按手动/系统模式立即生效，壁纸亮度在后台精确算完后刷新
         Ui.updateAppearance(this);
+        // 壁纸亮度后台重算完成 → 主线程回这里比对并刷新（不再在主线程等解码）
+        Ui.onWallpaperRechecked = this::refreshAppearanceIfChanged;
         // 不是「跟随安卓」时，把结果反推给系统：开机后桌面和屏内应用保持一致
         if (Prefs.getThemeMode(this) != Prefs.THEME_AUTO) {
             Ui.applySystemNightMode(this, Ui.dark);
@@ -403,6 +406,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
         rvDock = new RecyclerView(this);
         rvDock.setLayoutManager(new LinearLayoutManager(this, LinearLayoutManager.HORIZONTAL, false));
+        rvDock.setHasFixedSize(true);       // 格子数变化走 adapter 通知，省整表 requestLayout
         rvDock.setOverScrollMode(View.OVER_SCROLL_NEVER);
         rvDock.setClipToPadding(false);
         int dp8 = Ui.dp(this, 8);
@@ -453,6 +457,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         listSpan = effectiveListColumns();
         appsGlm = new GridLayoutManager(this, listSpan);
         rvApps.setLayoutManager(appsGlm);
+        rvApps.setHasFixedSize(true);
         rvApps.setClipToPadding(false);
         rvApps.setOverScrollMode(View.OVER_SCROLL_NEVER);
         int p = Ui.dp(this, 8);
@@ -472,18 +477,27 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         // 滚动中每 90ms 一次（跟上手感），停下时再补一次（落在最终位置）。
         rvApps.addOnScrollListener(new RecyclerView.OnScrollListener() {
             private long last;
+            private int accDy;
 
             @Override
             public void onScrolled(RecyclerView rv, int dx, int dy) {
+                // 滚动中的刷新是滚动卡顿的老根因（每个可见标签都重取样），
+                // 节流 = 时间（≥120ms）+ 空间（累计滚过约一行高度 48px）双门槛
+                accDy += dy;
+                if (Math.abs(accDy) < 48) return;
                 long now = android.os.SystemClock.uptimeMillis();
-                if (now - last < 90) return;
+                if (now - last < 120) return;
                 last = now;
+                accDy = 0;
                 repaintWallText(rv);
             }
 
             @Override
             public void onScrollStateChanged(RecyclerView rv, int newState) {
-                if (newState == RecyclerView.SCROLL_STATE_IDLE) repaintWallText(rv);
+                if (newState == RecyclerView.SCROLL_STATE_IDLE) {
+                    accDy = 0;
+                    repaintWallText(rv);
+                }
             }
         });
         return page;
@@ -1383,6 +1397,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         PerfMon.detach();
         Watchdog.setProbe(null);
         WallTint.setOnReady(null);
+        Ui.onWallpaperRechecked = null;     // 静态回调别挂着旧 Activity
         if (pip != null) pip.release();
         pip = null;
     }

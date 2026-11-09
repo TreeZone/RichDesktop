@@ -117,11 +117,22 @@ public final class WallTint {
         startLoad(c);
     }
 
-    /** 壁纸变了：丢掉缓存重新取 */
+    /** 有加载在跑时又来一次 invalidate：等它结束后补一次，避免两条线程并发解码互相覆盖 */
+    private static volatile boolean pendingReload;
+
+    /**
+     * 壁纸变了：丢掉缓存重新取。
+     * 旧实现直接把 loading 清成 false 再无条件起线程 —— 动态壁纸会连发多条广播，
+     * 结果是同时几条线程全图解码、后完成的旧线程还会覆盖新结果。现在有加载在跑
+     * 就只挂一个 pendingReload 标记，等在跑的这条结束后最多补一次。
+     */
     public static void invalidate(Context c) {
         thumb = null;
         version++;
-        loading = false;
+        if (loading) {
+            pendingReload = true;
+            return;
+        }
         startLoad(c);
     }
 
@@ -193,6 +204,11 @@ public final class WallTint {
             thumb = pixelsOk ? b : null;
             version++;
             loading = false;
+            // 加载期间又来过 invalidate：补一次重载（最多补一次，不会滚雪球）
+            if (pendingReload) {
+                pendingReload = false;
+                startLoad(app);
+            }
             Log.i(TAG, String.format(
                     "壁纸取样 live=%s var=%.4f 壁纸L=%.3f 屏幕L=%.3f colors=%s -> 按位置=%s 全局亮=%s",
                     live, var, avg, b == null ? -1 : screenLum(avg),
@@ -255,10 +271,26 @@ public final class WallTint {
                 + Color.blue(color) * 0.114f) / 255f;
     }
 
-    /** sRGB 单通道 → 线性光强 */
+    /**
+     * sRGB 单通道 → 线性光强。
+     * 性能：linear() 走 Math.pow，而 relLum 在应用列表滚动时被高频调用（每个可见
+     * 标签每 ~100ms 27 个像素），所以按 0~255 预计算三张查找表，取样时只查表。
+     */
     private static double linear(int c) {
         double v = c / 255.0;
         return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    }
+
+    private static final float[] LUT_R = new float[256];
+    private static final float[] LUT_G = new float[256];
+    private static final float[] LUT_B = new float[256];
+    static {
+        for (int c = 0; c < 256; c++) {
+            double lin = linear(c);
+            LUT_R[c] = (float) (0.2126 * lin);
+            LUT_G[c] = (float) (0.7152 * lin);
+            LUT_B[c] = (float) (0.0722 * lin);
+        }
     }
 
     /**
@@ -267,9 +299,7 @@ public final class WallTint {
      * 直接拿 sRGB 平均会高估暗色壁纸的亮度。
      */
     private static double relLum(int color) {
-        return 0.2126 * linear(Color.red(color))
-                + 0.7152 * linear(Color.green(color))
-                + 0.0722 * linear(Color.blue(color));
+        return LUT_R[Color.red(color)] + LUT_G[Color.green(color)] + LUT_B[Color.blue(color)];
     }
 
     /** 相对亮度 → sRGB 灰度（0~1） */
@@ -360,7 +390,8 @@ public final class WallTint {
             if (y1 <= y0) y1 = Math.min(bh, y0 + 1);
 
             int nx = 9, ny = 3;
-            float[] vals = new float[nx * ny];
+            // 复用缓冲（只在主线程调用）：旧实现每次 new float[27]，滚动时是持续的 GC 抖动
+            float[] vals = SAMPLE_BUF;
             int n = 0;
             for (int i = 0; i < ny; i++) {
                 int y = y0 + (y1 - y0) * i / Math.max(1, ny - 1);
@@ -381,4 +412,7 @@ public final class WallTint {
     private static float fclamp(float v, float lo, float hi) {
         return v < lo ? lo : Math.min(v, hi);
     }
+
+    /** sampleRelLum 的复用缓冲（9×3 = 27，只在主线程读写） */
+    private static final float[] SAMPLE_BUF = new float[27];
 }

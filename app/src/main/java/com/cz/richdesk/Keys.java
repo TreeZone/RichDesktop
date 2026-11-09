@@ -43,6 +43,18 @@ public class Keys {
 
     private static final String TAG = "PipDesk";
 
+    /**
+     * 按键注入统一走这条单线程队列（旧实现每次按键 new 一个线程，连点/长按重复
+     * 触发时会堆出多条线程，还可能各自阻塞在 shell 兜底上）。
+     */
+    private static final java.util.concurrent.ExecutorService EXEC =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "pipdesk-key");
+                t.setPriority(Thread.NORM_PRIORITY + 1);
+                t.setDaemon(true);
+                return t;
+            });
+
     private Keys() { }
 
     public static void back(Context c) {
@@ -69,14 +81,14 @@ public class Keys {
     public static void send(final Context ctx, final int keyCode) {
         if (ctx == null) return;
         final Context app = ctx.getApplicationContext();
-        new Thread(() -> {
+        EXEC.execute(() -> {
             if (inject(app, keyCode, android.view.Display.DEFAULT_DISPLAY)) {
                 Log.i(TAG, "按键注入成功 keyCode=" + keyCode);
                 return;
             }
             Log.w(TAG, "按键注入失败，改走 shell keyCode=" + keyCode);
             Shell.runSync("input keyevent " + keyCode);
-        }, "pipdesk-key").start();
+        });
     }
 
     /**
@@ -87,7 +99,7 @@ public class Keys {
     public static void send(final Context ctx, final int keyCode, final int displayId) {
         if (ctx == null) return;
         final Context app = ctx.getApplicationContext();
-        new Thread(() -> {
+        EXEC.execute(() -> {
             if (displayId >= 0 && displayId != android.view.Display.DEFAULT_DISPLAY) {
                 if (inject(app, keyCode, displayId)) {
                     Log.i(TAG, "按键定向注入成功 keyCode=" + keyCode + " d=" + displayId);
@@ -106,7 +118,7 @@ public class Keys {
             }
             Log.w(TAG, "按键注入失败，改走 shell keyCode=" + keyCode);
             Shell.runSync("input keyevent " + keyCode);
-        }, "pipdesk-key").start();
+        });
     }
 
     /** 注入一次 DOWN+UP；displayId >= 0 时把事件定向到该屏 */
