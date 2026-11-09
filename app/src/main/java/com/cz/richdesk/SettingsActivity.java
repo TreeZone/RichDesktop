@@ -497,25 +497,44 @@ public class SettingsActivity extends AppCompatActivity {
         wrap.addView(sb, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // 离散档位刻度：选项不多（≤20 个）时沿轨道画一排分隔点，与滑块中心
-        // 对齐（两端缩进半个滑块宽），一眼看出有几档可选。滑块压着的位置
-        // 不画（onProgressChanged 里重绘），点不会叠到滑块上。
+        // 离散档位刻度：选项不多（≤20 个）时沿轨道画一排分隔点，一眼看出有几档可选。
+        // 端点与轨道线精确重合：直接量 progressDrawable 里 track 层的真实 bounds
+        // （Material 轨道自带 4dp inset，按滑块宽估算必然对不上）。
+        // 滑块压着的位置不画（onProgressChanged 里重绘），点不会叠到滑块上。
         // DPI/圆角/图标大小这类几十档的连续型滑条不画（点太密没有信息量）。
         View ticks = null;
         if (steps + 1 <= 20) {
             ticks = new View(this) {
                 @Override protected void onDraw(Canvas canvas) {
-                    Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-                    p.setColor(Ui.tintDim());
-                    float inset = sb.getThumb().getIntrinsicWidth() / 2f;
-                    float w = Math.max(1, getWidth() - inset * 2);
-                    float cy = getHeight() / 2f;
-                    float r = Ui.dp(getContext(), 2.5f);
-                    float thumbX = inset + w * sb.getProgress() / (float) steps;
+                    float left, right, cy;
+                    // 量轨道真实边界；拿不到就退回滑块宽估算
+                    android.graphics.Rect tb = null;
+                    try {
+                        android.graphics.drawable.LayerDrawable ld =
+                                (android.graphics.drawable.LayerDrawable) sb.getProgressDrawable();
+                        android.graphics.drawable.Drawable bg =
+                                ld.findDrawableByLayerId(android.R.id.background);
+                        if (bg != null) tb = bg.getBounds();
+                    } catch (Throwable ignored) { }
+                    if (tb != null && tb.width() > 0) {
+                        left = sb.getPaddingLeft() + tb.left;
+                        right = sb.getPaddingLeft() + tb.right;
+                        cy = sb.getPaddingTop() + tb.exactCenterY();
+                    } else {
+                        float inset = sb.getThumb().getIntrinsicWidth() / 2f;
+                        left = inset;
+                        right = getWidth() - inset;
+                        cy = getHeight() / 2f;
+                    }
+                    float w = Math.max(1, right - left);
+                    float r = Ui.dp(getContext(), 2f);
+                    float thumbX = left + w * sb.getProgress() / (float) steps;
                     float hide = sb.getThumb().getIntrinsicWidth() / 2f + r;
+                    Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
                     for (int i = 0; i <= steps; i++) {
-                        float x = inset + w * i / steps;
+                        float x = left + w * i / (float) steps;
                         if (Math.abs(x - thumbX) < hide) continue;
+                        p.setColor(i <= sb.getProgress() ? Ui.tint() : Ui.tintDim());
                         canvas.drawCircle(x, cy, r, p);
                     }
                 }

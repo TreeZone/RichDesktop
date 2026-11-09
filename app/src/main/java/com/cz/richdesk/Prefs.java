@@ -26,8 +26,8 @@ public class Prefs {
 
     private static final String FILE = "pipdesk";
 
-    public static final int DOCK_MIN = 1;
-    public static final int DOCK_MAX = 20;
+    public static final int DOCK_MIN = 3;
+    public static final int DOCK_MAX = 10;
     public static final int PANE_MAX = 3;
 
     private static SharedPreferences sp(Context c) {
