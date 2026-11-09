@@ -449,6 +449,11 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         for (PipPane p : panes) p.bringBackIfFullscreened();
     }
 
+    /** 全局配置（夜间模式等）变化后调用：逐屏校验屏内应用还在不在本屏（见 PipPane.reensureTask） */
+    public void reensureAll() {
+        for (PipPane p : panes) p.reensureTask();
+    }
+
     public void release() {
         for (PipPane p : panes) p.release();
     }

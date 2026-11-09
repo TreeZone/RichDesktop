@@ -735,18 +735,62 @@ public class PipPane {
         if (display < 0) return;
         main.postDelayed(() -> {
             if (!targetPkg.equals(pkg)) return;
-            // findTaskId（getRunningTasks）和 taskOnDisplay 都是 binder 调用：
-            // 旧实现整段跑在主线程，每开一个应用主线程就顿一下，丢后台
+            // findTask（getRunningTasks）是 binder 调用：整段丢后台，别占主线程
             new Thread(() -> {
-                int taskId = findTaskId(targetPkg);
-                if (taskId >= 0 && !taskOnDisplay(taskId, display)) {
-                    if (moveTask(taskId, display)) {
-                        Log.w(TAG, "任务 " + taskId + " 不在 display " + display
-                                + "，已搬回 (" + targetPkg + ")");
-                    }
+                int taskDisp = findTaskDisplay(targetPkg);
+                if (taskDisp >= 0 && taskDisp != display) {
+                    Log.w(TAG, "任务不在 display " + display + "（在 " + taskDisp
+                            + "），搬回 (" + targetPkg + ")");
+                    forceToDisplay(targetPkg, display);
                 }
             }, "pipdesk-findtask").start();
         }, 1200);
+    }
+
+    /** 把应用 task 弄到本面板的虚拟屏：搬 task 优先；搬不动就移除后重新拉起 */
+    private void forceToDisplay(final String targetPkg, final int display) {
+        new Thread(() -> {
+            int tid = findTaskId(targetPkg);
+            if (tid >= 0 && moveTask(tid, display)) return;
+            // 这台 ROM 的 moveTaskToDisplay 反射不通（或 task 又变了）：
+            // 移除 task 后重新拉起 —— 新 task 会直接建在本面板的虚拟屏上
+            Log.i(TAG, "moveTask 搬不动，移除 task 后重新拉起 (" + targetPkg + ")");
+            if (tid >= 0) removeTask(tid);
+            main.postDelayed(() -> {
+                if (targetPkg.equals(pkg) && displayId >= 0) launchOn(targetPkg, displayId);
+            }, 300);
+        }, "pipdesk-forcedisp").start();
+    }
+
+    /**
+     * 全局配置（夜间模式等）变化后的兜底校验。
+     *
+     * UiModeManager.setNightMode 是全局 uiMode 变更：屏内应用没声明 uiMode
+     * configChanges 的会被销毁重建，这台 ROM 上重建后 task 偶尔被丢回主屏，
+     * 表现就是「切个深浅色，画中画里的应用被切走了」。
+     * 还在本屏 → 不动；落到别的屏 → 搬回；task 整个没了 → 重新拉起
+     * （launchOn 带的是 launch intent，应用其实还活着时这就是一次带回前台，无害）。
+     */
+    public void reensureTask() {
+        final String keep = pkg;
+        final int disp = displayId;
+        if (keep == null || disp < 0) return;
+        new Thread(() -> {
+            Object t = findTaskInfo(keep);
+            if (t == null) {
+                Log.w(TAG, "配置变更后任务消失，重新拉起 (" + keep + ")");
+                main.post(() -> {
+                    if (keep.equals(pkg) && displayId >= 0) launchOn(keep, displayId);
+                });
+                return;
+            }
+            Integer td = intField(t, "displayId");
+            if (td == null) return;          // 查得到 task 但查不到所在屏：别瞎折腾
+            if (td == disp) return;          // 就在本屏：正常
+            Log.w(TAG, "配置变更后任务在 display " + td + "，不在本屏 " + disp
+                    + "，搬回 (" + keep + ")");
+            forceToDisplay(keep, disp);
+        }, "pipdesk-reeensure").start();
     }
 
     /**
@@ -764,12 +808,45 @@ public class PipPane {
      * 这条链路实测可用（IWindowManager 同款写法已经跑通）。
      */
     private int findTaskId(String targetPkg) {
+        Object t = findTaskInfo(targetPkg);
+        if (t == null) return -1;
+        Integer tid = intField(t, "taskId");
+        return tid == null ? -1 : tid;
+    }
+
+    /**
+     * 找应用当前 task 所在的 displayId（与 findTaskId 同一套扫描）；找不到返回 -1。
+     * 注意：不能走 getTaskForTaskId 反射 —— 那条路在这台 HyperOS 上查不到，
+     * 永远返回"已在屏上"，错位检测形同虚设；getRunningTasks 的 task 信息里
+     * 自带 displayId，实测可用。
+     */
+    private int findTaskDisplay(String targetPkg) {
+        Object t = findTaskInfo(targetPkg);
+        if (t == null) return -1;
+        Integer disp = intField(t, "displayId");
+        return disp == null ? -1 : disp;
+    }
+
+    /**
+     * 三级降级找应用的 task 信息对象（taskId + displayId 都在上面）。
+     * 查找顺序（实测踩坑记录）：
+     *   1) 公共 API ActivityManager.getRunningTasks() —— 本应用 uid 1000 + PRIVILEGED，
+     *      能拿到全部 task（含虚拟屏）。零反射，优先用；
+     *   2) getAllRootTaskInfos()（Android 12+，唯一确定覆盖所有 display 的口）；
+     *   3) getTasks(maxNum)，任意形参数量都接受。
+     *
+     * 【重要】入口 binder 不能用 ActivityTaskManager.getService()：它在这台
+     * HyperOS 的隐藏 API blocklist 上，反射直接 NoSuchMethodException（logcat 里有
+     * "blocked, reflection, denied"）。必须走 ServiceManager + Stub.asInterface，
+     * 这条链路实测可用（IWindowManager 同款写法已经跑通）。
+     */
+    private Object findTaskInfo(String targetPkg) {
         // 1) 公共 API，无隐藏 API 风险
         try {
             ActivityManager am = (ActivityManager) app.getSystemService(Context.ACTIVITY_SERVICE);
-            Integer found = scanTaskInfos(am.getRunningTasks(30), targetPkg);
+            Object found = scanTask(am.getRunningTasks(30), targetPkg);
             if (found != null) {
-                Log.i(TAG, "findTaskId(" + targetPkg + ")=" + found + " (getRunningTasks)");
+                Log.i(TAG, "findTask(" + targetPkg + ") 命中 (getRunningTasks)");
                 return found;
             }
         } catch (Throwable t) {
@@ -783,9 +860,9 @@ public class PipPane {
                 for (java.lang.reflect.Method m : iface.getMethods()) {
                     if ("getAllRootTaskInfos".equals(m.getName())
                             && m.getParameterTypes().length == 0) {
-                        Integer found = scanTaskInfos(unwrapSlice(invokeQuiet(m, atm)), targetPkg);
+                        Object found = scanTask(unwrapSlice(invokeQuiet(m, atm)), targetPkg);
                         if (found != null) {
-                            Log.i(TAG, "findTaskId(" + targetPkg + ")=" + found + " (rootTasks)");
+                            Log.i(TAG, "findTask(" + targetPkg + ") 命中 (rootTasks)");
                             return found;
                         }
                     }
@@ -797,18 +874,18 @@ public class PipPane {
                     if (pt.length < 1 || pt[0] != int.class) continue;
                     Object[] args = defaultArgs(pt);
                     args[0] = 30;
-                    Integer found = scanTaskInfos(unwrapSlice(invokeQuiet(m, atm, args)), targetPkg);
+                    Object found = scanTask(unwrapSlice(invokeQuiet(m, atm, args)), targetPkg);
                     if (found != null) {
-                        Log.i(TAG, "findTaskId(" + targetPkg + ")=" + found + " (getTasks)");
+                        Log.i(TAG, "findTask(" + targetPkg + ") 命中 (getTasks)");
                         return found;
                     }
                 }
             }
-            Log.i(TAG, "findTaskId(" + targetPkg + ") 未找到（接口全试过）");
+            Log.i(TAG, "findTask(" + targetPkg + ") 未找到（接口全试过）");
         } catch (Throwable t) {
             Log.i(TAG, "查 task 跳过：" + t.getClass().getSimpleName());
         }
-        return -1;
+        return null;
     }
 
     /** ParceledListSlice → List；本来就是 List 就直接用，解不开返回 null */
@@ -846,15 +923,15 @@ public class PipPane {
     }
 
     /**
-     * 在 task 信息列表里找目标包名。
-     * 命中：topActivity 的包名，或 childTaskNames（根 task 的子任务名，
+     * 在 task 信息列表里找目标包名，返回命中的 task 信息对象本身（taskId/displayId
+     * 都能从它身上取）。命中：topActivity 的包名，或 childTaskNames（根 task 的子任务名，
      * 形如 "com.xx.app/.ui.MainActivity"）里有该包 —— RootTaskInfo 的
      * topActivity 经常是 null，childTaskNames 是更稳的字段。
      * 多个命中时优先**非主屏**的那个（全屏打开要搬的就是虚拟屏上那个）。
      */
-    private static Integer scanTaskInfos(List<?> tasks, String targetPkg) {
+    private static Object scanTask(List<?> tasks, String targetPkg) {
         if (tasks == null) return null;
-        int fallback = -1;
+        Object fallback = null;
         for (Object t : tasks) {
             if (t == null) continue;
             Integer tid = intField(t, "taskId");
@@ -873,10 +950,10 @@ public class PipPane {
                 }
             }
             if (!hit) continue;
-            if (disp != null && disp != android.view.Display.DEFAULT_DISPLAY) return tid;
-            if (fallback < 0) fallback = tid;
+            if (disp != null && disp != android.view.Display.DEFAULT_DISPLAY) return t;
+            if (fallback == null) fallback = t;
         }
-        return fallback >= 0 ? fallback : null;
+        return fallback;
     }
 
     private static Integer intField(Object o, String name) {
@@ -933,26 +1010,6 @@ public class PipPane {
                     .getMethod("getService").invoke(null);
         } catch (Throwable ignored) { }
         return null;
-    }
-
-    private static boolean taskOnDisplay(int taskId, int display) {
-        try {
-            Object atm = activityTaskManager();
-            if (atm == null) return true;   // 拿不到服务就别乱搬
-            for (java.lang.reflect.Method m : atm.getClass().getMethods()) {
-                if (!"getTaskForTaskId".equals(m.getName())) continue;
-                Class<?>[] pt = m.getParameterTypes();
-                if (pt.length == 1 && pt[0] == int.class) {
-                    Object task = invokeQuiet(m, atm, taskId);
-                    if (task == null) return true;
-                    Integer disp = intField(task, "displayId");
-                    return disp == null || disp == display;
-                }
-            }
-            return true;   // 接口不在，别乱搬
-        } catch (Throwable t) {
-            return true;   // 查不到就别乱搬
-        }
     }
 
     /**
@@ -1148,7 +1205,8 @@ public class PipPane {
             // 旧 task（看起来"没反应"），日志里要能直接看出是哪一步断了
             Log.i(TAG, "全屏打开 " + targetPkg + " taskId=" + tid
                     + " move=" + moved
-                    + " onDisplay0=" + (moved && taskOnDisplay(tid, android.view.Display.DEFAULT_DISPLAY)));
+                    + " onDisplay0=" + (moved && findTaskDisplay(targetPkg)
+                            == android.view.Display.DEFAULT_DISPLAY));
             main.post(() -> {
                 startFullscreenIntent(intent, tid);
                 // 等应用在主屏画好第一帧再收画中画，避免中间露出空白虚拟屏

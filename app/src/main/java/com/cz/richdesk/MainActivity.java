@@ -314,7 +314,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         Ui.onWallpaperRechecked = this::refreshAppearanceIfChanged;
         // 不是「跟随安卓」时，把结果反推给系统：开机后桌面和屏内应用保持一致
         if (Prefs.getThemeMode(this) != Prefs.THEME_AUTO) {
-            Ui.applySystemNightMode(this, Ui.dark);
+            syncSystemNightMode(Ui.dark);
         }
         new Thread(() -> {
             SunTimes.refreshIfStale(getApplicationContext());   // 「跟随时间」需要日落/日出
@@ -365,9 +365,24 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         Ui.updateAppearance(this);
         if (was != Ui.dark) {
             // 定时/跟随安卓换色时，系统夜间模式一起同步：屏内应用才会跟着变深/变浅
-            Ui.applySystemNightMode(this, Ui.dark);
+            syncSystemNightMode(Ui.dark);
             refreshAppearance();
         }
+    }
+
+    /**
+     * 把深浅色同步给系统（UiModeManager）。
+     *
+     * setNightMode 是全局 uiMode 变更：屏内应用没声明 uiMode configChanges 的会被
+     * 销毁重建，这台 ROM 上重建后 task 偶尔被丢回主屏 —— 用户看到的就是
+     * 「切个深浅色，画中画里的应用被切走了」。所以同步完延迟 2s 逐屏校验：
+     * 被挪走的搬回、没了的重新拉起（PipPane.reensureTask）。
+     */
+    private void syncSystemNightMode(boolean dark) {
+        Ui.applySystemNightMode(this, dark);
+        if (pip == null) return;
+        new android.os.Handler(android.os.Looper.getMainLooper())
+                .postDelayed(pip::reensureAll, 2000);
     }
 
     private static int currentDay() {
@@ -1111,7 +1126,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         boolean toDark = !Ui.dark;
         Prefs.setThemeMode(this, toDark ? Prefs.THEME_DARK : Prefs.THEME_LIGHT);
         Ui.updateAppearance(this);
-        Ui.applySystemNightMode(this, Ui.dark);   // 屏内应用（虚拟屏）跟着系统一起变
+        syncSystemNightMode(Ui.dark);   // 屏内应用（虚拟屏）跟着系统一起变
         refreshAppearance();
         toast(toDark ? "已切换到深色模式" : "已切换到浅色模式");
     }
@@ -1171,10 +1186,44 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
      * Dock、玻璃全部重新走一遍 onCreate/onResume。屏内应用被折腾出来的错位、残影、
      * 触摸转发卡住这类问题，这一步就能恢复；比 killProcess 稳（进程活着，
      * 桌面不会有一小段"什么都没有"的空窗）。
+     *
+     * 但这台车机上 recreate() 重建出来的桌面**不一定自己回到前台**（用户实测：
+     * 重启后桌面退出去了，再起来时压在别的应用下面，看起来像"起不来"）。
+     * 所以重建前置个标志，onResume 里 moveTaskToFront 拎回前台 + 延迟补一发
+     * HOME intent 双保险（见 {@link #bringLauncherToFront}）。
      */
     private void restartLauncher() {
         toast("正在重启桌面…");
+        pendingToFront = true;
         recreate();
+    }
+
+    /** recreate() 重建完成后要把 task 拎回前台（车机上重建后的 HOME 不一定自己到前台） */
+    private static boolean pendingToFront;
+
+    /**
+     * 双保险拉回前台：
+     * 1) moveTaskToFront 把桌面 task 拎到最前（uid 1000 有 REORDER_TASKS）；
+     * 2) 再以 HOME intent 拉一次 —— HOME 是桌面身份，系统必然把它放最前。
+     * 重建正常时这两步都是空操作（task 本来就在最前）。
+     */
+    private void bringLauncherToFront() {
+        try {
+            android.app.ActivityManager am =
+                    (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            am.moveTaskToFront(getTaskId(), 0);
+        } catch (Throwable t) {
+            Log.i(TAG, "moveTaskToFront 不可用：" + t.getClass().getSimpleName());
+        }
+        try {
+            Intent home = new Intent(Intent.ACTION_MAIN)
+                    .addCategory(Intent.CATEGORY_HOME)
+                    .setPackage(getPackageName())
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(home);
+        } catch (Throwable t) {
+            Log.i(TAG, "HOME 兜底失败：" + t.getClass().getSimpleName());
+        }
     }
 
     /** 外观（深浅色）变化后，把桌面上所有玻璃和文字刷成新配色 */
@@ -1311,6 +1360,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     protected void onResume() {
         super.onResume();
         AppState.mainResumed = true;
+        // recreate() 重建完的第一帧：车机上不一定自己回前台，主动拎一次
+        if (pendingToFront) {
+            pendingToFront = false;
+            bringLauncherToFront();
+        }
         applySettings();
         // 回到桌面：把「全屏打开」过、还挂在主屏的应用搬回画中画继续显示
         pip.bringBackFullscreened();
@@ -1346,6 +1400,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             appliedDpi = dpi;
             for (String p : running) pip.openAuto(p);
             openDefaults();        // 新增的空闲屏也吃默认应用配置
+            // 重建后的窗口期：正在飞的应用 task 可能落在刚被替换掉的旧虚拟屏上
+            // （recreate 重启桌面实测会走到：task 在旧屏、面板换了新屏 → PiP 冻结）。
+            // 2.5s 后逐屏校验，跑错屏的搬回、没了的重新拉起（PipPane.reensureTask）。
+            new android.os.Handler(android.os.Looper.getMainLooper())
+                    .postDelayed(pip::reensureAll, 2500);
         }
         if (dpi != appliedDpi) {
             pip.setDpi(dpi);
