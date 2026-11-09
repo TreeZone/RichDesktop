@@ -49,8 +49,10 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
 
     /** 快捷方式格子的伪包名（下标 0 = 「桌面设置」，它没有伪包名，单独处理） */
     private static final String[] SHORTCUT_PKGS = {
-            AppInfo.THEME_PKG, AppInfo.RESTART_PKG, AppInfo.BACK_PKG, AppInfo.HOME_PKG};
-    private static final String[] SHORTCUT_LABELS = {"深浅模式", "重启桌面", "返回", "主页"};
+            AppInfo.THEME_PKG, AppInfo.RESTART_PKG, AppInfo.BACK_PKG, AppInfo.HOME_PKG,
+            AppInfo.SLEEP_PKG, AppInfo.RECENTS_PKG, AppInfo.VOL_UP_PKG, AppInfo.VOL_DOWN_PKG};
+    private static final String[] SHORTCUT_LABELS = {
+            "深浅模式", "重启桌面", "返回", "主页", "息屏", "最近任务", "音量 +", "音量 -"};
     /** 快捷方式一共几格（含「桌面设置」） */
     private static final int SHORTCUT_COUNT = SHORTCUT_PKGS.length + 1;
 
@@ -118,6 +120,10 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         if (AppInfo.RESTART_PKG.equals(pkg)) return new RestartIcon();
         if (AppInfo.BACK_PKG.equals(pkg)) return new BackIcon();
         if (AppInfo.HOME_PKG.equals(pkg)) return new HomeIcon();
+        if (AppInfo.SLEEP_PKG.equals(pkg)) return new SleepIcon();
+        if (AppInfo.RECENTS_PKG.equals(pkg)) return new RecentsIcon();
+        if (AppInfo.VOL_UP_PKG.equals(pkg)) return new VolUpIcon();
+        if (AppInfo.VOL_DOWN_PKG.equals(pkg)) return new VolDownIcon();
         return null;
     }
 
@@ -679,6 +685,106 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
             // 屋身
             cv.drawRoundRect(l + side * 0.30f, t + side * 0.48f,
                     l + side * 0.70f, t + side * 0.78f, side * 0.06f, side * 0.06f, p);
+        }
+    }
+
+    /** 「息屏」：深靛底板 + 电源符号（圆环 + 顶部缺口 + 竖线） */
+    static class SleepIcon extends ShortcutIcon {
+        @Override int[] plate() {
+            return Ui.dark ? new int[]{0xFF5E6C93, 0xFF1B2133}
+                    : new int[]{0xFFDDE3F6, 0xFFA7B3D4};
+        }
+
+        @Override void glyph(Canvas cv, float l, float t, float side, Paint p) {
+            float cx = l + side * 0.5f, cy = t + side * 0.55f;
+            float r = side * 0.21f;
+            p.setColor(Ui.dark ? 0xFFEFF2FF : 0xFF242B45);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(side * 0.085f);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            // 从 -60° 起扫 300°，顶部留个缺口给竖线
+            cv.drawArc(new android.graphics.RectF(cx - r, cy - r, cx + r, cy + r),
+                    -60f, 300f, false, p);
+            cv.drawLine(cx, t + side * 0.26f, cx, cy - r * 0.15f, p);
+        }
+    }
+
+    /** 「最近任务」：石板灰底板 + 两张叠放的卡片（后一张淡一点） */
+    static class RecentsIcon extends ShortcutIcon {
+        @Override int[] plate() {
+            return Ui.dark ? new int[]{0xFF727E8B, 0xFF23282E}
+                    : new int[]{0xFFE3E8EE, 0xFFAAB6C3};
+        }
+
+        @Override void glyph(Canvas cv, float l, float t, float side, Paint p) {
+            float rad = side * 0.055f;
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(side * 0.062f);
+            // 后面那张：只留上半圈，看起来像被压住
+            p.setColor(Ui.dark ? 0x66EFF3F8 : 0x66232A32);
+            cv.drawRoundRect(l + side * 0.27f, t + side * 0.24f,
+                    l + side * 0.65f, t + side * 0.58f, rad, rad, p);
+            // 前面那张
+            p.setColor(Ui.dark ? 0xFFEFF3F8 : 0xFF232A32);
+            cv.drawRoundRect(l + side * 0.35f, t + side * 0.38f,
+                    l + side * 0.73f, t + side * 0.76f, rad, rad, p);
+        }
+    }
+
+    /** 喇叭底座（两个音量图标共用）：矩形 + 梯形 */
+    private static void speaker(Canvas cv, float l, float t, float side, float alpha, Paint p) {
+        p.setStyle(Paint.Style.FILL);
+        p.setAlpha((int) (255 * alpha));
+        Path sp = new Path();
+        sp.moveTo(l + side * 0.22f, t + side * 0.42f);
+        sp.lineTo(l + side * 0.32f, t + side * 0.42f);
+        sp.lineTo(l + side * 0.43f, t + side * 0.29f);
+        sp.lineTo(l + side * 0.43f, t + side * 0.71f);
+        sp.lineTo(l + side * 0.32f, t + side * 0.58f);
+        sp.lineTo(l + side * 0.22f, t + side * 0.58f);
+        sp.close();
+        cv.drawPath(sp, p);
+        p.setAlpha(255);
+    }
+
+    /** 「音量 +」：青底板 + 喇叭 + 加号 */
+    static class VolUpIcon extends ShortcutIcon {
+        @Override int[] plate() {
+            return Ui.dark ? new int[]{0xFF3F8FA8, 0xFF0F2B36}
+                    : new int[]{0xFFD6F0F8, 0xFF8FC4D6};
+        }
+
+        @Override void glyph(Canvas cv, float l, float t, float side, Paint p) {
+            int tone = Ui.dark ? 0xFFE9F8FF : 0xFF12323D;
+            p.setColor(tone);
+            speaker(cv, l, t, side, 1f, p);
+            p.setColor(tone);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(side * 0.075f);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            float ax = l + side * 0.66f, ay = t + side * 0.5f, arm = side * 0.10f;
+            cv.drawLine(ax - arm, ay, ax + arm, ay, p);
+            cv.drawLine(ax, ay - arm, ax, ay + arm, p);
+        }
+    }
+
+    /** 「音量 -」：紫底板 + 喇叭 + 减号 */
+    static class VolDownIcon extends ShortcutIcon {
+        @Override int[] plate() {
+            return Ui.dark ? new int[]{0xFF8A6FB0, 0xFF2A1F3A}
+                    : new int[]{0xFFEDE3F7, 0xFFBFA9DA};
+        }
+
+        @Override void glyph(Canvas cv, float l, float t, float side, Paint p) {
+            int tone = Ui.dark ? 0xFFF6EFFF : 0xFF2E2140;
+            p.setColor(tone);
+            speaker(cv, l, t, side, 1f, p);
+            p.setColor(tone);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(side * 0.075f);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            float ax = l + side * 0.66f, ay = t + side * 0.5f, arm = side * 0.10f;
+            cv.drawLine(ax - arm, ay, ax + arm, ay, p);
         }
     }
 }

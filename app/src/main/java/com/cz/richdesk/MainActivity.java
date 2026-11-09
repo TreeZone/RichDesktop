@@ -45,6 +45,19 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     private PaneBox paneBox;
     private FrameLayout dockWrap;
     private RecyclerView rvDock, rvApps;
+    /** Dock 一行：[左功能区][Dock 图标区][右功能区]（玻璃铺在 dockRow 上） */
+    private LinearLayout dockRow, dockLeftBox, dockRightBox;
+    /** 右功能区：时间 + 天气 */
+    private TextView dockClock, dockWeather;
+    private final android.os.Handler dockHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    /** 15s 一跳：刷时间/天气，顺带跑一次亮度自动调节（目标没变不会重复写系统设置） */
+    private final Runnable dockTick = new Runnable() {
+        @Override public void run() {
+            updateDockRealtime();
+            dockHandler.postDelayed(this, 15000);
+        }
+    };
 
     private final List<String> dockPkgs = new ArrayList<>();
     private List<AppInfo> appList;
@@ -432,14 +445,31 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         // Dock ↔ 画中画的间距 = 画中画之间的缝（Ui.PANE_GAP_DP），需求：两处永远一致
         dockWrap.setPadding(0, paneGapPx(), 0, 0);
 
+        // Dock 一行 = [左功能区][图标区][右功能区]；玻璃铺在整行上，三段共用一条连续的玻璃
+        dockRow = new LinearLayout(this);
+        dockRow.setOrientation(LinearLayout.HORIZONTAL);
+        dockRow.setGravity(Gravity.CENTER_VERTICAL);
+        int dp8 = Ui.dp(this, 8);
+        dockRow.setPadding(dp8, dp8, dp8, dp8);
+        dockRow.setBackground(Ui.glass(this, appliedDockCorner < 0 ? Prefs.getDockCorner(this) : appliedDockCorner));
+
+        // 左端功能区：自建快捷图标（返回/主页/息屏/音量…），默认隐藏
+        dockLeftBox = new LinearLayout(this);
+        dockLeftBox.setOrientation(LinearLayout.HORIZONTAL);
+        dockLeftBox.setGravity(Gravity.CENTER_VERTICAL);
+        dockLeftBox.setVisibility(View.GONE);
+        // 右端功能区：时间 + 天气，默认隐藏
+        dockRightBox = new LinearLayout(this);
+        dockRightBox.setOrientation(LinearLayout.VERTICAL);
+        dockRightBox.setGravity(Gravity.CENTER);
+        dockRightBox.setVisibility(View.GONE);
+
         rvDock = new RecyclerView(this);
         rvDock.setLayoutManager(new LinearLayoutManager(this, LinearLayoutManager.HORIZONTAL, false));
         rvDock.setHasFixedSize(true);       // 格子数变化走 adapter 通知，省整表 requestLayout
         rvDock.setOverScrollMode(View.OVER_SCROLL_NEVER);
         rvDock.setClipToPadding(false);
-        int dp8 = Ui.dp(this, 8);
-        rvDock.setPadding(dp8, dp8, dp8, dp8);
-        rvDock.setBackground(Ui.glass(this, appliedDockCorner < 0 ? Prefs.getDockCorner(this) : appliedDockCorner));
+        rvDock.setBackground(null);          // 玻璃在 dockRow 上（三段共用）
         rvDock.setOnTouchListener((v, e) -> {
             // 只有 Dock 内容超出一屏、真的需要自己横向滚动时才拦截翻页；
             // 内容放得下时（常态）不拦，Dock 上的左滑才能翻到应用页（需求 2）
@@ -452,7 +482,13 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         // Dock 用配置高度：RecyclerView 在 wrap_content 下会被量成 0，
         // 内容就会溢出到画中画区域上（之前"格子跑到画中画底部"就是这个原因）
         // 需求 2：Dock 宽度与画中画等宽 —— 直接 MATCH_PARENT，格子由 padding 居中
-        dockWrap.addView(rvDock, new FrameLayout.LayoutParams(
+        dockRow.addView(dockLeftBox, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        dockRow.addView(rvDock, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        dockRow.addView(dockRightBox, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        dockWrap.addView(dockRow, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         pageHome.addView(dockWrap, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, effectiveDockHeight()) + paneGapPx()));
@@ -461,6 +497,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         dockAdapter.setIconDp(Prefs.getDockIcon(this));
         rvDock.setAdapter(dockAdapter);
         dockAdapter.attachDragHelper(rvDock);   // 长按拖动排序（原地松手仍是菜单）
+        refreshDockPanels();                     // 左右功能区按配置显示
         rvDock.post(this::applyDockSlots);
         dockWrap.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> applyDockSlots());
         return pageHome;
@@ -647,6 +684,148 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         if (pageHome != null) pageHome.getRootView().requestApplyInsets();
     }
 
+    // ------------------------------------------------------------ Dock 左右功能区
+
+    /**
+     * 按配置重建 Dock 左右两端的功能区（设置里改开关后调用）。
+     * 左：自建快捷图标（返回/主页/息屏/最近任务/音量…）；
+     * 右：时间 + 天气。
+     */
+    private void refreshDockPanels() {
+        if (dockRow == null || dockLeftBox == null || dockRightBox == null) return;
+        boolean left = Prefs.dockLeftEnabled(this);
+        boolean right = Prefs.dockRightEnabled(this);
+        dockLeftBox.setVisibility(left ? View.VISIBLE : View.GONE);
+        dockRightBox.setVisibility(right ? View.VISIBLE : View.GONE);
+        if (left) rebuildDockLeft();
+        if (right) ensureDockRight();
+        updateDockRealtime();
+        startDockTicker();
+        applyDockSlots();
+    }
+
+    /** 左功能区：每个图标点一下执行、长按可移走；末尾一个「＋」用来添加 */
+    private void rebuildDockLeft() {
+        dockLeftBox.removeAllViews();
+        final int ic = Ui.dp(this, Prefs.getDockIcon(this));
+        final int gap = Ui.dp(this, 6);
+        for (final String pkg : Prefs.getDockLeft(this)) {
+            AppInfo ai = findApp(pkg);
+            android.widget.ImageView iv = new MaskedIconView(this);
+            iv.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
+            iv.setImageDrawable(ai != null ? ai.icon
+                    : getDrawable(android.R.drawable.sym_def_app_icon));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ic, ic);
+            lp.rightMargin = gap;
+            iv.setLayoutParams(lp);
+            iv.setOnClickListener(v -> {
+                if (AppInfo.isBuiltin(pkg)) runBuiltin(pkg);
+                else openPip(pkg, 0);
+            });
+            iv.setOnLongClickListener(v -> {
+                GlassMenu.show(this, labelOf(pkg),
+                        new CharSequence[]{"移到 Dock 图标区", "从左侧移除"},
+                        which -> {
+                            if (which == 0) {
+                                if (dockPkgs.size() >= Prefs.getDockCount(this)) {
+                                    toast("Dock 已满，可在设置里加大格数");
+                                    return;
+                                }
+                                if (!dockPkgs.contains(pkg)) dockPkgs.add(pkg);
+                                Prefs.setDock(this, dockPkgs);
+                                dockAdapter.notifyDataSetChanged();
+                                applyDockSlots();
+                                toast("已移到 Dock");
+                            } else {
+                                List<String> l = Prefs.getDockLeft(this);
+                                l.remove(pkg);
+                                Prefs.setDockLeft(this, l);
+                                rebuildDockLeft();
+                                applyDockSlots();
+                                toast("已从左侧移除");
+                            }
+                        });
+                return true;
+            });
+            dockLeftBox.addView(iv);
+        }
+
+        // 「＋」：从内置快捷方式里挑一个加进来
+        TextView add = new TextView(this);
+        int sz = Math.min(Ui.dp(this, 40), ic);
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(sz, sz);
+        alp.rightMargin = gap;
+        add.setLayoutParams(alp);
+        GradientDrawable g = new GradientDrawable();
+        g.setShape(GradientDrawable.OVAL);
+        g.setColor(Ui.dark ? 0x1FFFFFFF : 0x26000000);
+        g.setStroke(Math.max(1, Ui.dp(this, 1)), Ui.dark ? 0x4DFFFFFF : 0x40000000);
+        add.setBackground(g);
+        add.setGravity(Gravity.CENTER);
+        add.setText("＋");
+        add.setTextSize(16);
+        add.setTextColor(Ui.tint());
+        add.setOnClickListener(v -> pickDockLeftApp());
+        dockLeftBox.addView(add);
+    }
+
+    /** 往左功能区加图标：只列内置快捷方式（那才是「自己建的应用图标」） */
+    private void pickDockLeftApp() {
+        if (pickerDialog != null && pickerDialog.isShowing()) return;
+        pickerDialog = new AppPickerSheet(this, "左侧功能区 · 选择图标",
+                AppListAdapter.shortcuts(), Prefs.getListColumns(this), Prefs.getIconSize(this),
+                ai -> {
+                    List<String> l = Prefs.getDockLeft(this);
+                    if (!l.contains(ai.pkg)) l.add(ai.pkg);
+                    Prefs.setDockLeft(this, l);
+                    rebuildDockLeft();
+                    applyDockSlots();
+                });
+        pickerDialog.show();
+    }
+
+    /** 右功能区：时间 + 天气（只建一次，之后只改文字） */
+    private void ensureDockRight() {
+        if (dockRightBox.getChildCount() > 0) return;
+        dockClock = new TextView(this);
+        dockClock.setTextSize(14);
+        dockClock.setTextColor(Ui.tint());
+        dockClock.setGravity(Gravity.CENTER);
+        dockWeather = new TextView(this);
+        dockWeather.setTextSize(11);
+        dockWeather.setTextColor(Ui.tintDim());
+        dockWeather.setGravity(Gravity.CENTER);
+        int padH = Ui.dp(this, 6);
+        dockRightBox.setPadding(padH, 0, Ui.dp(this, 2), 0);
+        dockRightBox.addView(dockClock);
+        dockRightBox.addView(dockWeather);
+    }
+
+    /** 时间/天气/亮度：15s 一跳 */
+    private void updateDockRealtime() {
+        if (dockRightBox != null && dockRightBox.getVisibility() == View.VISIBLE
+                && dockClock != null) {
+            java.util.Calendar cal = java.util.Calendar.getInstance();
+            dockClock.setText(String.format(java.util.Locale.US, "%02d:%02d",
+                    cal.get(java.util.Calendar.HOUR_OF_DAY),
+                    cal.get(java.util.Calendar.MINUTE)));
+            if (dockWeather != null) dockWeather.setText(Weather.dockLabel(this));
+        }
+        // 天气缓存过期就后台拉一次（亮度判断「阴天」也靠它）
+        Weather.refreshIfStale(this);
+        // 亮度自动调节：目标值没变时内部直接返回，不会反复写系统设置
+        Brightness.applyIfAuto(this);
+    }
+
+    private void startDockTicker() {
+        dockHandler.removeCallbacks(dockTick);
+        dockHandler.post(dockTick);
+    }
+
+    private void stopDockTicker() {
+        dockHandler.removeCallbacks(dockTick);
+    }
+
     // ------------------------------------------------------------ Dock 格位
 
     /**
@@ -657,10 +836,15 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     private void applyDockSlots() {
         if (rvDock == null || dockAdapter == null || dockWrap == null) return;
         int slots = Prefs.getDockCount(this);
-        // Dock 与画中画等宽，可用宽度 = dockWrap 宽 - 左右内边距；首帧拿不到就按屏幕估
-        int wrapW = dockWrap.getWidth() > 0 ? dockWrap.getWidth()
-                : getResources().getDisplayMetrics().widthPixels - 2 * gapPx();
-        int avail = wrapW - Ui.dp(this, 16);
+        // 图标区可用宽 = rvDock 自己的宽度（左右功能区 + 外框内边距已经扣掉）；
+        // 首帧宽度还是 0 时按整条 Dock 估，随后的 onLayoutChange 会纠正
+        int availW = rvDock.getWidth();
+        if (availW <= 0) {
+            int wrapW = dockWrap.getWidth() > 0 ? dockWrap.getWidth()
+                    : getResources().getDisplayMetrics().widthPixels - 2 * gapPx();
+            availW = wrapW - 2 * Ui.dp(this, 8);
+        }
+        int avail = Math.max(Ui.dp(this, 46), availW);
         int slotW = avail / Math.max(1, slots);
         slotW = Math.max(Ui.dp(this, 46), Math.min(Ui.dp(this, 78), slotW));
 
@@ -675,7 +859,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
         dockAdapter.setSlotWidth(slotW);
 
-        rvDock.setPadding(side, Ui.dp(this, 8), side, Ui.dp(this, 8));
+        rvDock.setPadding(side, 0, side, 0);   // 纵向内边距由 dockRow 统一给
 
         dockAdapter.notifyDataSetChanged();
     }
@@ -995,6 +1179,14 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             sendBack();
         } else if (AppInfo.HOME_PKG.equals(pkg)) {
             Keys.home(this);
+        } else if (AppInfo.SLEEP_PKG.equals(pkg)) {
+            Keys.screenOff(this);
+        } else if (AppInfo.RECENTS_PKG.equals(pkg)) {
+            Keys.recents(this);
+        } else if (AppInfo.VOL_UP_PKG.equals(pkg)) {
+            Keys.volume(this, true);
+        } else if (AppInfo.VOL_DOWN_PKG.equals(pkg)) {
+            Keys.volume(this, false);
         }
     }
 
@@ -1232,7 +1424,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     /** 外观（深浅色）变化后，把桌面上所有玻璃和文字刷成新配色 */
     private void refreshAppearance() {
         if (rvDock == null) return;
-        rvDock.setBackground(Ui.glass(this, Prefs.getDockCorner(this)));
+        if (dockRow != null) dockRow.setBackground(Ui.glass(this, Prefs.getDockCorner(this)));
+        if (dockClock != null) dockClock.setTextColor(Ui.tint());
+        if (dockWeather != null) dockWeather.setTextColor(Ui.tintDim());
+        // 左区的自建图标底板也分深浅色两套 → 重新画一遍
+        if (dockLeftBox != null && dockLeftBox.getVisibility() == View.VISIBLE) rebuildDockLeft();
         dockAdapter.notifyDataSetChanged();
         appListAdapter.notifyDataSetChanged();
         // 文字颜色由「背后壁纸」决定 → 外观/壁纸一变，让标签重新取样
@@ -1379,6 +1575,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     protected void onPause() {
         super.onPause();
         AppState.mainResumed = false;
+        stopDockTicker();      // 不在前台就不用每秒刷时间/查天气了
     }
 
     /** 从设置页返回时的增量刷新 */
@@ -1422,7 +1619,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         // 圆角只有一套：画中画和 Dock 一起变（需求：调画中画圆角要同时改 Dock）
         if (pipCorner != appliedPipCorner) {
             pip.setCorner(pipCorner);
-            rvDock.setBackground(Ui.glass(this, pipCorner));
+            if (dockRow != null) dockRow.setBackground(Ui.glass(this, pipCorner));
             appliedPipCorner = pipCorner;
             appliedDockCorner = pipCorner;
         }
@@ -1456,6 +1653,9 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             appliedStatusBar = statusBar;
             applyStatusBar(statusBar);
         }
+        // Dock 左右功能区 / 时间天气 / 亮度自动调节：每次回到桌面都按当前配置重建一遍
+        // （开关、左区图标、亮度值都可能刚在设置页里改过）
+        refreshDockPanels();
     }
 
     @Override

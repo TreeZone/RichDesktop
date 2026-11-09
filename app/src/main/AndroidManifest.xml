@@ -28,6 +28,14 @@
     <!-- 切换深浅色时联动系统夜间模式（signature 级，uid 1000 才有） -->
     <uses-permission android:name="android.permission.MODIFY_DAY_NIGHT_MODE" />
 
+    <!-- 「息屏」按键：PowerManager.goToSleep（signature|privileged） -->
+    <uses-permission android:name="android.permission.DEVICE_POWER" />
+
+    <!-- 按日出日落自动调亮度：写 SCREEN_BRIGHTNESS（signature|preinstalled） -->
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+    <!-- 音量键：调音频流（普通权限） -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />

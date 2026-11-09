@@ -208,6 +208,24 @@ public class SettingsActivity extends AppCompatActivity {
         seek("Dock 图标大小", Prefs.DOCK_ICON_MIN, Prefs.DOCK_ICON_MAX, 2, Prefs.getDockIcon(this),
                 v -> Prefs.setDockIcon(this, v), v -> v + " dp（Dock 高度随之自适应）");
 
+        // Dock 左右两端的功能区（需求：左端放自建图标，右端放时间/天气，都可选）
+        toggle("左端功能区（自建图标）", Prefs.dockLeftEnabled(this), b -> {
+            Prefs.setDockLeftEnabled(this, b);
+            if (b && Prefs.getDockLeft(this).isEmpty()) {
+                // 第一次打开先给一套能用的：返回 / 主页 / 最近任务
+                List<String> d = new ArrayList<>();
+                d.add(AppInfo.BACK_PKG);
+                d.add(AppInfo.HOME_PKG);
+                d.add(AppInfo.RECENTS_PKG);
+                Prefs.setDockLeft(this, d);
+                toast("已放入默认图标：返回 / 主页 / 最近任务");
+            }
+        });
+        action("左区已放：" + dockLeftNames(), () ->
+                toast("在桌面上点左区末尾「＋」添加，长按图标移除或移到 Dock"));
+        toggle("右端时间 + 天气", Prefs.dockRightEnabled(this),
+                b -> Prefs.setDockRightEnabled(this, b));
+
         section("应用列表");
         seek("图标大小", Prefs.ICON_MIN, Prefs.ICON_MAX, 4, Prefs.getIconSize(this),
                 v -> Prefs.setIconSize(this, v), v -> v + " dp");
@@ -224,6 +242,35 @@ public class SettingsActivity extends AppCompatActivity {
 
         section("壁纸");
         action("更换壁纸（静态图片）", () -> pickWallpaper());
+
+        // 亮度自动调节：日落后/日出后用不同亮度，阴天（联网天气）单独一档
+        section("亮度（按日出日落 + 天气）");
+        toggle("自动调节屏幕亮度", Prefs.brightAuto(this), b -> {
+            Prefs.setBrightAuto(this, b);
+            if (b) {
+                Weather.refreshIfStale(this);       // 先把天气捞一下，阴天判断才准
+                Brightness.applyIfAuto(this);
+                toast("当前：" + Brightness.describe(this));
+            }
+        });
+        seek("白天亮度（日出后）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
+                Prefs.getBrightDay(this),
+                v -> { Prefs.setBrightDay(this, v); Brightness.applyIfAuto(this); },
+                v -> v + " / 255");
+        seek("夜间亮度（日落后）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
+                Prefs.getBrightNight(this),
+                v -> { Prefs.setBrightNight(this, v); Brightness.applyIfAuto(this); },
+                v -> v + " / 255");
+        seek("阴天亮度（联网天气）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
+                Prefs.getBrightCloudy(this),
+                v -> { Prefs.setBrightCloudy(this, v); Brightness.applyIfAuto(this); },
+                v -> v + " / 255");
+        action("当前亮度方案：" + Brightness.describe(this) + "（" + Weather.dockLabel(this) + "）",
+                () -> toast(Brightness.describe(this)));
+        note("· 日落/日出与天气都联网获取，用的位置就是上面「日落地点」那个；"
+                + "断网时退回固定时段，功能不停。\n"
+                + "· 阴天/雨雪用「阴天亮度」，少云仍按白天算——宁可亮一点也别把屏幕压暗。\n"
+                + "· 自动调节打开后会把系统亮度切成手动，否则系统自动亮度会马上盖掉这里的值。");
 
         section("说明");
         note("· 画中画顺序固定：横排从左到右、竖排从上到下，依次是画中画 1/2/3。\n"
@@ -623,6 +670,18 @@ public class SettingsActivity extends AppCompatActivity {
     }
 
     // ------------------------------------------------------------ 深浅色模式
+
+    /** Dock 左区已放的图标名（设置页回显用） */
+    private String dockLeftNames() {
+        List<String> l = Prefs.getDockLeft(this);
+        if (l.isEmpty()) return "（空，点桌面左区「＋」添加）";
+        StringBuilder b = new StringBuilder();
+        for (String p : l) {
+            if (b.length() > 0) b.append(" / ");
+            b.append(AppListAdapter.shortcutLabel(p));
+        }
+        return b.toString();
+    }
 
     /** 屏内渲染分辨率档位标签 */
     private static String renderScaleLabel(int pct) {

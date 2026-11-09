@@ -95,6 +95,108 @@ public class Prefs {
         sp(c).edit().putInt("dock_count", clamp(n, DOCK_MIN, DOCK_MAX)).apply();
     }
 
+    // ------------------------------------------------------------ Dock 左右功能区
+
+    /** Dock 左端功能区：一列自建快捷图标（默认关，打开后没配图标就只显示「＋」） */
+    public static boolean dockLeftEnabled(Context c) {
+        return sp(c).getBoolean("dock_left_on", false);
+    }
+
+    public static void setDockLeftEnabled(Context c, boolean b) {
+        sp(c).edit().putBoolean("dock_left_on", b).apply();
+    }
+
+    public static List<String> getDockLeft(Context c) {
+        List<String> r = new ArrayList<>();
+        String s = sp(c).getString("dock_left", "");
+        if (s != null && !s.isEmpty()) {
+            for (String p : s.split("\\|")) if (!p.isEmpty()) r.add(p);
+        }
+        return r;
+    }
+
+    public static void setDockLeft(Context c, List<String> list) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < list.size(); i++) {
+            if (i > 0) sb.append('|');
+            sb.append(list.get(i));
+        }
+        sp(c).edit().putString("dock_left", sb.toString()).apply();
+    }
+
+    /** Dock 右端功能区：时间 + 天气（默认关） */
+    public static boolean dockRightEnabled(Context c) {
+        return sp(c).getBoolean("dock_right_on", false);
+    }
+
+    public static void setDockRightEnabled(Context c, boolean b) {
+        sp(c).edit().putBoolean("dock_right_on", b).apply();
+    }
+
+    // ------------------------------------------------------------ 亮度（按日出日落 + 天气）
+
+    public static final int BRIGHT_MIN = 10, BRIGHT_MAX = 255;
+
+    /** 是否按「日出日落 + 天气」自动调屏幕亮度 */
+    public static boolean brightAuto(Context c) {
+        return sp(c).getBoolean("bright_auto", false);
+    }
+
+    public static void setBrightAuto(Context c, boolean b) {
+        sp(c).edit().putBoolean("bright_auto", b).apply();
+    }
+
+    /** 白天（日出后、非阴天）亮度 0~255 */
+    public static int getBrightDay(Context c) {
+        return clamp(sp(c).getInt("bright_day", 200), BRIGHT_MIN, BRIGHT_MAX);
+    }
+
+    public static void setBrightDay(Context c, int v) {
+        sp(c).edit().putInt("bright_day", clamp(v, BRIGHT_MIN, BRIGHT_MAX)).apply();
+    }
+
+    /** 夜间（日落后）亮度 */
+    public static int getBrightNight(Context c) {
+        return clamp(sp(c).getInt("bright_night", 60), BRIGHT_MIN, BRIGHT_MAX);
+    }
+
+    public static void setBrightNight(Context c, int v) {
+        sp(c).edit().putInt("bright_night", clamp(v, BRIGHT_MIN, BRIGHT_MAX)).apply();
+    }
+
+    /** 阴天/雨雪（联网查到的天气）亮度 */
+    public static int getBrightCloudy(Context c) {
+        return clamp(sp(c).getInt("bright_cloudy", 140), BRIGHT_MIN, BRIGHT_MAX);
+    }
+
+    public static void setBrightCloudy(Context c, int v) {
+        sp(c).edit().putInt("bright_cloudy", clamp(v, BRIGHT_MIN, BRIGHT_MAX)).apply();
+    }
+
+    // ------------------------------------------------------------ 天气缓存（跟亮度、Dock 天气共用）
+
+    /** WMO 天气代码；-1 = 还没查到 */
+    public static int getWeatherCode(Context c) {
+        return sp(c).getInt("weather_code", -1);
+    }
+
+    /** 气温（℃ ×10 存成整数） */
+    public static int getWeatherTempX10(Context c) {
+        return sp(c).getInt("weather_temp_x10", Integer.MIN_VALUE);
+    }
+
+    public static long getWeatherAt(Context c) {
+        return sp(c).getLong("weather_at", 0L);
+    }
+
+    public static void setWeather(Context c, int code, int tempX10, long atMillis) {
+        sp(c).edit()
+                .putInt("weather_code", code)
+                .putInt("weather_temp_x10", tempX10)
+                .putLong("weather_at", atMillis)
+                .apply();
+    }
+
     // ------------------------------------------------------------ Dock 外观（需求：高度与图标大小可调）
 
     public static final int DOCK_H_MIN = 56;

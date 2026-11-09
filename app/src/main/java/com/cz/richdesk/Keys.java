@@ -65,6 +65,108 @@ public class Keys {
         send(c, KeyEvent.KEYCODE_HOME);
     }
 
+    /** 最近任务：和导航栏那个方块键同一个 keyCode */
+    public static void recents(Context c) {
+        send(c, KeyEvent.KEYCODE_APP_SWITCH);
+    }
+
+    /**
+     * 音量加/减。
+     * 优先走 AudioManager（带系统的音量条、按音频流语义走，车机上也生效）；
+     * 拿不到 AudioManager 才退回按键注入。
+     */
+    public static void volume(Context c, boolean up) {
+        if (c == null) return;
+        try {
+            android.media.AudioManager am = (android.media.AudioManager)
+                    c.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
+            if (am != null) {
+                am.adjustStreamVolume(android.media.AudioManager.STREAM_MUSIC,
+                        up ? android.media.AudioManager.ADJUST_RAISE
+                                : android.media.AudioManager.ADJUST_LOWER,
+                        android.media.AudioManager.FLAG_SHOW_UI
+                                | android.media.AudioManager.FLAG_PLAY_SOUND);
+                Log.i(TAG, "音量" + (up ? "+" : "-") + " → "
+                        + am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC));
+                return;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "AudioManager 调音量失败：" + t.getClass().getSimpleName());
+        }
+        send(c, up ? KeyEvent.KEYCODE_VOLUME_UP : KeyEvent.KEYCODE_VOLUME_DOWN);
+    }
+
+    /**
+     * 息屏。
+     *
+     * 走 PowerManager.goToSleep（需要 DEVICE_POWER，uid 1000 才有），
+     * 调用前顺手把「双击唤醒」打开——不然息屏后用户只能去按实体键/等超时，
+     * 点一下桌面图标反而更难恢复。开不了就沿用系统原有设置，不报错。
+     */
+    public static void screenOff(Context c) {
+        if (c == null) return;
+        final Context app = c.getApplicationContext();
+        EXEC.execute(() -> {
+            enableDoubleTapToWake(app);
+            try {
+                android.os.PowerManager pm =
+                        (android.os.PowerManager) app.getSystemService(Context.POWER_SERVICE);
+                Method m = android.os.PowerManager.class.getMethod("goToSleep", long.class);
+                m.invoke(pm, SystemClock.uptimeMillis());
+                Log.i(TAG, "息屏：goToSleep 已调用");
+                return;
+            } catch (Throwable t) {
+                Log.w(TAG, "goToSleep 不可用：" + t.getClass().getSimpleName());
+            }
+            send(app, KeyEvent.KEYCODE_POWER);
+        });
+    }
+
+    private static volatile boolean dt2wTried;
+
+    /**
+     * 打开「双击屏幕唤醒」。
+     *
+     * Android 没有统一的这个开关，各家放在 System/Secure/Global 的不同键名里，
+     * 这里把常见键名挨个试一遍（键不存在时 getInt 返回 -1，直接跳过），
+     * 最后再试几个常见 sysfs 节点。一个都没成功就沿用系统设置。
+     */
+    private static void enableDoubleTapToWake(Context c) {
+        if (dt2wTried) return;
+        dt2wTried = true;
+        String[] keys = {"double_tap_to_wake", "double_tap_screen_wake",
+                "double_click_wake", "dt2w", "double_tap_wake"};
+        boolean ok = false;
+        for (String k : keys) {
+            ok |= putSetting(c, android.provider.Settings.System.class, k);
+            ok |= putSetting(c, android.provider.Settings.Secure.class, k);
+            ok |= putSetting(c, android.provider.Settings.Global.class, k);
+        }
+        // 部分平台（MTK / 高通）双击唤醒落在 sysfs 上
+        for (String p : new String[]{"/sys/android_touch/wake_gestures",
+                "/sys/devices/virtual/touch/tp_wake/dt2w", "/sys/class/touchscreen/wake_gesture"}) {
+            if (Shell.runSync("echo 1 > " + p + " 2>/dev/null")) ok = true;
+        }
+        Log.i(TAG, ok ? "双击唤醒已开启" : "双击唤醒：系统未提供可写开关，沿用原设置");
+    }
+
+    /** 设置项存在（getInt 不是 -1）才写；写成功返回 true */
+    private static boolean putSetting(Context c, Class<?> cls, String key) {
+        try {
+            android.content.ContentResolver cr = c.getContentResolver();
+            Method get = cls.getMethod("getInt",
+                    android.content.ContentResolver.class, String.class, int.class);
+            Method put = cls.getMethod("putInt",
+                    android.content.ContentResolver.class, String.class, int.class);
+            int cur = (Integer) get.invoke(null, cr, key, -1);
+            if (cur < 0) return false;
+            if (cur == 1) return true;
+            return Boolean.TRUE.equals(put.invoke(null, cr, key, 1));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     /**
      * 把按键定向发到指定虚拟屏（发给该屏上正在运行的应用）。
      * displayId < 0 时退回全局注入。

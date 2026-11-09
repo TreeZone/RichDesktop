@@ -19,6 +19,14 @@ public class AppInfo {
     public static final String BACK_PKG = "pipdesk://nav-back";
     /** 伪包名：主页（安卓主页键） */
     public static final String HOME_PKG = "pipdesk://nav-home";
+    /** 伪包名：息屏（PowerManager.goToSleep，双击屏幕可唤醒） */
+    public static final String SLEEP_PKG = "pipdesk://sys-sleep";
+    /** 伪包名：最近任务（KEYCODE_APP_SWITCH） */
+    public static final String RECENTS_PKG = "pipdesk://sys-recents";
+    /** 伪包名：音量加 */
+    public static final String VOL_UP_PKG = "pipdesk://vol-up";
+    /** 伪包名：音量减 */
+    public static final String VOL_DOWN_PKG = "pipdesk://vol-down";
 
     /** 所有伪包名共用的前缀：凭它区分"桌面内置快捷方式"和真实应用 */
     public static final String SCHEME = "pipdesk://";

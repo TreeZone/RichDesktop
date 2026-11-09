@@ -70,15 +70,27 @@ public class SunTimes {
         return Prefs.getSunCacheDay(c) == today() && Prefs.getSunSetMin(c) >= 0;
     }
 
-    /** 每天第一次进入「跟随时间」模式时刷新一次；必须在后台线程调用 */
+    /** 每天第一次需要时刷新一次；必须在后台线程调用 */
     public static void refreshIfStale(Context c) {
-        if (!Prefs.useSunTime(c)) return;
+        // 不再限制「跟随时间」模式：亮度自动调节也用这份缓存，多查一次没副作用
         if (freshCache(c)) return;
         try {
             fetch(c);
         } catch (Throwable t) {
             Log.i(TAG, "日落时间获取失败，沿用固定时段：" + t);
         }
+    }
+
+    /**
+     * 当前使用的位置：手动坐标 → 系统最后已知定位 → 北京兜底。
+     * 日落查询和天气查询共用同一个位置，保证两块数据说的是同一个地方。
+     */
+    public static double[] location(Context c) {
+        if (!Double.isNaN(Prefs.getLatitude(c))) {
+            return new double[]{Prefs.getLatitude(c), Prefs.getLongitude(c)};
+        }
+        double[] loc = lastKnown(c);
+        return loc != null ? loc : new double[]{DEFAULT_LAT, DEFAULT_LNG};
     }
 
     /** 状态文案（设置页用） */
@@ -113,15 +125,8 @@ public class SunTimes {
     // ------------------------------------------------------------ 联网
 
     private static void fetch(Context c) throws Exception {
-        double lat, lng;
-        if (!Double.isNaN(Prefs.getLatitude(c))) {
-            lat = Prefs.getLatitude(c);
-            lng = Prefs.getLongitude(c);
-        } else {
-            double[] loc = lastKnown(c);
-            lat = loc != null ? loc[0] : DEFAULT_LAT;
-            lng = loc != null ? loc[1] : DEFAULT_LNG;
-        }
+        double[] loc = location(c);
+        double lat = loc[0], lng = loc[1];
 
         HttpURLConnection conn = null;
         try {
