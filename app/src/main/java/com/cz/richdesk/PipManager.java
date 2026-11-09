@@ -201,6 +201,11 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         for (PipPane p : panes) p.setDpi(value);
     }
 
+    /** 屏内渲染分辨率比例（1.0 标准 / 0.75 / 0.5）：所有面板一起调 */
+    public void setRenderScale(float v) {
+        for (PipPane p : panes) p.setRenderScale(v);
+    }
+
     /** 旋转等尺寸大变化后：所有有内容的屏重建虚拟屏（重新排版、重算 letterbox） */
     public void postRebuildAll(long delayMs) {
         for (PipPane p : panes) p.postRebuild(delayMs);

@@ -160,6 +160,16 @@ public class SettingsActivity extends AppCompatActivity {
                 dbg.removeExtra("debug_scroll_theme");
                 content.postDelayed(() -> sv.smoothScrollTo(0, themeBox.getTop()), 500);
             }
+            // 直接设置屏内渲染分辨率：--ei debug_render 75（50/75/100）
+            if (dbg.hasExtra("debug_render")) {
+                int pct = clamp(dbg.getIntExtra("debug_render", 100), 50, 100);
+                dbg.removeExtra("debug_render");
+                content.postDelayed(() -> {
+                    Prefs.setRenderScale(this, pct);
+                    rebuildRenderBox();
+                    toast("屏内渲染分辨率 " + renderScaleLabel(pct));
+                }, 600);
+            }
         }
 
         section("虚拟桌面");
@@ -170,6 +180,12 @@ public class SettingsActivity extends AppCompatActivity {
                 }, v -> v + " 屏");
         seek("画中画 DPI", Prefs.DPI_MIN, Prefs.DPI_MAX, 20, Prefs.getDpi(this),
                 v -> Prefs.setDpi(this, v), String::valueOf);
+        // 屏内渲染分辨率：降低虚拟屏像素量换帧率（GPU 重的应用更稳，画面略糊）。
+        // 放进盒子里：点击后要重建行标签（action 的标题是建行时写死的）
+        renderBox = new LinearLayout(this);
+        renderBox.setOrientation(LinearLayout.VERTICAL);
+        content.addView(renderBox);
+        rebuildRenderBox();
         // 圆角只有一套：改这里画中画和 Dock 一起变（需求 1）
         seek("圆角（画中画 + Dock）", 0, Prefs.CORNER_MAX, 1, Prefs.getPipCorner(this),
                 v -> Prefs.setPipCorner(this, v), v -> v + " dp");
@@ -289,6 +305,7 @@ public class SettingsActivity extends AppCompatActivity {
     private LinearLayout paneDefaultsBox;
     /** 外观设置卡片容器（模式/入夜/天亮/日落/地点，改一项只重建这块） */
     private LinearLayout themeBox;
+    private LinearLayout renderBox;
     /** 应用列表缓存（含图标），默认应用选择器用 */
     private List<AppInfo> appCache;
 
@@ -550,6 +567,30 @@ public class SettingsActivity extends AppCompatActivity {
 
     // ------------------------------------------------------------ 深浅色模式
 
+    /** 屏内渲染分辨率档位标签 */
+    private static String renderScaleLabel(int pct) {
+        switch (pct) {
+            case 75: return "省电（75%）";
+            case 50: return "流畅（50%）";
+            default: return "标准（100%）";
+        }
+    }
+
+    /** 「屏内渲染分辨率」行：点一下切档，标签跟着刷新 */
+    private void rebuildRenderBox() {
+        if (renderBox == null) return;
+        renderBox.removeAllViews();
+        actionTo(renderBox, "屏内渲染分辨率：" + renderScaleLabel(Prefs.getRenderScale(this)),
+                () -> {
+                    int cur = Prefs.getRenderScale(this);
+                    int next = cur >= 100 ? 75 : (cur >= 75 ? 50 : 100);
+                    Prefs.setRenderScale(this, next);
+                    rebuildRenderBox();
+                    toast(next == 100 ? "已恢复 1:1 渲染（最清晰）"
+                            : "已切换：屏内应用渲染像素减少，画面更流畅（略糊）");
+                });
+    }
+
     private static String themeLabel(int mode) {
         switch (mode) {
             case Prefs.THEME_TIME: return "跟随时间";
@@ -618,8 +659,7 @@ public class SettingsActivity extends AppCompatActivity {
     private void rebuildThemeBox() {
         if (themeBox == null) return;
         themeBox.removeAllViews();
-        actionTo(themeBox, "外观模式：" + themeLabel(Prefs.getThemeMode(this)), this::pickThemeMode);
-        toggleTo(themeBox, "屏内应用跟随深浅色", Prefs.syncAppsNightMode(this), b -> {
+        actionTo(themeBox, "外观模式：" + themeLabel(Prefs.getThemeMode(this)), this::pickThemeMode);        toggleTo(themeBox, "屏内应用跟随深浅色", Prefs.syncAppsNightMode(this), b -> {
             Prefs.setSyncAppsNightMode(this, b);
             if (b) {
                 // 打开的瞬间先同步一次当前外观，别等下次切换才生效

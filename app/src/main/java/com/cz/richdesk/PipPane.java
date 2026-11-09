@@ -65,6 +65,13 @@ public class PipPane {
     private String pkg;
     private int dpi;
     private int cornerDp;
+    /**
+     * 屏内渲染分辨率比例（1.0 标准 / 0.75 / 0.5）。
+     * 虚拟屏与纹理 buffer 都按「面板像素 × 比例」创建：应用渲染的像素少了，
+     * GPU 重的应用帧率更稳；纹理由 TextureView 放大回面板，代价是画面略糊。
+     * 触摸映射按 displayW/viewW 算，比例变化自动跟上，无需特殊处理。
+     */
+    private float renderScale = 1f;
 
     private boolean surfaceReady;
     private int surfaceW, surfaceH;
@@ -92,6 +99,7 @@ public class PipPane {
         this.dpi = dpi;
         this.cornerDp = cornerDp;
         this.cb = cb;
+        this.renderScale = Prefs.getRenderScale(app) / 100f;
 
         root = new FrameLayout(ctx);
         root.setBackground(Ui.glass(ctx, cornerDp));
@@ -113,8 +121,8 @@ public class PipPane {
                 surfaceW = w;
                 surfaceH = h;
                 android.graphics.SurfaceTexture st = texture.getSurfaceTexture();
-                if (st != null) st.setDefaultBufferSize(w, h);
-                if (vd != null && !resizeDisplay(w, h, dpi)) scheduleRecreate();
+                if (st != null) st.setDefaultBufferSize(buf(w), buf(h));
+                if (vd != null && !resizeDisplay(buf(w), buf(h), dpi)) scheduleRecreate();
             }
         });
 
@@ -140,7 +148,7 @@ public class PipPane {
         texture.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
             @Override
             public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) {
-                st.setDefaultBufferSize(Math.max(1, w), Math.max(1, h));
+                st.setDefaultBufferSize(buf(w), buf(h));
                 surfaceReady = true;
                 surfaceW = w;
                 surfaceH = h;
@@ -152,13 +160,16 @@ public class PipPane {
                 surfaceReady = true;
                 // 比例动画/拖动中：不改 buffer 尺寸，纹理先拉伸（结束由 applyDeferredResize 对齐）
                 if (deferResize) return;
-                st.setDefaultBufferSize(Math.max(1, w), Math.max(1, h));
+                st.setDefaultBufferSize(buf(w), buf(h));
                 if (w != surfaceW || h != surfaceH) {
                     surfaceW = w;
                     surfaceH = h;
                     // 旋转/分屏：优先原地 resize（等价于设备旋转，应用收到 config change），
                     // 销毁重建会让屏内应用掉到手机主屏上（不 resize 时才有这个兜底）
-                    if (vd != null && !resizeDisplay(w, h, dpi)) scheduleRecreate();
+                    if (vd != null && (buf(w) != displayW || buf(h) != displayH)
+                            && !resizeDisplay(buf(w), buf(h), dpi)) {
+                        scheduleRecreate();
+                    }
                 }
             }
 
@@ -205,7 +216,28 @@ public class PipPane {
     public void setDpi(int dpi) {
         if (this.dpi == dpi) return;
         this.dpi = dpi;
-        if (vd != null && !resizeDisplay(surfaceW, surfaceH, dpi)) scheduleRecreate();
+        if (vd != null && !resizeDisplay(buf(surfaceW), buf(surfaceH), dpi)) scheduleRecreate();
+    }
+
+    /** 面板像素 → 虚拟屏/纹理 buffer 像素（乘渲染比例，最小 1） */
+    private int buf(int viewPx) {
+        return Math.max(1, Math.round(viewPx * renderScale));
+    }
+
+    /**
+     * 调整屏内渲染分辨率比例（设置页「屏内渲染分辨率」）。
+     * 建好屏后原地 resize + 改 buffer；比例没变或屏还没建就只记下来，
+     * 下次 createDisplay/onSurfaceTextureAvailable 自然按新比例走。
+     */
+    public void setRenderScale(float s) {
+        s = Math.max(0.5f, Math.min(1f, s));
+        if (Math.abs(s - renderScale) < 0.001f) return;
+        renderScale = s;
+        Log.i(TAG, "pane " + index + " renderScale=" + renderScale);
+        if (vd == null || surfaceW <= 0 || surfaceH <= 0) return;
+        SurfaceTexture st = texture.getSurfaceTexture();
+        if (st != null) st.setDefaultBufferSize(buf(surfaceW), buf(surfaceH));
+        if (!resizeDisplay(buf(surfaceW), buf(surfaceH), dpi)) scheduleRecreate();
     }
 
     /**
@@ -236,8 +268,8 @@ public class PipPane {
         surfaceW = w;
         surfaceH = h;
         SurfaceTexture st = texture.getSurfaceTexture();
-        if (st != null) st.setDefaultBufferSize(w, h);
-        if (vd != null && !resizeDisplay(w, h, dpi)) scheduleRecreate();
+        if (st != null) st.setDefaultBufferSize(buf(w), buf(h));
+        if (vd != null && !resizeDisplay(buf(w), buf(h), dpi)) scheduleRecreate();
     }
 
     /**
@@ -578,8 +610,8 @@ public class PipPane {
         if (!surfaceReady) return;
         SurfaceTexture st = texture.getSurfaceTexture();
         if (st == null) return;
-        int w = Math.max(1, surfaceW);
-        int h = Math.max(1, surfaceH);
+        int w = Math.max(1, buf(surfaceW));
+        int h = Math.max(1, buf(surfaceH));
         Surface surface = new Surface(st);
         int baseFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
                 | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;

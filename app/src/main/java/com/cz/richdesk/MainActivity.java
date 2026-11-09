@@ -65,6 +65,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
     // 上次应用的配置，用于从设置页返回时做增量刷新
     private int appliedPaneCount = -1, appliedDpi = -1, appliedPipCorner = -1;
+    private float appliedRenderScale = -1f;
     private int appliedDockCorner = -1, appliedDockCount = -1, appliedIconSize = -1;
     private int appliedDockIcon = -1;
     private int appliedListColumns = -1;
@@ -263,6 +264,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         appliedPaneCount = Prefs.getPaneCount(this);
         appliedOrientation = getResources().getConfiguration().orientation;
         appliedDpi = Prefs.getDpi(this);
+        appliedRenderScale = Prefs.getRenderScale(this) / 100f;
         appliedPipCorner = Prefs.getPipCorner(this);
         appliedDockCorner = Prefs.getDockCorner(this);
         appliedDockCount = Prefs.getDockCount(this);
@@ -1410,6 +1412,12 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         if (dpi != appliedDpi) {
             pip.setDpi(dpi);
             appliedDpi = dpi;
+        }
+        // 屏内渲染分辨率（性能设置）：改动后原地 resize 虚拟屏
+        float renderScale = Prefs.getRenderScale(this) / 100f;
+        if (Math.abs(renderScale - appliedRenderScale) > 0.001f) {
+            pip.setRenderScale(renderScale);
+            appliedRenderScale = renderScale;
         }
         // 圆角只有一套：画中画和 Dock 一起变（需求：调画中画圆角要同时改 Dock）
         if (pipCorner != appliedPipCorner) {

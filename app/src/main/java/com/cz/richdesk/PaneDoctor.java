@@ -90,22 +90,37 @@ public final class PaneDoctor {
         }
     }
 
-    /** 各画中画的累计出帧数 + 虚拟屏电平状态（F=帧数，st=屏状态） */
+    /** 各画中画的累计出帧数 + 虚拟屏电平状态（F=帧数，st=屏状态，fps=距上次心跳的平均帧率） */
     private static void heartbeat() {
         PipManager p = pip;
         if (p == null || p.count() == 0) return;
         StringBuilder b = new StringBuilder("FRAMES");
         boolean any = false;
+        long total = 0;
         for (int i = 0; i < p.count(); i++) {
             PipPane pane = p.pane(i);
             if (pane == null || pane.pkg() == null) continue;
             any = true;
+            long f = pane.frames();
+            total += f;
             b.append(" p").append(i).append('=').append(pane.pkg())
-                    .append(":f").append(pane.frames())
+                    .append(":f").append(f)
                     .append(":st").append(pane.displayState());
         }
-        if (any) Log.i(TAG, b.toString());
+        if (!any) { hbFrames = -1; return; }
+        long now = android.os.SystemClock.uptimeMillis();
+        if (hbFrames >= 0 && total >= hbFrames && now > hbAt) {
+            float fps = (total - hbFrames) * 1000f / (now - hbAt);
+            b.append(" fps=").append(String.format(java.util.Locale.US, "%.1f", fps));
+        }
+        hbFrames = total;
+        hbAt = now;
+        Log.i(TAG, b.toString());
     }
+
+    /** 上次心跳的累计帧数/时刻：两次相减就是这 32s 的平均帧率（换应用后计数回退则重置） */
+    private static long hbFrames = -1;
+    private static long hbAt;
 
     private static void tick() {
         PipManager p = pip;

@@ -294,6 +294,21 @@ public class Prefs {
     }
 
     /**
+     * 屏内应用渲染分辨率比例（百分比，存 100 / 75 / 50）。
+     *
+     * 虚拟屏按「面板像素尺寸 × 比例」创建，屏内应用渲染的像素就少了 —— GPU
+     * 重的应用（导航、视频）帧率明显更稳；纹理交给 TextureView 放大回去，
+     * 画面略糊。默认 100（标准，1:1 渲染最清晰）。
+     */
+    public static int getRenderScale(Context c) {
+        return clamp(sp(c).getInt("render_scale", 100), 50, 100);
+    }
+
+    public static void setRenderScale(Context c, int pct) {
+        sp(c).edit().putInt("render_scale", clamp(pct, 50, 100)).apply();
+    }
+
+    /**
      * 深浅色切换是否把夜间模式同步给系统（屏内应用跟着变深/变浅）。
      *
      * 默认**关**：全局 uiMode 变更会销毁重建屏内应用，实测部分应用（QQ）
