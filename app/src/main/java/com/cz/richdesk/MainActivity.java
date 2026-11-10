@@ -289,6 +289,28 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         setContentView(root);
         root.requestApplyInsets();
 
+        // 调试钩子：没有手指（自动化截图核对）时也能把长按浮层菜单弹出来看效果
+        //   --es debug_menu dock    → Dock 第一个图标的菜单
+        //   --es debug_menu panel   → 左端功能区第一个图标的菜单
+        android.content.Intent dbgIntent = getIntent();
+        if (dbgIntent != null && dbgIntent.hasExtra("debug_menu")) {
+            final String what = dbgIntent.getStringExtra("debug_menu");
+            dbgIntent.removeExtra("debug_menu");
+            root.postDelayed(() -> {
+                if ("dock".equals(what) && !dockPkgs.isEmpty()) {
+                    OverlayMenu.setAnchor(rvDock != null && rvDock.getChildCount() > 0
+                            ? rvDock.getChildAt(0) : null);
+                    onDockLongClick(0, dockPkgs.get(0));
+                } else if ("panel".equals(what) && dockLeftBox != null
+                        && dockLeftBox.getChildCount() > 0) {
+                    List<String> dl = Prefs.getDockLeft(this);
+                    if (!dl.isEmpty()) {
+                        showPanelIconMenu(true, dl.get(0), dockLeftBox.getChildAt(0));
+                    }
+                }
+            }, 1500);
+        }
+
         if (!DataDirFix.ok()) {
             Toast.makeText(this, "配置暂时存不住：请安装权限模块后重启手机",
                     Toast.LENGTH_LONG).show();
@@ -500,11 +522,15 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         rvDock.setClipToPadding(false);
         rvDock.setBackground(null);          // 玻璃在 dockRow 上（三段共用）
         rvDock.setOnTouchListener((v, e) -> {
-            // 只有 Dock 内容超出一屏、真的需要自己横向滚动时才拦截翻页；
-            // 内容放得下时（常态）不拦，Dock 上的左滑才能翻到应用页（需求 2）
-            if (e.getActionMasked() == MotionEvent.ACTION_DOWN
-                    && (rvDock.canScrollHorizontally(1) || rvDock.canScrollHorizontally(-1))) {
-                v.getParent().requestDisallowInterceptTouchEvent(true);
+            // 只有在应用栏真的「放不下」、必须自己横向滚动时才拦截翻页手势。
+            // 判断用「可滚距离 > 12dp」而不是 canScrollHorizontally：后者常常因为
+            // 一两个像素的取整余量就返回 true，结果在应用栏上横滑永远翻不到应用列表页。
+            if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                int range = rvDock.computeHorizontalScrollRange();
+                int extent = rvDock.computeHorizontalScrollExtent();
+                if (range - extent > Ui.dp(this, 12)) {
+                    v.getParent().requestDisallowInterceptTouchEvent(true);
+                }
             }
             return false;
         });
@@ -863,9 +889,9 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         return box;
     }
 
-    /** 功能区图标的长按菜单（原地长按松手时弹出；添加入口也在这里） */
-    private void showPanelIconMenu(final boolean left, final String pkg) {
-        GlassMenu.show(this, labelOf(pkg),
+    /** 功能区图标的长按菜单（长按即弹；拖动会把它关掉；添加入口也在这里） */
+    private void showPanelIconMenu(final boolean left, final String pkg, View anchor) {
+        OverlayMenu.show(this, anchor, labelOf(pkg),
                 new CharSequence[]{"添加图标", "移到 Dock 图标区", "从功能区移除"},
                 which -> {
                     if (which == 0) {
@@ -891,14 +917,12 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 });
     }
 
-    /** 长按后「停住不动」多久自动弹菜单（一移动就取消，改为拖动） */
-    private static final long PANEL_MENU_DELAY = 280;
-    private Runnable pendingPanelMenu;
-
     /**
-     * 长按进入待命：先给一点时间判断「是要拖还是要菜单」——
-     * 手指一动就取消计时器、直接开拖；停住不动 280ms 就先把菜单弹出来，
-     * 不用等松手（需求：长按即弹菜单，检测到拖动则关掉菜单开始移动）。
+     * 长按：**立刻**把菜单弹出来（浮层，不抢手势），同时进入拖动待命。
+     *
+     * 手指接着拖动 → onPanelDragTouch 一检测到位移就把菜单收掉，继续换位；
+     * 原地松手 → 菜单留着，用户直接点里面的项。这是用户要的交互顺序，
+     * 之前那个「先等 280ms 再弹」的版本反了（他嫌逻辑不对）。
      */
     private void beginPanelDrag(boolean left, String pkg, View cell) {
         LinearLayout box = left ? dockLeftBox : dockRightBox;
@@ -908,32 +932,27 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         panelDragCells.clear();
         for (int i = 0; i < box.getChildCount(); i++) panelDragCells.add(box.getChildAt(i));
         panelDragList = l;
+        panelDragOrigin = new ArrayList<>(l);   // 原始顺序：算位移用，避免多跨几格后累计错位
         panelDragLeft = left;
         panelDragView = cell;
         panelDragIndex = panelDragCur = idx;
         panelDragMoved = false;
         panelDragStartRawX = -1;   // 起手位置在第一次 MOVE 时才记（长按时 DOWN 已过去）
+        // 长按拖动期间不许翻页：否则按住最右边那个图标往左拖，主屏会被带着滑到应用列表页
+        if (cell.getParent() != null) cell.getParent().requestDisallowInterceptTouchEvent(true);
         cell.animate().scaleX(1.14f).scaleY(1.14f).setDuration(120).start();
         cell.setElevation(Ui.dp(this, 10));
-        // 停住不动 → 自动弹菜单；一旦开始拖动就取消（见 cancelPendingPanelMenu）
-        cancelPendingPanelMenu();
-        pendingPanelMenu = () -> {
-            pendingPanelMenu = null;
-            finishPanelDrag(left, true);
-        };
-        dockHandler.postDelayed(pendingPanelMenu, PANEL_MENU_DELAY);
-    }
-
-    private void cancelPendingPanelMenu() {
-        if (pendingPanelMenu != null) {
-            dockHandler.removeCallbacks(pendingPanelMenu);
-            pendingPanelMenu = null;
-        }
+        OverlayMenu.dismissCurrent();
+        showPanelIconMenu(left, pkg, cell);
     }
 
     /**
-     * 功能区拖动：不重建列表，只在越过相邻格中心时互换数据并把被换的图标
-     * 平移到腾出的格子里（和 ItemTouchHelper 的视觉一致），松手再统一落盘。
+     * 功能区拖动换位。
+     *
+     * 位移不再「交换一次就累加一次」—— 那样跨两三格后每个格子的 translation 会互相
+     * 叠加，图标被推到面板外面看不见（用户反馈「挤得看不到」）。现在每次位置变化都
+     * 按「当前顺序 vs 原始顺序」整排重算：位移 =（现在的下标 − 原始下标）× 格宽，
+     * 任何时刻都是确定的，也永远不会超出面板范围。
      */
     private boolean onPanelDragTouch(View v, android.view.MotionEvent e, boolean left) {
         if (panelDragIndex < 0) return false;   // 非拖动态：交给点击/长按
@@ -944,64 +963,77 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             case android.view.MotionEvent.ACTION_MOVE: {
                 if (panelDragStartRawX < 0) panelDragStartRawX = e.getRawX();
                 float dx = e.getRawX() - panelDragStartRawX;
-                // 12dp：手指按着不动时的轻微抖动不算「拖动」，免得松手时不弹菜单
-                boolean movedNow = Math.abs(dx) > Ui.dp(this, 12);
-                if (movedNow && !panelDragMoved) cancelPendingPanelMenu();  // 开始拖 → 别再弹菜单
+                // 8dp：手指按着不动时的轻微抖动不算「拖动」
+                boolean movedNow = Math.abs(dx) > Ui.dp(this, 8);
+                if (movedNow) {
+                    // 检测到拖动 → 把刚弹出来的菜单关掉，继续换位（用户要的就是这个顺序）
+                    OverlayMenu.dismissCurrent();
+                    if (v.getParent() != null) v.getParent().requestDisallowInterceptTouchEvent(true);
+                }
                 panelDragMoved |= movedNow;
-                v.setTranslationX(dx);
                 int pitch = Math.max(1, dockPitchPx());
                 int n = panelDragList.size();
+                // 被拖的图标不能移出面板：把跟手位移夹在首尾格之间
+                float shown = Math.max((0 - panelDragIndex) * (float) pitch,
+                        Math.min((n - 1 - panelDragIndex) * (float) pitch, dx));
+                v.setTranslationX(shown);
                 int target = Math.max(0, Math.min(n - 1,
                         panelDragIndex + Math.round(dx / (float) pitch)));
-                while (target != panelDragCur) {
-                    int step = target > panelDragCur ? 1 : -1;
-                    int other = panelDragCur + step;
-                    String tmp = panelDragList.set(panelDragCur, panelDragList.get(other));
-                    panelDragList.set(other, tmp);
-                    View otherV = panelDragCells.get(other);
-                    otherV.setTranslationX(otherV.getTranslationX() + (panelDragCur - other) * pitch);
-                    panelDragCur = other;
+                if (target != panelDragCur) {
+                    String moving = panelDragList.remove(panelDragCur);
+                    panelDragList.add(target, moving);
+                    panelDragCur = target;
+                    layoutPanelCells(pitch);
                 }
                 return true;
             }
             case android.view.MotionEvent.ACTION_UP:
             case android.view.MotionEvent.ACTION_CANCEL:
-                cancelPendingPanelMenu();
-                finishPanelDrag(left, false);
+                finishPanelDrag(left);
                 return true;
         }
         return true;
     }
 
+    /** 按当前顺序重算每个格子的位移：位移 =（现在的位置 − 原始位置）× 格宽 */
+    private void layoutPanelCells(int pitch) {
+        if (panelDragOrigin == null || panelDragList == null) return;
+        for (int i = 0; i < panelDragCells.size() && i < panelDragOrigin.size(); i++) {
+            View c = panelDragCells.get(i);
+            if (c == panelDragView) continue;   // 被拖的那个跟着手指走
+            int now = panelDragList.indexOf(panelDragOrigin.get(i));
+            if (now < 0) continue;
+            c.setTranslationX((now - i) * (float) pitch);
+        }
+    }
+
     /**
-     * 拖动结束。
-     *
-     * @param forceMenu true = 长按后停住不动（计时器到点）：弹菜单；
-     *                  false = 手指抬起：只要动过就只落盘/复位，绝不再弹菜单
-     *                  （之前用「有没有跨格」判断，拖了一下没跨过一格松手会突然弹菜单，很突兀）
+     * 拖动结束：换过位置就落盘，没换就复位。
+     * 菜单不在这里弹 —— 长按那一刻已经弹出来过了（见 beginPanelDrag），
+     * 这里再弹就是用户反馈的「松手又蹦一个弹框」。
      */
-    private void finishPanelDrag(boolean left, boolean forceMenu) {
+    private void finishPanelDrag(boolean left) {
         if (panelDragIndex < 0) return;
         View cell = panelDragView;
+        boolean dragged = panelDragMoved;
+        List<String> l = panelDragList;
+        boolean reordered = panelDragOrigin != null && !panelDragOrigin.equals(l);
         if (cell != null) {
+            cell.setTranslationX(0);
             cell.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
             cell.setElevation(0);
+            if (cell.getParent() != null) cell.getParent().requestDisallowInterceptTouchEvent(false);
         }
-        boolean dragged = panelDragMoved;
-        boolean reordered = panelDragCur != panelDragIndex;
-        List<String> l = panelDragList;
-        String pkg = l.get(Math.max(0, Math.min(panelDragCur, l.size() - 1)));
+        for (View c : panelDragCells) c.setTranslationX(0);   // 其余格子的位移动画一并不留
         panelDragIndex = panelDragCur = -1;
         panelDragView = null;
         panelDragCells.clear();
         panelDragList = null;
-        if (!forceMenu && (dragged || reordered)) {
+        panelDragOrigin = null;
+        if (dragged) {
             if (reordered) setPanelIcons(left, l);
             buildDockPanel(left ? dockLeftBox : dockRightBox, left);   // 清掉残留位移
             applyDockSlots();
-        } else {
-            buildDockPanel(left ? dockLeftBox : dockRightBox, left);
-            showPanelIconMenu(left, pkg);
         }
     }
 
@@ -1185,6 +1217,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     // 长按待命 → 拖走换位 / 原地松手弹菜单）
     private final List<View> panelDragCells = new ArrayList<>();
     private List<String> panelDragList;
+    /** 拖动开始那一刻的顺序：算每个格子的位移都拿它当基准，不会累计错位 */
+    private List<String> panelDragOrigin;
     private View panelDragView;
     private boolean panelDragLeft;
     private int panelDragIndex = -1, panelDragCur = -1;
@@ -1254,9 +1288,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             if (fit >= Ui.dp(this, 40)) slotW = fit;
         }
         int content = cells * slotW;
-        int side = content >= avail
-                ? Math.max(Ui.dp(this, 4), (avail - content) / 2)
-                : Math.max(Ui.dp(this, 8), (avail - content) / 2);
+        // 两侧留白只能是「真正剩余宽度的一半」。
+        // 以前这里有个 8dp 下限：剩余不足 16dp 时，内容会比可用宽多出十几像素，
+        // RecyclerView 于是有了可滚距离 —— 在应用栏上横滑就变成「列表自己滚几像素」，
+        // 手不够长就翻不到应用列表页（用户报的正是这个）。
+        int side = Math.max(0, (avail - content) / 2);
         if (slots == appliedSlotCount && slotW == appliedSlotWidth
                 && cells == appliedSlotCells && side == appliedSidePad) return;
         appliedSlotCount = slots;
@@ -1689,7 +1725,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         // 菜单和普通应用一致 ——「重新选择应用」「删除绑定」。
         // 没有「从 Dock 移除」（语义重复）；「全屏打开 / 指定画中画位置」它们也用不上。
         if (AppInfo.isBuiltin(pkg)) {
-            GlassMenu.show(this, labelOf(pkg),
+            OverlayMenu.show(this, labelOf(pkg),
                     new CharSequence[]{"重新选择应用", "删除绑定"},
                     which -> {
                         if (which == 0) {
@@ -1702,7 +1738,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                     });
             return;
         }
-        GlassMenu.show(this, labelOf(pkg),
+        OverlayMenu.show(this, labelOf(pkg),
                 new CharSequence[]{"全屏打开", "重新选择应用", "删除绑定", "指定画中画位置"},
                 which -> {
                     switch (which) {
@@ -1744,7 +1780,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
     @Override
     public void onAppLongClick(AppInfo app) {
-        GlassMenu.show(this, app.label,
+        OverlayMenu.show(this, app.label,
                 new CharSequence[]{"画中画打开", "全屏打开", "指定画中画位置", "绑定到 Dock"},
                 which -> {
                     switch (which) {
@@ -1803,7 +1839,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         final String run = AppInfo.THEME_PKG.equals(pkg)
                 ? (Ui.dark ? "切换到浅色" : "切换到深色") : "执行一次";
         final String act = inDock ? "从 Dock 移除" : "放到 Dock";
-        GlassMenu.show(this, label, new CharSequence[]{run, act}, which -> {
+        OverlayMenu.show(this, label, new CharSequence[]{run, act}, which -> {
             if (which == 0) {
                 runBuiltin(pkg);
                 return;

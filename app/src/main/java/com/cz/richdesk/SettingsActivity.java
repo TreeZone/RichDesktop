@@ -271,24 +271,15 @@ public class SettingsActivity extends AppCompatActivity {
         });
         View leftType = actionChild("左端内容：" + panelLabel(Prefs.getDockLeftType(this)),
                 () -> pickPanelType(true));
-        // 只有「快捷功能」才有图标可列（时间天气没有图标），按当前类型决定显不显示
-        View leftIcons = Prefs.getDockLeftType(this) == Prefs.PANEL_SHORTCUT
-                ? actionChild("左端图标：" + dockLeftNames(),
-                        () -> toast("长按功能区图标 →「添加图标」；也可移除或移到中间图标区"))
-                : null;
-        if (leftIcons != null) children(leftSw, leftType, leftIcons);
-        else children(leftSw, leftType);
+        // 「左端图标…」这一行已去掉（需求）：图标增删都在桌面上长按完成，
+        // 设置里再列一遍只是噪音。
+        children(leftSw, leftType);
 
         Switch rightSw = toggle("右端功能区", Prefs.dockRightEnabled(this),
                 b -> Prefs.setDockRightEnabled(this, b));
         View rightType = actionChild("右端内容：" + panelLabel(Prefs.getDockRightType(this)),
                 () -> pickPanelType(false));
-        View rightIcons = Prefs.getDockRightType(this) == Prefs.PANEL_SHORTCUT
-                ? actionChild("右端图标：" + dockRightNames(),
-                        () -> toast("长按功能区图标 →「添加图标」；也可移除或移到中间图标区"))
-                : null;
-        if (rightIcons != null) children(rightSw, rightType, rightIcons);
-        else children(rightSw, rightType);
+        children(rightSw, rightType);
 
         note("· 两侧都可选「快捷功能」或「时间 + 天气」；不显示时那一侧的分隔竖线也不显示。\n"
                 + "· 快捷功能最多 5 个图标，不留空位；添加方式 = 长按任一图标 →「添加图标」。\n"
@@ -801,7 +792,7 @@ public class SettingsActivity extends AppCompatActivity {
         setRowsEnabled(l, parent.isChecked());
     }
 
-    /** 递归启用/禁用一整个卡片（SeekBar 拖不动、行不可点、文字变淡） */
+    /** 整组子项跟着父开关变灰 / 恢复 */
     private void setRowsEnabled(List<View> rows, boolean en) {
         for (View r : rows) {
             r.setAlpha(en ? 1f : 0.38f);
@@ -809,9 +800,16 @@ public class SettingsActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * 递归启用/禁用一整个卡片（SeekBar 拖不动、行不可点、文字变淡）。
+     *
+     * **只动 enabled，绝对不要 setClickable(true)**：卡片里的标题 TextView 本来是
+     * clickable=false，事件才会冒泡到卡片身上的 onClick。一旦被这里改成 true，
+     * 点标题就变成"TextView 自己消费掉、但没有任何回调"，整行只有边缘能点中 ——
+     * 这就是用户说的「左右端功能区点好几次才弹出菜单」。
+     */
     private void setEnabledDeep(View v, boolean en) {
         v.setEnabled(en);
-        v.setClickable(en);
         if (v instanceof SeekBar) ((SeekBar) v).setEnabled(en);
         if (v instanceof ViewGroup) {
             ViewGroup g = (ViewGroup) v;

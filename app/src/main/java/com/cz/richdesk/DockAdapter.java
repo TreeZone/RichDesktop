@@ -117,6 +117,28 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
         add.setShadowLayer(3, 0, 1, 0x99000000);
         add.setVisibility(View.GONE);
         cell.addView(add);
+        // 长按后菜单立刻弹出（浮层），手指一移动就把它关掉，拖动继续换位。
+        // 只做这一件事，返回 false 不影响点击 / 长按 / ItemTouchHelper 的任何流程。
+        cell.setOnTouchListener(new View.OnTouchListener() {
+            private float downX, downY;
+
+            @Override
+            public boolean onTouch(View v, android.view.MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case android.view.MotionEvent.ACTION_DOWN:
+                        downX = e.getRawX();
+                        downY = e.getRawY();
+                        break;
+                    case android.view.MotionEvent.ACTION_MOVE:
+                        if (Math.abs(e.getRawX() - downX) > Ui.dp(v.getContext(), 8)
+                                || Math.abs(e.getRawY() - downY) > Ui.dp(v.getContext(), 8)) {
+                            OverlayMenu.dismissCurrent();
+                        }
+                        break;
+                }
+                return false;
+            }
+        });
 
         return new VH(cell, iv, add);
     }
@@ -180,42 +202,19 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
 
     // ------------------------------------------------------------ 长按拖动排序
 
-    /** 长按后停住不动多久自动弹菜单；一动就取消、改为拖动 */
-    private static final long MENU_DELAY = 280;
-    private Runnable pendingMenu;
-    /** 菜单已经由计时器弹出：随后的 clearView 不要再弹第二次 */
-    private boolean menuHandedOff;
-
-    private void cancelPendingMenu(View any) {
-        if (pendingMenu != null) {
-            any.removeCallbacks(pendingMenu);
-            pendingMenu = null;
-        }
-    }
-
     /**
-     * 长按入口：进入拖动待命，并起一个 280ms 的「停手计时器」——
-     * 停住不动就把菜单弹出来（不用等松手），手指一动就取消计时器、纯拖动。
+     * 长按：进入拖动待命，**同时立刻弹菜单**（浮层 OverlayMenu，不抢手势）。
+     *
+     * 交互顺序按用户要求改过一次：不是「等手指停住 280ms 才弹」，而是长按即弹；
+     * 一旦检测到拖动（item 的 OnTouchListener / onMove）就把菜单关掉，换位继续。
      */
     private void onLongPress(VH vh) {
         if (dragHelper == null) return;
         int pos = vh.getBindingAdapterPosition();
         if (pos < 0 || pos >= host.dockPkgs().size()) return;
-        final View item = vh.itemView;
-        cancelPendingMenu(item);
-        menuHandedOff = false;
+        OverlayMenu.setAnchor(vh.itemView);   // 菜单贴着这个图标弹出
         dragHelper.startDrag(vh);
-        pendingMenu = () -> {
-            pendingMenu = null;
-            menuHandedOff = true;
-            item.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
-            item.setElevation(0);
-            int p = vh.getBindingAdapterPosition();
-            if (p >= 0 && p < host.dockPkgs().size()) {
-                host.onDockLongClick(p, host.dockPkgs().get(p));
-            }
-        };
-        item.postDelayed(pendingMenu, MENU_DELAY);
+        host.onDockLongClick(pos, host.dockPkgs().get(pos));
     }
 
     /** MainActivity 在 rvDock.setAdapter 之后调用一次 */
@@ -235,7 +234,7 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
                 int from = a.getBindingAdapterPosition(), to = b.getBindingAdapterPosition();
                 int used = host.dockPkgs().size();
                 if (from < 0 || to < 0 || from >= used || to >= used) return false;
-                cancelPendingMenu(a.itemView);   // 开始换位 = 用户要拖，别再弹菜单
+                OverlayMenu.dismissCurrent();   // 真的开始换位了 → 菜单该让路
                 List<String> pkgs = host.dockPkgs();
                 pkgs.add(to, pkgs.remove(from));
                 notifyItemMoved(from, to);
@@ -245,6 +244,24 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
 
             @Override
             public void onSwiped(@NonNull RecyclerView.ViewHolder vh, int dir) { }
+
+            /**
+             * 拖动中每一帧都走这里：手指只要挪开一点就把长按弹出的菜单收掉。
+             * 比 cell 的 OnTouchListener 可靠 —— ItemTouchHelper 接管手势后，
+             * 子 View 只会收到 CANCEL，拿不到后面的 MOVE（用户报的
+             * 「移动后弹框不自动关闭」就是这个原因）。
+             */
+            @Override
+            public void onChildDraw(@NonNull android.graphics.Canvas c, @NonNull RecyclerView rv,
+                                    @NonNull RecyclerView.ViewHolder vh, float dX, float dY,
+                                    int actionState, boolean isCurrentlyActive) {
+                if (isCurrentlyActive && actionState == ItemTouchHelper.ACTION_STATE_DRAG
+                        && (Math.abs(dX) > Ui.dp(rv.getContext(), 6)
+                        || Math.abs(dY) > Ui.dp(rv.getContext(), 6))) {
+                    OverlayMenu.dismissCurrent();
+                }
+                super.onChildDraw(c, rv, vh, dX, dY, actionState, isCurrentlyActive);
+            }
 
             @Override
             public boolean isLongPressDragEnabled() {
@@ -264,23 +281,14 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
             @Override
             public void clearView(@NonNull RecyclerView rv, @NonNull RecyclerView.ViewHolder vh) {
                 super.clearView(rv, vh);
-                cancelPendingMenu(vh.itemView);
                 vh.itemView.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
                 vh.itemView.setElevation(0);
                 boolean moved = dragMoved;
                 dragMoved = false;
-                if (menuHandedOff) {          // 菜单已经弹过了（手指还按着时弹的）
-                    menuHandedOff = false;
-                    return;
-                }
+                // 菜单在长按那一刻就弹出来了（OverlayMenu），这里绝不再弹一次 ——
+                // 用户反馈的「拖动后松手又蹦一个弹框」就是这里重复弹出来的。
                 if (moved) {
                     host.onDockOrderChanged();   // 拖动过 → 只存新顺序
-                    return;
-                }
-                // 没拖动也没弹过菜单（例如没到 280ms 就抬手）
-                int pos = vh.getBindingAdapterPosition();
-                if (pos >= 0 && pos < host.dockPkgs().size()) {
-                    host.onDockLongClick(pos, host.dockPkgs().get(pos));
                 }
             }
         };

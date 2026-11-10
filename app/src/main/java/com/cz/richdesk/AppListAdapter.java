@@ -85,6 +85,20 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         }
     }
 
+    /**
+     * 快捷区顺序，缺配置时补一份默认值。
+     * 必须保证非空：以前拖动快捷区图标时，如果用户从没拖过（配置里没这条），
+     * shortcutOrder 是 null → onMove 直接 return false → 表现为「拖不动」。
+     */
+    private List<String> shortcutOrderOrInit() {
+        if (shortcutOrder == null || shortcutOrder.size() != SHORTCUT_COUNT) {
+            shortcutOrder = new ArrayList<>(SHORTCUT_COUNT);
+            shortcutOrder.add(AppInfo.SETTINGS_PKG);
+            for (String p : SHORTCUT_PKGS) shortcutOrder.add(p);
+        }
+        return shortcutOrder;
+    }
+
     /** slot（0..8）→ 伪包名：按可配置顺序取，配置缺失时退回固定顺序 */
     private String shortcutPkgAt(int slot) {
         if (shortcutOrder != null && slot >= 0 && slot < shortcutOrder.size()) {
@@ -274,6 +288,30 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         tlp.topMargin = Ui.dp(parent.getContext(), 6);
         cell.addView(tv, tlp);
 
+        // 菜单是长按即弹的浮层：手指一移动就把它收掉，换位拖动继续。
+        // 返回 false，不影响点击 / 长按 / ItemTouchHelper 的原有流程。
+        final Context c = parent.getContext();
+        cell.setOnTouchListener(new View.OnTouchListener() {
+            private float downX, downY;
+
+            @Override
+            public boolean onTouch(View v, android.view.MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case android.view.MotionEvent.ACTION_DOWN:
+                        downX = e.getRawX();
+                        downY = e.getRawY();
+                        break;
+                    case android.view.MotionEvent.ACTION_MOVE:
+                        if (Math.abs(e.getRawX() - downX) > Ui.dp(c, 8)
+                                || Math.abs(e.getRawY() - downY) > Ui.dp(c, 8)) {
+                            OverlayMenu.dismissCurrent();
+                        }
+                        break;
+                }
+                return false;
+            }
+        });
+
         return cell;
     }
 
@@ -292,8 +330,9 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         applyIconSize(vh);
         vh.tvLabel.setText(ai.label);
         vh.itemView.setOnClickListener(v -> host.onAppClick(ai));
+        vh.itemView.setLongClickable(true);
         vh.itemView.setOnLongClickListener(v -> {
-            // 长按不再直接弹菜单：先进入拖动待命，原地松手 = 菜单，拖走 = 排序
+            // 长按立刻弹菜单（浮层，不抢手势）；检测到拖动就把菜单关掉继续换位
             if (dragEnabled) onLongPress(vh);
             else host.onAppLongClick(ai);
             return true;
@@ -324,6 +363,12 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
             if (host instanceof FullHost) ((FullHost) host).onShortcutClick(pkg);
         });
         vh.itemView.setOnLongClickListener(v -> {
+            // 自建图标（桌面设置 / 深浅模式 / 重启桌面…）也要能长按拖动换位置，
+            // 所以这里跟普通应用走同一条入口，不再直接弹菜单。
+            if (dragEnabled) {
+                onLongPress(vh);
+                return true;
+            }
             if (!(host instanceof FullHost)) return false;
             ((FullHost) host).onShortcutLongClick(pkg);
             return true;
@@ -344,46 +389,25 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
 
     // ------------------------------------------------------------ 长按拖动排序
 
-    /** 长按后停住不动多久自动弹菜单；一动就取消、改为拖动 */
-    private static final long MENU_DELAY = 280;
-    private Runnable pendingMenu;
-    private boolean menuHandedOff;
-
-    private void cancelPendingMenu(View any) {
-        if (pendingMenu != null) {
-            any.removeCallbacks(pendingMenu);
-            pendingMenu = null;
-        }
-    }
-
     /**
-     * 长按入口：进入拖动待命 + 起一个 280ms 停手计时器 ——
-     * 停住不动就把菜单弹出来（不用等松手），手指一动就取消计时器、纯拖动。
-     * 只有普通应用格子能拖；前 5 个快捷方式是功能位，固定在最前。
+     * 长按：进入拖动待命 + **立刻**弹菜单（OverlayMenu 浮层）。
+     *
+     * 快捷区（桌面设置 / 深浅模式 / 重启桌面 / 返回 / 主页 / 息屏 / 最近任务 / 音量±）
+     * 现在也允许拖动 —— 以前这里 `pos < offset()` 直接 return，所以那几个自建图标
+     * 怎么长按都拖不动（用户报的第三条）。跨区仍然禁止，快捷区只在内部换位。
      */
-    private void onLongPress(final RecyclerView.ViewHolder vh) {
+    private void onLongPress(RecyclerView.ViewHolder vh) {
         if (dragHelper == null) return;
-        int pos = vh.getBindingAdapterPosition();
-        if (pos < offset() || pos >= getItemCount()) return;
-        final View item = vh.itemView;
-        cancelPendingMenu(item);
-        menuHandedOff = false;
+        final int pos = vh.getBindingAdapterPosition();
+        if (pos < 0 || pos >= getItemCount()) return;
+        OverlayMenu.setAnchor(vh.itemView);   // 菜单贴着这个图标弹出
         dragHelper.startDrag(vh);
-        pendingMenu = () -> {
-            pendingMenu = null;
-            menuHandedOff = true;
-            item.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
-            item.setElevation(0);
-            int p = vh.getBindingAdapterPosition();
-            int idx = p - offset();
-            if (idx < offset()) {
-                String pkg = shortcutPkgAt(idx);
-                if (host instanceof FullHost) ((FullHost) host).onShortcutLongClick(pkg);
-            } else if (data != null && idx >= 0 && idx < data.size()) {
-                host.onAppLongClick(data.get(idx));
-            }
-        };
-        item.postDelayed(pendingMenu, MENU_DELAY);
+        int idx = pos - offset();
+        if (idx < offset()) {
+            if (host instanceof FullHost) ((FullHost) host).onShortcutLongClick(shortcutPkgAt(idx));
+        } else if (data != null && idx >= 0 && idx < data.size()) {
+            host.onAppLongClick(data.get(idx));
+        }
     }
 
     /** 桌面应用页在 setAdapter 之后调用一次；picker 弹窗不调（无拖动） */
@@ -404,12 +428,12 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
                 int sc = offset();
                 int from = a.getBindingAdapterPosition(), to = b.getBindingAdapterPosition();
                 if (from < 0 || to < 0 || from >= getItemCount() || to >= getItemCount()) return false;
-                cancelPendingMenu(a.itemView);   // 开始换位 = 用户要拖，别再弹菜单
+                OverlayMenu.dismissCurrent();   // 开始换位 = 菜单让路
                 if (from < sc && to < sc) {
-                    // 快捷区内部换位（9 个功能图标之间）
-                    if (shortcutOrder == null) return false;
-                    String tmp = shortcutOrder.set(from, shortcutOrder.get(to));
-                    shortcutOrder.set(to, tmp);
+                    // 快捷区内部换位（9 个自建功能图标之间）
+                    List<String> order = shortcutOrderOrInit();
+                    String tmp = order.set(from, order.get(to));
+                    order.set(to, tmp);
                     notifyItemMoved(from, to);
                     dragMoved = true;
                     return true;
@@ -423,6 +447,24 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
 
             @Override
             public void onSwiped(@NonNull RecyclerView.ViewHolder vh, int dir) { }
+
+            /**
+             * 拖动中每一帧都走这里：手指只要挪开一点就把长按弹出的菜单收掉。
+             * 必须放在这里 —— ItemTouchHelper 一旦接管手势，格子本身只会收到
+             * ACTION_CANCEL，收不到后续 MOVE，所以 cell 上的 OnTouchListener
+             * 在"已经拖起来"的场景里是收不到位移的（用户报的「移动后弹框不关」）。
+             */
+            @Override
+            public void onChildDraw(@NonNull Canvas c, @NonNull RecyclerView rv,
+                                    @NonNull RecyclerView.ViewHolder vh, float dX, float dY,
+                                    int actionState, boolean isCurrentlyActive) {
+                if (isCurrentlyActive && actionState == ItemTouchHelper.ACTION_STATE_DRAG
+                        && (Math.abs(dX) > Ui.dp(rv.getContext(), 6)
+                        || Math.abs(dY) > Ui.dp(rv.getContext(), 6))) {
+                    OverlayMenu.dismissCurrent();
+                }
+                super.onChildDraw(c, rv, vh, dX, dY, actionState, isCurrentlyActive);
+            }
 
             @Override
             public boolean isLongPressDragEnabled() {
@@ -442,34 +484,22 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
             @Override
             public void clearView(@NonNull RecyclerView rv, @NonNull RecyclerView.ViewHolder vh) {
                 super.clearView(rv, vh);
-                cancelPendingMenu(vh.itemView);
                 vh.itemView.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
                 vh.itemView.setElevation(0);
                 boolean moved = dragMoved;
                 dragMoved = false;
-                if (menuHandedOff) {          // 菜单已由停手计时器弹过
-                    menuHandedOff = false;
-                    return;
-                }
+                // 菜单在长按那一刻已经弹过（OverlayMenu），这里不再补弹 ——
+                // 否则「拖动后松手」就会突然蹦出一个菜单（用户反馈的老问题）。
+                if (!moved) return;
                 int pos = vh.getBindingAdapterPosition();
                 int idx = pos - offset();
-                if (moved) {
-                    if (idx < offset()) {
-                        // 快捷区拖动结束 → 存新顺序
-                        if (shortcutOrder != null && host instanceof FullHost) {
-                            ((FullHost) host).onShortcutOrderChanged(new ArrayList<>(shortcutOrder));
-                        }
-                    } else if (data != null && idx >= 0 && idx < data.size()) {
-                        host.onAppOrderChanged(new ArrayList<>(data));
-                    }
-                    return;
-                }
-                // 没拖动 = 长按原地松手 → 弹原来的长按菜单
                 if (idx < offset()) {
-                    String pkg = shortcutPkgAt(idx);
-                    if (host instanceof FullHost) ((FullHost) host).onShortcutLongClick(pkg);
+                    // 快捷区拖动结束 → 存新顺序
+                    if (shortcutOrder != null && host instanceof FullHost) {
+                        ((FullHost) host).onShortcutOrderChanged(new ArrayList<>(shortcutOrder));
+                    }
                 } else if (data != null && idx >= 0 && idx < data.size()) {
-                    host.onAppLongClick(data.get(idx));
+                    host.onAppOrderChanged(new ArrayList<>(data));
                 }
             }
         };
