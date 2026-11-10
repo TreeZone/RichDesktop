@@ -73,6 +73,44 @@ public class DebugTapReceiver extends BroadcastReceiver {
             // 注入一个按键：--ei key 26（26=电源/224=唤醒/4=返回/3=主页）
             int key = i.getIntExtra("key", -1);
             if (key >= 0) a.debugKey(key);
+            // 息屏参数（无手指自测用）：--ei sleepmode 0|1  --ei sleepguard <秒>
+            if (i.hasExtra("sleepmode")) {
+                Prefs.setSleepMode(context, i.getIntExtra("sleepmode", 0));
+                android.util.Log.i("PipDesk", "DEBUG 息屏方式=" + Prefs.getSleepMode(context));
+            }
+            if (i.hasExtra("sleepguard")) {
+                Prefs.setSleepGuardSec(context, i.getIntExtra("sleepguard", 180));
+                android.util.Log.i("PipDesk", "DEBUG 兜底唤醒=" + Prefs.getSleepGuardSec(context) + "s");
+            }
+            // 亮度自测：--ei brightauto 1 --ei brightsun 1 --ei brightweather 0
+            //          --ei brightday 200 --ei brightnight 60 --ei brightcloudy 140
+            if (i.hasExtra("brightauto")) {
+                boolean on = i.getIntExtra("brightauto", 0) == 1;
+                Prefs.setBrightAuto(context, on);
+                if (on) Brightness.applyIfAuto(context); else Brightness.restore(context);
+            }
+            if (i.hasExtra("brightsun")) {
+                Prefs.setBrightUseSun(context, i.getIntExtra("brightsun", 1) == 1);
+            }
+            if (i.hasExtra("brightweather")) {
+                Prefs.setBrightUseWeather(context, i.getIntExtra("brightweather", 1) == 1);
+            }
+            if (i.hasExtra("brightday")) Prefs.setBrightDay(context, i.getIntExtra("brightday", 200));
+            if (i.hasExtra("brightnight")) Prefs.setBrightNight(context, i.getIntExtra("brightnight", 60));
+            if (i.hasExtra("brightcloudy")) Prefs.setBrightCloudy(context, i.getIntExtra("brightcloudy", 140));
+            if (i.getIntExtra("brightapply", 0) == 1) {
+                Brightness.applyIfAuto(context);
+                android.util.Log.i("PipDesk", "DEBUG " + Brightness.describe(context)
+                        + "；天气 " + Weather.dockLabel(context) + "（" + Weather.ageLabel(context) + "）");
+            }
+            if (i.getIntExtra("brightrestore", 0) == 1) {
+                Brightness.restore(context);
+                android.util.Log.i("PipDesk", "DEBUG 亮度控制权已还原");
+            }
+            if (i.getIntExtra("weather", 0) == 1) {
+                Weather.forceRefresh(context);
+                android.util.Log.i("PipDesk", "DEBUG 手动刷新天气");
+            }
             // 模拟长按 Dock 第 pos 格：--ei docklong <pos>（触发 onDockLongClick）
             int dockLong = i.getIntExtra("docklong", -1);
             if (dockLong >= 0) a.debugDockLongClick(dockLong);

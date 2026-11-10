@@ -27,10 +27,17 @@ public class Weather {
     private static final String API = "https://api.open-meteo.com/v1/forecast"
             + "?latitude=%f&longitude=%f&current=temperature_2m,weather_code&timezone=auto";
 
-    /** 同一份天气数据的有效期 */
-    private static final long FRESH_MS = 30 * 60 * 1000L;
+    /**
+     * 同一份天气数据的有效期。
+     *
+     * 为什么不是 5 分钟：Open-Meteo 的 current 数据本身十几分钟才更新一次，
+     * 查得再勤也是同一份结果——除了多耗流量和电，没有任何收益。15 分钟刚好
+     * 卡在数据更新节奏上；一天 96 次，离免费额度（1 万次/天）还很远。
+     */
+    private static final long FRESH_MS = 15 * 60 * 1000L;
 
     private static volatile boolean fetching;
+    private static volatile long lastFailAt;
 
     private Weather() { }
 
@@ -39,16 +46,48 @@ public class Weather {
                 && System.currentTimeMillis() - Prefs.getWeatherAt(c) < FRESH_MS;
     }
 
-    /** 缓存过期就在后台拉一次（不阻塞界面） */
+    /**
+     * 现在有没有人真的需要天气：
+     *   · Dock 右端要显示天气，或
+     *   · 亮度自动调节开着且勾了「跟随天气」
+     * 都不需要时就别联网了（省流量、省电）。
+     */
+    public static boolean needed(Context c) {
+        if (c == null) return false;
+        if (Prefs.dockRightEnabled(c)) return true;
+        return Prefs.brightAuto(c) && Prefs.brightUseWeather(c);
+    }
+
+    /** 缓存过期就在后台拉一次（不阻塞界面）；不需要天气时不发请求 */
     public static void refreshIfStale(Context c) {
-        if (c == null || fresh(c) || fetching) return;
+        if (c == null || !needed(c) || fresh(c) || fetching) return;
+        // 断网时 5 分钟内不重试，避免 15 秒一跳的定时器把请求堆起来
+        if (System.currentTimeMillis() - lastFailAt < 5 * 60 * 1000L) return;
         final Context app = c.getApplicationContext();
         fetching = true;
         new Thread(() -> {
             try {
                 fetch(app);
             } catch (Throwable t) {
+                lastFailAt = System.currentTimeMillis();
                 Log.i(TAG, "天气获取失败，沿用旧值：" + t);
+            } finally {
+                fetching = false;
+            }
+        }, "pipdesk-weather").start();
+    }
+
+    /** 设置页手动刷新：不看缓存、不看开关，立刻拉一次 */
+    public static void forceRefresh(Context c) {
+        if (c == null || fetching) return;
+        final Context app = c.getApplicationContext();
+        fetching = true;
+        new Thread(() -> {
+            try {
+                fetch(app);
+            } catch (Throwable t) {
+                lastFailAt = System.currentTimeMillis();
+                Log.i(TAG, "天气获取失败：" + t);
             } finally {
                 fetching = false;
             }
@@ -101,11 +140,22 @@ public class Weather {
 
     /**
      * 是否算「阴天」（亮度用阴天档）。
-     * 少云（code 1）还算有太阳，按晴天处理；只有真正的多云/阴/雾/雨雪才算。
+     * 少云（1）、多云（2）都还算有太阳，按晴天处理；只有真正的阴/雾/雨雪才算，
+     * 否则稍微有点云就把屏幕压暗，白天看着发闷。
      * 没数据时按晴天——宁可用白天亮度，也不要凭猜测把屏幕压暗。
      */
     public static boolean isCloudy(int code) {
-        return code >= 2;
+        return code >= 3;
+    }
+
+    /** 天气数据新鲜度文案（设置页显示用） */
+    public static String ageLabel(Context c) {
+        long at = Prefs.getWeatherAt(c);
+        if (at <= 0) return "还没查到";
+        long min = (System.currentTimeMillis() - at) / 60000L;
+        if (min <= 0) return "刚刚更新";
+        if (min < 60) return min + " 分钟前更新";
+        return (min / 60) + " 小时前更新";
     }
 
     /** Dock 右端显示用：「多云 12°」，没数据时「天气 --」 */

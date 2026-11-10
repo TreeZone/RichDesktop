@@ -173,6 +173,66 @@ public class Prefs {
         sp(c).edit().putInt("bright_cloudy", clamp(v, BRIGHT_MIN, BRIGHT_MAX)).apply();
     }
 
+    /** 子开关：跟随日出日落（关掉就只用白天亮度，不做夜间变暗） */
+    public static boolean brightUseSun(Context c) {
+        return sp(c).getBoolean("bright_use_sun", true);
+    }
+
+    public static void setBrightUseSun(Context c, boolean b) {
+        sp(c).edit().putBoolean("bright_use_sun", b).apply();
+    }
+
+    /** 子开关：跟随天气（关掉就不联网取天气，也不做阴天变暗） */
+    public static boolean brightUseWeather(Context c) {
+        return sp(c).getBoolean("bright_use_weather", true);
+    }
+
+    public static void setBrightUseWeather(Context c, boolean b) {
+        sp(c).edit().putBoolean("bright_use_weather", b).apply();
+    }
+
+    /**
+     * 接管系统亮度前，用户原本的亮度状态（关掉总开关时还原）。
+     * mode: -1 未记录 / 0 手动 / 1 自动；value 仅手动模式有意义。
+     */
+    public static int getBrightSavedMode(Context c) {
+        return sp(c).getInt("bright_saved_mode", -1);
+    }
+
+    public static int getBrightSavedValue(Context c) {
+        return sp(c).getInt("bright_saved_value", -1);
+    }
+
+    public static void setBrightSaved(Context c, int mode, int value) {
+        sp(c).edit().putInt("bright_saved_mode", mode)
+                .putInt("bright_saved_value", value).apply();
+    }
+
+    // ------------------------------------------------------------ 息屏（一键关屏）
+
+    /** 息屏方式：0 = 真息屏（goToSleep）；1 = 黑屏遮罩（最安全，任意触摸即恢复） */
+    public static int getSleepMode(Context c) {
+        return clamp(sp(c).getInt("sleep_mode", 0), 0, 1);
+    }
+
+    public static void setSleepMode(Context c, int mode) {
+        sp(c).edit().putInt("sleep_mode", clamp(mode, 0, 1)).apply();
+    }
+
+    /**
+     * 真息屏的兜底自动亮屏秒数：到点强制唤醒，避免「黑屏后怎么都唤不醒」。
+     * 0 = 关闭兜底（不建议）。
+     */
+    public static final int SLEEP_GUARD_MAX = 600;
+
+    public static int getSleepGuardSec(Context c) {
+        return clamp(sp(c).getInt("sleep_guard_sec", 180), 0, SLEEP_GUARD_MAX);
+    }
+
+    public static void setSleepGuardSec(Context c, int sec) {
+        sp(c).edit().putInt("sleep_guard_sec", clamp(sec, 0, SLEEP_GUARD_MAX)).apply();
+    }
+
     // ------------------------------------------------------------ 天气缓存（跟亮度、Dock 天气共用）
 
     /** WMO 天气代码；-1 = 还没查到 */

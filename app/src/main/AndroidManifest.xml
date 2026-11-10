@@ -30,6 +30,10 @@
 
     <!-- 「息屏」按键：PowerManager.goToSleep（signature|privileged） -->
     <uses-permission android:name="android.permission.DEVICE_POWER" />
+    <!-- 息屏兜底：到点用闹钟强制唤醒屏幕（黑屏回不来是绝对不能接受的） -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 
     <!-- 按日出日落自动调亮度：写 SCREEN_BRIGHTNESS（signature|preinstalled） -->
     <uses-permission android:name="android.permission.WRITE_SETTINGS" />
@@ -78,6 +82,11 @@
                 <action android:name="com.cz.richdesk.DEBUG_UI" />
             </intent-filter>
         </receiver>
+
+        <!-- 息屏兜底：闹钟到点强制点亮屏幕（防止 goToSleep 后唤不醒） -->
+        <receiver
+            android:name=".SleepGuardReceiver"
+            android:exported="false" />
 
         <!-- 关闭画中画时，用它把虚拟屏上的目标应用顶回后台，避免残影 -->
         <activity

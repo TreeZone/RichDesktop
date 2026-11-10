@@ -657,8 +657,37 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
     // ------------------------------------------------------------ 状态栏
 
-    private void applyStatusBar(boolean show) {
-        androidx.appcompat.app.ActionBar bar = getSupportActionBar();
+    /**
+     * 遮罩息屏期间连状态栏一起藏掉（否则黑屏上还挂着时间/电量，既不像"熄屏"也刺眼）。
+     * 恢复时按用户设置还原。
+     */
+    void sleepBars(boolean hide) {
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController c = getWindow().getInsetsController();
+            if (c == null) return;
+            if (hide) {
+                c.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            } else {
+                applyStatusBar(Prefs.showStatusBar(this));
+                c.show(WindowInsets.Type.navigationBars());
+            }
+        } else {
+            View d = getWindow().getDecorView();
+            if (hide) {
+                d.setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+            } else {
+                applyStatusBar(Prefs.showStatusBar(this));
+            }
+        }
+    }
+
+    private void applyStatusBar(boolean show) {        androidx.appcompat.app.ActionBar bar = getSupportActionBar();
         if (bar != null) bar.hide();
         if (Build.VERSION.SDK_INT >= 30) {
             WindowInsetsController c = getWindow().getInsetsController();
@@ -813,6 +842,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         }
         // 天气缓存过期就后台拉一次（亮度判断「阴天」也靠它）
         Weather.refreshIfStale(this);
+        SunTimes.refreshIfStaleAsync(this);   // 当天日落/日出，一天只查一次
         // 亮度自动调节：目标值没变时内部直接返回，不会反复写系统设置
         Brightness.applyIfAuto(this);
     }
@@ -1180,14 +1210,52 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         } else if (AppInfo.HOME_PKG.equals(pkg)) {
             Keys.home(this);
         } else if (AppInfo.SLEEP_PKG.equals(pkg)) {
-            Keys.screenOff(this);
+            ScreenOff.sleep(this);
         } else if (AppInfo.RECENTS_PKG.equals(pkg)) {
             Keys.recents(this);
         } else if (AppInfo.VOL_UP_PKG.equals(pkg)) {
-            Keys.volume(this, true);
+            showVolumeHud(Keys.volume(this, true), true);
         } else if (AppInfo.VOL_DOWN_PKG.equals(pkg)) {
-            Keys.volume(this, false);
+            showVolumeHud(Keys.volume(this, false), false);
         }
+    }
+
+    /**
+     * 音量提示：车机上系统音量条经常不显示（FLAG_SHOW_UI 被 ROM 吞掉），
+     * 这里自己在窗口顶部浮一个小玻璃条，1.2 秒后淡出。
+     */
+    private void showVolumeHud(int[] vol, boolean up) {
+        if (vol == null || vol.length < 2) return;
+        final ViewGroup decor = (ViewGroup) getWindow().getDecorView();
+        View old = decor.findViewWithTag("pipdesk-vol-hud");
+        final TextView hud;
+        if (old instanceof TextView) {
+            hud = (TextView) old;
+        } else {
+            hud = new TextView(this);
+            hud.setTag("pipdesk-vol-hud");
+            hud.setTextSize(15);
+            // 深色玻璃 + 白字：停在浅色壁纸上也能看清（用主题玻璃的话白字会糊掉）
+            GradientDrawable bg = new GradientDrawable(
+                    GradientDrawable.Orientation.TL_BR,
+                    new int[]{0xF22A3240, 0xE6181D26});
+            bg.setCornerRadius(Ui.dp(this, 18));
+            bg.setStroke(Math.max(1, Ui.dp(this, 1)), 0x40FFFFFF);
+            hud.setBackground(bg);
+            hud.setTextColor(0xFFFFFFFF);
+            hud.setShadowLayer(4, 0, 1, 0xCC000000);
+            int ph = Ui.dp(this, 22);
+            hud.setPadding(ph, Ui.dp(this, 12), ph, Ui.dp(this, 12));
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.gravity = Gravity.CENTER;   // 居中：不压状态栏、不挡顶部标题
+            decor.addView(hud, lp);
+        }
+        hud.setText((up ? "音量 +  " : "音量 -  ") + vol[0] + " / " + vol[1]);
+        hud.animate().cancel();
+        hud.setAlpha(1f);
+        hud.animate().alpha(0f).setStartDelay(1200).setDuration(400).start();
+        Log.i(TAG, "音量提示 " + vol[0] + "/" + vol[1]);
     }
 
     /**
@@ -1536,6 +1604,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     @Override
     protected void onStop() {
         super.onStop();
+        // 遮罩模式下离开桌面就别留着一张黑屏：回来时必须能看到内容
+        if (ScreenOff.curtainShown(this)) ScreenOff.dismissCurtain(this);
         Log.i(TAG, "LIFE onStop " + paneSnapshot());
     }
 
@@ -1559,6 +1629,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     protected void onResume() {
         super.onResume();
         AppState.mainResumed = true;
+        // 屏幕已经亮着（人醒了/被唤醒）：把息屏兜底闹钟撤掉，免得待会儿又亮一次
+        ScreenOff.cancelGuard(this);
         // recreate() 重建完的第一帧：车机上不一定自己回前台，主动拎一次
         if (pendingToFront) {
             pendingToFront = false;

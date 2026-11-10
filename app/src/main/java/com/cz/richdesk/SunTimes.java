@@ -44,11 +44,19 @@ public class SunTimes {
      * 日落/日出可用就用它，否则用固定时段（默认 18:30 → 07:00）。
      */
     public static boolean isDarkNow(Context c) {
+        return isDarkNow(c, Prefs.useSunTime(c));
+    }
+
+    /**
+     * 同上，但由调用方决定用不用联网日落（亮度自动调节用的是自己的子开关，
+     * 和「外观跟随时间」互不影响）。useSun=false 时直接走固定时段。
+     */
+    public static boolean isDarkNow(Context c, boolean useSun) {
         int now = nowMinutes();
         int start = Prefs.getNightStart(c);
         int end = Prefs.getNightEnd(c);
 
-        if (Prefs.useSunTime(c) && freshCache(c)) {
+        if (useSun && freshCache(c)) {
             int set = Prefs.getSunSetMin(c);
             int rise = Prefs.getSunRiseMin(c);
             if (set >= 0 && rise >= 0) {
@@ -79,6 +87,28 @@ public class SunTimes {
         } catch (Throwable t) {
             Log.i(TAG, "日落时间获取失败，沿用固定时段：" + t);
         }
+    }
+
+    /** 上次尝试失败的时间：断网时别每 15 秒重试一次，10 分钟内不重复 */
+    private static volatile long lastTryAt;
+    private static volatile boolean refreshing;
+
+    /** 主线程安全的版本：日落数据过期就丢后台拉一次（失败静默沿用固定时段） */
+    public static void refreshIfStaleAsync(Context c) {
+        if (c == null || freshCache(c) || refreshing) return;
+        if (System.currentTimeMillis() - lastTryAt < 10 * 60 * 1000L) return;
+        final Context app = c.getApplicationContext();
+        refreshing = true;
+        lastTryAt = System.currentTimeMillis();
+        new Thread(() -> {
+            try {
+                fetch(app);
+            } catch (Throwable t) {
+                Log.i(TAG, "日落时间获取失败，沿用固定时段：" + t);
+            } finally {
+                refreshing = false;
+            }
+        }, "pipdesk-sun").start();
     }
 
     /**

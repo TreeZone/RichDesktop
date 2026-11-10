@@ -71,12 +71,12 @@ public class Keys {
     }
 
     /**
-     * 音量加/减。
+     * 音量加/减。返回 {当前音量, 最大值}，拿不到就是 null（调用方用来显示音量条）。
      * 优先走 AudioManager（带系统的音量条、按音频流语义走，车机上也生效）；
      * 拿不到 AudioManager 才退回按键注入。
      */
-    public static void volume(Context c, boolean up) {
-        if (c == null) return;
+    public static int[] volume(Context c, boolean up) {
+        if (c == null) return null;
         try {
             android.media.AudioManager am = (android.media.AudioManager)
                     c.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
@@ -86,40 +86,17 @@ public class Keys {
                                 : android.media.AudioManager.ADJUST_LOWER,
                         android.media.AudioManager.FLAG_SHOW_UI
                                 | android.media.AudioManager.FLAG_PLAY_SOUND);
-                Log.i(TAG, "音量" + (up ? "+" : "-") + " → "
-                        + am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC));
-                return;
+                int cur = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC);
+                int max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC);
+                Log.i(TAG, "音量" + (up ? "+" : "-") + " → " + cur + "/" + max);
+                // 有些车机把 FLAG_SHOW_UI 也吞掉了，桌面自己再浮一个提示（见 MainActivity）
+                return new int[]{cur, max};
             }
         } catch (Throwable t) {
             Log.w(TAG, "AudioManager 调音量失败：" + t.getClass().getSimpleName());
         }
         send(c, up ? KeyEvent.KEYCODE_VOLUME_UP : KeyEvent.KEYCODE_VOLUME_DOWN);
-    }
-
-    /**
-     * 息屏。
-     *
-     * 走 PowerManager.goToSleep（需要 DEVICE_POWER，uid 1000 才有），
-     * 调用前顺手把「双击唤醒」打开——不然息屏后用户只能去按实体键/等超时，
-     * 点一下桌面图标反而更难恢复。开不了就沿用系统原有设置，不报错。
-     */
-    public static void screenOff(Context c) {
-        if (c == null) return;
-        final Context app = c.getApplicationContext();
-        EXEC.execute(() -> {
-            enableDoubleTapToWake(app);
-            try {
-                android.os.PowerManager pm =
-                        (android.os.PowerManager) app.getSystemService(Context.POWER_SERVICE);
-                Method m = android.os.PowerManager.class.getMethod("goToSleep", long.class);
-                m.invoke(pm, SystemClock.uptimeMillis());
-                Log.i(TAG, "息屏：goToSleep 已调用");
-                return;
-            } catch (Throwable t) {
-                Log.w(TAG, "goToSleep 不可用：" + t.getClass().getSimpleName());
-            }
-            send(app, KeyEvent.KEYCODE_POWER);
-        });
+        return null;
     }
 
     private static volatile boolean dt2wTried;
@@ -131,7 +108,7 @@ public class Keys {
      * 这里把常见键名挨个试一遍（键不存在时 getInt 返回 -1，直接跳过），
      * 最后再试几个常见 sysfs 节点。一个都没成功就沿用系统设置。
      */
-    private static void enableDoubleTapToWake(Context c) {
+    public static void enableDoubleTapToWake(Context c) {
         if (dt2wTried) return;
         dt2wTried = true;
         String[] keys = {"double_tap_to_wake", "double_tap_screen_wake",

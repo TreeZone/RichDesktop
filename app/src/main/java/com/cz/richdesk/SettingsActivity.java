@@ -162,6 +162,17 @@ public class SettingsActivity extends AppCompatActivity {
                 dbg.removeExtra("debug_scroll_theme");
                 content.postDelayed(() -> sv.smoothScrollTo(0, themeBox.getTop()), 500);
             }
+            // 滚到底部（核对息屏/亮度区块截图用）
+            if (dbg.getBooleanExtra("debug_scroll_bottom", false)) {
+                dbg.removeExtra("debug_scroll_bottom");
+                content.postDelayed(() -> sv.smoothScrollTo(0, content.getHeight()), 500);
+            }
+            // 滚到指定像素（截图核对用，免去模拟手指滑动）
+            if (dbg.hasExtra("debug_scroll_y")) {
+                int y = dbg.getIntExtra("debug_scroll_y", 0);
+                dbg.removeExtra("debug_scroll_y");
+                content.postDelayed(() -> sv.scrollTo(0, y), 450);
+            }
             // 直接设置屏内渲染分辨率：--ei debug_render 75（50/75/100）
             if (dbg.hasExtra("debug_render")) {
                 int pct = clamp(dbg.getIntExtra("debug_render", 100), 50, 100);
@@ -243,34 +254,84 @@ public class SettingsActivity extends AppCompatActivity {
         section("壁纸");
         action("更换壁纸（静态图片）", () -> pickWallpaper());
 
+        // 息屏 & 音量：都是应用列表里的内置图标（和「主页」一样），可绑到 Dock
+        section("息屏与音量（应用列表图标，可绑 Dock）");
+        toggle("真息屏（关 = 黑屏遮罩，最安全）", Prefs.getSleepMode(this) == 0, b -> {
+            Prefs.setSleepMode(this, b ? 0 : 1);
+            toast(b ? "息屏方式：真息屏（触摸/按键唤醒 + 到点兜底点亮）"
+                    : "息屏方式：黑屏遮罩（任意触摸立即恢复）");
+        });
+        seek("兜底自动亮屏（真息屏后强制点亮）", 0, Prefs.SLEEP_GUARD_MAX, 60,
+                Prefs.getSleepGuardSec(this),
+                v -> Prefs.setSleepGuardSec(this, v),
+                v -> v == 0 ? "不自动（不建议）" : (v / 60) + " 分钟");
+        note("· 真息屏 = 等价于按电源键：屏幕和背光全关，最省电。唤醒方式：触摸屏幕/双击/按键。\n"
+                + "· 兜底：真息屏后会挂一个闹钟，到点强制点亮——就算这台车机的触摸唤不醒系统，"
+                + "也不会「黑了回不来」。默认 3 分钟，可改成 1~10 分钟。\n"
+                + "· 黑屏遮罩 = 不真关屏，只在最上层盖一层纯黑，任意触摸立刻恢复；"
+                + "100% 安全，代价是背光还亮着、稍微费电。\n"
+                + "· 音量 ± 调的是媒体音量，点一下会在屏幕上浮出当前音量（车机系统音量条常常不显示）。");
+
         // 亮度自动调节：日落后/日出后用不同亮度，阴天（联网天气）单独一档
-        section("亮度（按日出日落 + 天气）");
-        toggle("自动调节屏幕亮度", Prefs.brightAuto(this), b -> {
+        section("屏幕亮度（跟随日出日落 / 天气）");
+
+        toggle("总开关：自动调节屏幕亮度", Prefs.brightAuto(this), b -> {
             Prefs.setBrightAuto(this, b);
             if (b) {
                 Weather.refreshIfStale(this);       // 先把天气捞一下，阴天判断才准
+                SunTimes.refreshIfStaleAsync(this);
                 Brightness.applyIfAuto(this);
                 toast("当前：" + Brightness.describe(this));
+            } else {
+                // 把亮度控制权还给系统（本来自动就恢复自动，本来手动就恢复原值）
+                Brightness.restore(this);
+                toast("已停止自动调节，亮度控制权已还给系统");
             }
         });
-        seek("白天亮度（日出后）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
-                Prefs.getBrightDay(this),
-                v -> { Prefs.setBrightDay(this, v); Brightness.applyIfAuto(this); },
-                v -> v + " / 255");
+
+        toggle("跟随日出日落（日落后变暗）", Prefs.brightUseSun(this), b -> {
+            Prefs.setBrightUseSun(this, b);
+            if (b) SunTimes.refreshIfStaleAsync(this);
+            Brightness.applyIfAuto(this);
+            toast(b ? "已开启：日落后切到夜间亮度" : "已关闭：不再按日落变暗");
+        });
         seek("夜间亮度（日落后）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
                 Prefs.getBrightNight(this),
                 v -> { Prefs.setBrightNight(this, v); Brightness.applyIfAuto(this); },
                 v -> v + " / 255");
-        seek("阴天亮度（联网天气）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
+
+        toggle("跟随天气（阴雨天变暗）", Prefs.brightUseWeather(this), b -> {
+            Prefs.setBrightUseWeather(this, b);
+            if (b) Weather.refreshIfStale(this);
+            Brightness.applyIfAuto(this);
+            toast(b ? "已开启：阴/雨/雪天切到阴天亮度" : "已关闭：不再按天气变暗");
+        });
+        seek("阴天 / 雨雪亮度", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
                 Prefs.getBrightCloudy(this),
                 v -> { Prefs.setBrightCloudy(this, v); Brightness.applyIfAuto(this); },
                 v -> v + " / 255");
-        action("当前亮度方案：" + Brightness.describe(this) + "（" + Weather.dockLabel(this) + "）",
-                () -> toast(Brightness.describe(this)));
-        note("· 日落/日出与天气都联网获取，用的位置就是上面「日落地点」那个；"
-                + "断网时退回固定时段，功能不停。\n"
-                + "· 阴天/雨雪用「阴天亮度」，少云仍按白天算——宁可亮一点也别把屏幕压暗。\n"
-                + "· 自动调节打开后会把系统亮度切成手动，否则系统自动亮度会马上盖掉这里的值。");
+
+        seek("白天亮度（其余情况）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
+                Prefs.getBrightDay(this),
+                v -> { Prefs.setBrightDay(this, v); Brightness.applyIfAuto(this); },
+                v -> v + " / 255");
+
+        action("现在为什么是这个亮度？", () -> toast(Brightness.describe(this)
+                + "\n天气：" + Weather.dockLabel(this) + "（" + Weather.ageLabel(this) + "）"
+                + "\n日落：" + SunTimes.describe(this)));
+        action("立即刷新天气（平时每 15 分钟自动刷新）", () -> {
+            Weather.forceRefresh(this);
+            toast("正在刷新天气，稍等…");
+        });
+        note("· 三个子项（日出日落 / 天气）可以各自开关；总开关关掉时完全不碰系统亮度，"
+                + "适合车机自带自动背光的情况。\n"
+                + "· 优先级：夜间 > 阴雨天 > 白天。晚上不管阴不阴都用夜间亮度，"
+                + "否则一阴天反而更亮、很刺眼。\n"
+                + "· 天气 15 分钟查一次：Open-Meteo 的数据本身十几分钟才更新，"
+                + "查得再勤也是同一份结果；只在「Dock 显示天气」或「跟随天气」开着时才联网。\n"
+                + "· 阴天判断只认「阴 / 雾 / 雨 / 雪 / 雷」，多云仍按白天亮度，"
+                + "免得稍微有点云就把屏幕压暗。\n"
+                + "· 日落/天气都联网获取，位置就是上面「日落地点」那个；断网退回固定时段。");
 
         section("说明");
         note("· 画中画顺序固定：横排从左到右、竖排从上到下，依次是画中画 1/2/3。\n"
