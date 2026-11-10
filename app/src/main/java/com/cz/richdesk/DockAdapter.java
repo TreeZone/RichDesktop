@@ -173,7 +173,7 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
                 onLongPress(vh);
                 return true;
             });
-            // 长按震动统一由 Ui.buzz 震一次（默认震动会被 ItemTouchHelper 再补一刀变两震）
+            // 全局关闭震感：关掉系统默认触感（含 ItemTouchHelper.select 那一刀）
             vh.itemView.setHapticFeedbackEnabled(false);
         } else {
             vh.ivIcon.setVisibility(View.GONE);
@@ -214,9 +214,8 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
         if (dragHelper == null) return;
         int pos = vh.getBindingAdapterPosition();
         if (pos < 0 || pos >= host.dockPkgs().size()) return;
-        // 统一单次短震（关掉默认的，ItemTouchHelper.select 的那刀也被关掉）
+        // 全局关闭震感：关掉系统默认触感反馈，不再主动震
         vh.itemView.setHapticFeedbackEnabled(false);
-        Ui.buzz(vh.itemView);
         OverlayMenu.setAnchor(vh.itemView);   // 菜单贴着这个图标弹出
         dragHelper.startDrag(vh);
         host.onDockLongClick(pos, host.dockPkgs().get(pos));

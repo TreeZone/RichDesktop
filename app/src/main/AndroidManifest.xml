@@ -12,7 +12,6 @@
 
     <!-- 「跟随时间」按日落/日出切换：联网查一次当日日落时刻 -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- 取最后已知位置来算日落（拿不到就退回默认坐标，不影响功能） -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />

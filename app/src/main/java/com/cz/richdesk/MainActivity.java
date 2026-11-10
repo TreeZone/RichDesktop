@@ -565,7 +565,6 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 new android.view.GestureDetector.SimpleOnGestureListener() {
                     @Override public void onLongPress(MotionEvent e) {
                         if (dockPkgs.isEmpty()) {
-                            Ui.buzz(rvDock);            // 和图标长按同一套震动
                             onDockAdd();
                         }
                     }
@@ -941,9 +940,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             else openPip(pkg, 0);
         });
         box.setOnLongClickListener(v -> {
-            // 长按统一单次短震（与应用列表 / Dock 应用区一致）
+            // 全局关闭震感：只关掉系统默认的触感反馈，不再主动震
             box.setHapticFeedbackEnabled(false);
-            Ui.buzz(box);
             beginPanelDrag(left, pkg, box);
             return true;
         });
@@ -1705,6 +1703,15 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             }
         }
         boolean running = pip.indexOfPkg(pkg) >= 0;
+        // 单画布局下点开「指定了屏位」的应用：即使它还在某块隐藏的屏上跑着
+        //（running=true 会跳过 pip.open、绕过 PipManager.open 里的恢复逻辑），
+        // 也要先恢复单画前的布局，否则单画布局永远退不回去。
+        // 恢复后强制走一遍 open：PipPane.open 对已运行的应用是幂等的（不重建虚拟屏），
+        // 只会把应用所在的屏重新放回显示。
+        if (pip.inSingleMode() && (preferred >= 1 || pip.isAssigned(pkg))) {
+            pip.restoreSingleLayout();
+            running = false;
+        }
         if (!running) pip.open(pkg, preferred);
         // 刚在某个屏上打开了应用 → 那块屏成为返回键的目标（用户的心理预期就是"返回到刚开的那个"）
         int idx = pip.indexOfPkg(pkg);

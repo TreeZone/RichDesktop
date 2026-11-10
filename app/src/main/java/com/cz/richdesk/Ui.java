@@ -12,8 +12,6 @@ import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
-import android.os.VibrationEffect;
-import android.os.Vibrator;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
@@ -65,30 +63,6 @@ public class Ui {
 
     public static int dp(Context c, float v) {
         return Math.round(v * density(c));
-    }
-
-    /**
-     * 长按统一触一次短震（20ms）。
-     *
-     * 为什么不用 View.performHapticFeedback：长按场景它会被触发两次 ——
-     *   1) View 长按本身震一次（performLongClickInternal）；
-     *   2) ItemTouchHelper.select() 拖动接手时又震一次（源码里写死的）。
-     * 所以凡是走拖动的格子一律 setHapticFeedbackEnabled(false) 关掉默认震动，
-     * 由这里用 Vibrator 精确震一次。
-     */
-    @SuppressWarnings("deprecation")
-    public static void buzz(View v) {
-        if (v == null) return;
-        try {
-            Vibrator vib = (Vibrator) v.getContext().getSystemService(Context.VIBRATOR_SERVICE);
-            if (vib == null || !vib.hasVibrator()) return;
-            if (Build.VERSION.SDK_INT >= 26) {
-                vib.vibrate(VibrationEffect.createOneShot(
-                        20, VibrationEffect.DEFAULT_AMPLITUDE));
-            } else {
-                vib.vibrate(20);
-            }
-        } catch (Throwable ignored) { }
     }
 
     /** 当前系统是否支持窗口背景模糊（Android 12 / API 31 起） */

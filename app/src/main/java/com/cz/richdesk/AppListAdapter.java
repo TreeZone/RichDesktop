@@ -288,7 +288,7 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         // 图标是硬性 dp（不再被格宽缩小），列多/图标大时可能比格子的内宽还宽一点，
         // 允许它画出格子边界（居中溢出，两侧均匀），否则会被父容器裁成缺边
         cell.setClipChildren(false);
-        // 长按震动统一由 Ui.buzz 震一次（关掉默认的，ItemTouchHelper.select 还会补一刀）
+        // 全局关闭震感：关掉系统默认触感（含 ItemTouchHelper.select 那一刀）
         cell.setHapticFeedbackEnabled(false);
 
         // iOS 风格圆角方遮罩：Dock 与应用列表用同一个类，外形才统一
@@ -445,9 +445,8 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         if (dragHelper == null) return;
         final int pos = vh.getBindingAdapterPosition();
         if (pos < 0 || pos >= getItemCount()) return;
-        // 统一单次短震：三处（操作区 / Dock / 应用列表）手感一致
+        // 全局关闭震感：关掉系统默认触感反馈，不再主动震
         vh.itemView.setHapticFeedbackEnabled(false);
-        Ui.buzz(vh.itemView);
         OverlayMenu.setAnchor(vh.itemView);   // 菜单贴着这个图标弹出
         dragHelper.startDrag(vh);
         int idx = pos - offset();

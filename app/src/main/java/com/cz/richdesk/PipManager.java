@@ -533,6 +533,11 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         return singleMode;
     }
 
+    /** 恢复单画前的布局（不在单画布局时什么都不做）。供外部在打开指定屏位应用前调用。 */
+    public void restoreSingleLayout() {
+        if (singleMode) restoreSingle();
+    }
+
     /** 单画布局显示的是第几屏（0 起；不在单画布局返回 -1） */
     public int singleIndex() {
         return singleMode ? singleIdx : -1;
