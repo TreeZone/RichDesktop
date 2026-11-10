@@ -46,6 +46,10 @@ public class SettingsActivity extends AppCompatActivity {
     /** 重建后要还原的滚动位置（-1 = 不还原）。recreate() 会换一个新的 Activity 实例，
      *  instance 字段带不过去，所以用 static 暂存一次。 */
     private static int pendingScrollY = -1;
+    /** 「退出再进来」的滚动记忆（主页/测试页分开）。只在进程存活期间有效：
+     *  进程被杀 / 重启桌面 / 重启机器后自动归零，从头进。 */
+    private static int lastScrollMain = -1;
+    private static int lastScrollTest = -1;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -128,11 +132,12 @@ public class SettingsActivity extends AppCompatActivity {
 
         // 切外观会重建本页（recreate）：重建前记下的滚动位置在这里还原，
         // 否则选完模式整页会跳回最顶部，想接着调下面的项还得重新滚一遍。
-        // 普通的「退出再进来」也有记忆：recreate 暂存不存在（-1）时读 Prefs 里
-        // 上次退出时的位置（主页/测试页分开存，进程被杀也能恢复）。
+        // 普通的「退出再进来」也记忆，但只在进程存活期间：static 变量随进程
+        // 死亡自动归零，重启桌面 / 重启机器后从头进（进程被杀重建时 lastScroll
+        // 已经是 -1，自然回到顶部）。
         int restoreY = pendingScrollY;
         pendingScrollY = -1;
-        if (restoreY < 0) restoreY = Prefs.getSettingsScroll(this, testPage);
+        if (restoreY < 0) restoreY = testPage ? lastScrollTest : lastScrollMain;
         final int fRestoreY = restoreY;
         if (fRestoreY > 0) {
             sv.getViewTreeObserver().addOnGlobalLayoutListener(
@@ -1284,10 +1289,12 @@ public class SettingsActivity extends AppCompatActivity {
     @Override
     protected void onPause() {
         super.onPause();
-        // 退出（返回）/ 切走时记住滚动位置，下次进来还在原地（recreate 重建走
-        // pendingScrollY 暂存，这里写 Prefs 是给「退出再进来」用的，两条路互不干扰）
+        // 退出（返回）/ 切走时记住滚动位置，下次进来还在原地。
+        // 只记在进程内存里（static）：进程被杀 / 重启桌面 / 重启机器就自动清零，
+        // 下次从头进。recreate 重建走 pendingScrollY 暂存，两条路互不干扰。
         if (scrollView != null) {
-            Prefs.setSettingsScroll(this, testPage, scrollView.getScrollY());
+            if (testPage) lastScrollTest = scrollView.getScrollY();
+            else lastScrollMain = scrollView.getScrollY();
         }
     }
 
