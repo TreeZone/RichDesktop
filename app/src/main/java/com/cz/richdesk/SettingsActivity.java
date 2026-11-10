@@ -219,6 +219,7 @@ public class SettingsActivity extends AppCompatActivity {
         // 导致测试页把主页的全部设置项都带出来了。
         if (testPage) {
             buildBrightness();
+            buildPerfOverlay();
             return;
         }
 
@@ -453,6 +454,35 @@ public class SettingsActivity extends AppCompatActivity {
                 + "· 阴天判断只认「阴 / 雾 / 雨 / 雪 / 雷」，多云仍按白天亮度，"
                 + "免得稍微有点云就把屏幕压暗。\n"
                 + "· 日落/天气都联网获取，位置就是上面「日落地点」那个；断网退回固定时段。");
+    }
+
+    /**
+     * 性能悬浮窗（实验中，挂在「测试功能」页）：实时 CPU / GPU / 系统内存 /
+     * 本进程内存 / 线程 / fd / 虚拟屏数量 / 每块画中画帧率。排查卡顿用。
+     */
+    private void buildPerfOverlay() {
+        section("性能悬浮窗（排查卡顿 / 泄漏）");
+        toggle("显示性能悬浮窗", Prefs.perfOverlay(this), b -> {
+            Prefs.setPerfOverlay(this, b);
+            if (b) {
+                PerfOverlay.show(this);
+                toast(PerfOverlay.isShown()
+                        ? "悬浮窗已显示（左上角，不影响触摸）"
+                        : "悬浮窗显示失败：请在系统设置里允许本应用显示在其他应用上层");
+            } else {
+                PerfOverlay.hide();
+                toast("悬浮窗已关闭");
+            }
+        });
+        note("· 每秒刷新：CPU（整体+各核）、GPU、系统内存、本进程 pss/heap、\n"
+                + "  thr=线程数、fd=文件句柄数、dsp=系统 Display 数、p0..=每块画中画（包名/帧数/帧间隔/状态）。\n"
+                + "· 卡顿排查先看 PERF 行（同时会写进日志）：\n"
+                + "  displays 持续上涨 = 虚拟屏泄漏；\n"
+                + "  threads 上涨 = 线程泄漏；\n"
+                + "  pss 涨而 heap 不涨 = native / 显存问题。\n"
+                + "· GPU 占用依赖内核节点，各厂商不同（Adreno/Mali/MTK 等自动探测）；\n"
+                + "  个别机型节点需要 root，读不到就显示 -，不影响其他数据。\n"
+                + "· 高频触摸日志默认关闭，需要时创建 /sdcard/pipdesk_verbose 打开。");
     }
 
     // ------------------------------------------------------------ 息屏亮屏方式 / 版本彩蛋

@@ -383,6 +383,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         // 资源心跳：每分钟一行（堆/PSS/线程/fd/Display 数/注入队列），
         // 「跑一段时间变卡」时看这行数字是哪一个在涨就知道根因在哪。
         PerfMon.start(this, pip);
+        PerfOverlay.apply(this, pip);       // 性能悬浮窗：按设置开关恢复显示
         // 卡死时把各画中画的 display/尺寸/包名一起写进日志：能立刻看出是
         // "某块屏没建出来" 还是 "三块屏都正常但渲染卡住了"
         Watchdog.setProbe(() -> {

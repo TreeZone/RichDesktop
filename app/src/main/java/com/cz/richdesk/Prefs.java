@@ -505,6 +505,15 @@ public class Prefs {
         sp(c).edit().putBoolean("status_bar", b).apply();
     }
 
+    /** 性能悬浮窗（调试工具，开关在测试功能页）：实时 CPU/GPU/内存/虚拟屏 */
+    public static boolean perfOverlay(Context c) {
+        return sp(c).getBoolean("perf_overlay", false);
+    }
+
+    public static void setPerfOverlay(Context c, boolean b) {
+        sp(c).edit().putBoolean("perf_overlay", b).apply();
+    }
+
     // ------------------------------------------------------------ 槽位分配
 
     /** 应用 → 画中画序号（1 起），未记录表示自动分配 */

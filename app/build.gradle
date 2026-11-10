@@ -40,8 +40,8 @@ android {
         applicationId "com.cz.richdesk"
         minSdk 28
         targetSdk 30
-        versionCode 87
-        versionName "0.17.1"
+        versionCode 88
+        versionName "0.17.2"
     }
 
     /*
