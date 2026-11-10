@@ -478,6 +478,8 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
             singleMode = true;
             Log.i(TAG, "进入单画布局：pane " + idx + "，保存比例 "
                     + java.util.Arrays.toString(savedWeights));
+            FileLog.append("单画：pane=" + idx + " 比例=" + java.util.Arrays.toString(savedWeights)
+                    + " 原应用=" + singlePrevPkg);
         }
         singleIdx = idx;
         restoreIfCollapsed(idx);
@@ -510,6 +512,8 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         container.setWeights(weights);
         syncCollapsed();
         Log.i(TAG, "退出单画布局：恢复比例 " + java.util.Arrays.toString(weights));
+        FileLog.append("恢复布局：比例=" + java.util.Arrays.toString(weights)
+                + " 借用屏pane=" + idx + " 开回=" + prev);
         // 单画借用的那块屏开回原应用：同一块虚拟屏换应用，不重建、秒回
         if (idx >= 0 && idx < panes.size() && prev != null
                 && !prev.equals(panes.get(idx).pkg())) {
@@ -535,7 +539,9 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
 
     /** 恢复单画前的布局（不在单画布局时什么都不做）。供外部在打开指定屏位应用前调用。 */
     public void restoreSingleLayout() {
-        if (singleMode) restoreSingle();
+        if (!singleMode) return;
+        Log.i(TAG, "restoreSingleLayout：指定屏位应用打开前恢复布局");
+        restoreSingle();
     }
 
     /** 单画布局显示的是第几屏（0 起；不在单画布局返回 -1） */

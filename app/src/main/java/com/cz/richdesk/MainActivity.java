@@ -559,15 +559,14 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         rvDock.setOverScrollMode(View.OVER_SCROLL_NEVER);
         rvDock.setClipToPadding(false);
         rvDock.setBackground(null);          // 玻璃在 dockRow 上（三段共用）
-        // 添加入口：长按 Dock 空白处（不再挂常驻「＋」，需求：跟功能区一样去掉加号）。
+        // 添加入口：长按 Dock 应用区的**空白处**（有没有图标都生效 ——
+        // 触摸先分给图标格子，格子不消费才落到 RecyclerView，所以和图标长按天然并存）。
         // 注意：空 RecyclerView 的触摸走它自己的手势处理，不会触发 view 级长按 ——
         // 所以这里必须用 GestureDetector 识别长按，setOnLongClickListener 永远不响。
         final android.view.GestureDetector dockGesture = new android.view.GestureDetector(this,
                 new android.view.GestureDetector.SimpleOnGestureListener() {
                     @Override public void onLongPress(MotionEvent e) {
-                        if (dockPkgs.isEmpty()) {
-                            onDockAdd();
-                        }
+                        onDockAdd();
                     }
                 });
         rvDock.setOnTouchListener((v, e) -> {
@@ -887,6 +886,12 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         }
         int padH = Ui.dp(this, 4);
         box.setPadding(padH, 0, padH, 0);
+        // 面板级长按：长按**空白/间隙**弹「添加图标」选择框（和图标的长按菜单并存 ——
+        // 触摸先分给图标格子，格子自己消费了长按，只有空白处才会落到面板上）
+        box.setOnLongClickListener(v -> {
+            pickPanelApp(left);
+            return true;
+        });
         for (final String pkg : pkgs) box.addView(shortcutIcon(pkg, left, ic, pitch));
         if (pkgs.isEmpty()) {
             // 一个图标都没有：留一格透明的长按区当作「添加」入口
@@ -931,6 +936,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     private View shortcutIcon(final String pkg, final boolean left, int ic, int pitch) {
         FrameLayout box = new FrameLayout(this);
         box.setLayoutParams(new LinearLayout.LayoutParams(pitch, ViewGroup.LayoutParams.MATCH_PARENT));
+        // 全局关闭震感：必须在构建时就关（放到长按监听里第一下震动已经出去了）
+        box.setHapticFeedbackEnabled(false);
         android.widget.ImageView iv = new MaskedIconView(this);
         iv.setScaleType(android.widget.ImageView.ScaleType.FIT_CENTER);
         AppInfo ai = findApp(pkg);
@@ -941,8 +948,6 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             else openPip(pkg, 0);
         });
         box.setOnLongClickListener(v -> {
-            // 全局关闭震感：只关掉系统默认的触感反馈，不再主动震
-            box.setHapticFeedbackEnabled(false);
             beginPanelDrag(left, pkg, box);
             return true;
         });

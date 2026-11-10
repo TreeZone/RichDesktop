@@ -1298,14 +1298,54 @@ public class SettingsActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        if (toastView != null) {
+            toastView.removeCallbacks(toastHide);
+            toastView = null;
+        }
         if (tickReceiver != null) {
             try { unregisterReceiver(tickReceiver); } catch (Throwable ignored) { }
             tickReceiver = null;
         }
     }
 
+    /** 浮层提示的自动收起任务（新提示进来先取消旧的，永远只有一条在显示） */
+    private final Runnable toastHide = new Runnable() {
+        @Override public void run() {
+            if (toastView != null) toastView.setVisibility(View.GONE);
+        }
+    };
+    private TextView toastView;
+
+    /**
+     * 窗口内浮层提示（替代系统 Toast）。
+     *
+     * 为什么不用 Toast：系统 Toast 是排队的 —— 连续点版本行 5 次，5 条「再点 N 次」
+     * 要一条一条播完（每条 2 秒），用户看到的反馈慢半拍。这里改成同一个 TextView
+     * 复用：新提示立即替换文本、重新计时，反馈是即时的。
+     */
     private void toast(String s) {
-        android.widget.Toast.makeText(this, s, android.widget.Toast.LENGTH_SHORT).show();
+        if (toastView == null) {
+            toastView = new TextView(this);
+            toastView.setTextSize(14);
+            toastView.setTextColor(0xFFFFFFFF);
+            toastView.setBackgroundColor(0xCC222A38);
+            int p = Ui.dp(this, 10);
+            toastView.setPadding(p, p, p, p);
+            toastView.setElevation(Ui.dp(this, 12));
+            toastView.setVisibility(View.GONE);
+            ViewGroup decor = (ViewGroup) getWindow().getDecorView();
+            decor.addView(toastView, new ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) toastView.getLayoutParams();
+            lp.gravity = Gravity.CENTER_HORIZONTAL | Gravity.BOTTOM;
+            lp.bottomMargin = Ui.dp(this, 48);
+            toastView.setLayoutParams(lp);
+        }
+        toastView.setText(s);
+        toastView.setVisibility(View.VISIBLE);
+        toastView.removeCallbacks(toastHide);
+        // 长文本（诊断结果等）多留一会儿；短提示 1.2 秒就收
+        toastView.postDelayed(toastHide, s.length() > 40 ? 3200 : 1200);
     }
 
     private String labelOf(String pkg) {
