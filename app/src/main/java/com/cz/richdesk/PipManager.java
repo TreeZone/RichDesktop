@@ -34,6 +34,11 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     private int cornerDp;
     /** 每块画中画的长度权重（与 panes 同序，0 = 折叠隐藏） */
     private float[] weights = new float[0];
+    /** 「单画」临时布局：未指定屏位的应用按单画打开时置位，恢复原布局后清掉 */
+    private boolean singleMode;
+    private float[] savedWeights;   // 进入单画前的比例（恢复用）
+    private int singleIdx = -1;     // 单画时显示哪块屏
+    private String singlePrevPkg;   // 单画前这块屏跑的应用（恢复时开回去）
 
     public PipManager(Context ctx, PaneBox container) {
         this.app = ctx.getApplicationContext();
@@ -117,6 +122,10 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     public void build(int paneCount) {
         release();
         panes.clear();
+        singleMode = false;
+        savedWeights = null;
+        singleIdx = -1;
+        singlePrevPkg = null;
         container.removeAllViews();
         dpi = Prefs.getDpi(app);
         cornerDp = Prefs.getPipCorner(app);
@@ -142,6 +151,15 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
      */
     public void applyOrientation() {
         container.setGapPx(Ui.dp(app, Ui.PANE_GAP_DP));
+        // 单画临时布局：重排版时仍然只显示那块屏（否则旋转会瞬间露出全部画中画）
+        if (singleMode && singleIdx >= 0 && singleIdx < panes.size()) {
+            List<View> only = new ArrayList<>(1);
+            only.add(panes.get(singleIdx).root);
+            container.setOrder(only);
+            container.setWeights(new float[]{1f});
+            weights = new float[]{1f};
+            return;
+        }
         List<View> order = new ArrayList<>(panes.size());
         for (PipPane p : panes) order.add(p.root);
         container.setOrder(order);
@@ -385,6 +403,7 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
 
     @Override
     public void onRatioSettled(float[] w) {
+        if (singleMode) return;   // 单画布局没有分隔条，比例回调一律忽略
         weights = sanitize(w);
         container.setWeights(weights);
         syncCollapsed();
@@ -399,6 +418,13 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     }
 
     // ------------------------------------------------------------ 打开
+
+    /** 这个应用是否显式指定了画中画屏位 */
+    public boolean isAssigned(String pkg) {
+        if (pkg == null) return false;
+        int explicit = Prefs.getPaneOf(app, pkg);
+        return explicit >= 1 && explicit <= panes.size();
+    }
 
     /**
      * 槽位挑选：显式指定 > 该应用已打开 > **活动画中画**。
@@ -416,7 +442,15 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     /** preferred：0 = 自动；1..n = 指定第几屏 */
     public boolean open(String pkg, int preferred) {
         if (panes.isEmpty()) return false;
+        // 「单画」临时布局下打开了指定屏位的应用 → 先恢复原布局（单/双/三画）
+        if (singleMode && ((preferred >= 1 && preferred <= panes.size()) || isAssigned(pkg))) {
+            restoreSingle();
+        }
         int idx = (preferred >= 1 && preferred <= panes.size()) ? preferred - 1 : pickPane(pkg);
+        if (singleMode) {
+            // 还在单画布局里：后续打开的应用都进当前这块屏（换着看，不破坏原布局）
+            idx = Math.max(0, Math.min(singleIdx, panes.size() - 1));
+        }
         PipPane p = panes.get(idx);
         // 同一应用已开在别的屏：先把它收掉，避免两份
         int other = indexOfPkg(pkg);
@@ -426,16 +460,89 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         return true;
     }
 
+    /**
+     * 「单画中画」打开：只显示一块屏，布局和「画中画数量 = 1」完全一样。
+     *
+     * 复用现有画中画（性能要求）：不新建虚拟屏、不销毁任何一块屏 —— 其他屏只是
+     * 暂时不显示（视图留在容器里，虚拟屏照常跑），恢复布局时原样回来、不用重启。
+     * 单画前这块屏跑的应用记下来，恢复时在原屏上开回去（同一块屏换应用，秒回）。
+     */
+    public int openSingle(String pkg) {
+        if (panes.isEmpty()) return -1;
+        int idx = singleMode ? singleIdx : pickPane(pkg);
+        if (idx < 0 || idx >= panes.size()) idx = 0;
+        PipPane p = panes.get(idx);
+        if (!singleMode) {
+            savedWeights = weights.clone();
+            singlePrevPkg = p.pkg();
+            singleMode = true;
+            Log.i(TAG, "进入单画布局：pane " + idx + "，保存比例 "
+                    + java.util.Arrays.toString(savedWeights));
+        }
+        singleIdx = idx;
+        restoreIfCollapsed(idx);
+        int other = indexOfPkg(pkg);
+        if (other >= 0 && other != idx) panes.get(other).close();
+        p.open(pkg);
+        // 视觉：只显示这一块屏（order 只放一个 → 没有分隔条、铺满整个画中画区域）
+        List<View> only = new ArrayList<>(1);
+        only.add(p.root);
+        container.setOrder(only);
+        container.setWeights(new float[]{1f});
+        weights = new float[]{1f};
+        return idx;
+    }
+
+    /** 恢复单画前的布局（比例 + 原应用），单画期间开进去的应用随之收掉 */
+    private void restoreSingle() {
+        singleMode = false;
+        int idx = singleIdx;
+        String prev = singlePrevPkg;
+        singleIdx = -1;
+        singlePrevPkg = null;
+        float[] saved = savedWeights;
+        savedWeights = null;
+        List<View> all = new ArrayList<>(panes.size());
+        for (PipPane p : panes) all.add(p.root);
+        container.setOrder(all);
+        weights = (saved != null && saved.length == panes.size())
+                ? saved.clone() : Prefs.getPaneWeights(app, panes.size());
+        container.setWeights(weights);
+        syncCollapsed();
+        Log.i(TAG, "退出单画布局：恢复比例 " + java.util.Arrays.toString(weights));
+        // 单画借用的那块屏开回原应用：同一块虚拟屏换应用，不重建、秒回
+        if (idx >= 0 && idx < panes.size() && prev != null
+                && !prev.equals(panes.get(idx).pkg())) {
+            panes.get(idx).open(prev);
+        }
+    }
+
     public void openAuto(String pkg) {
         open(pkg, 0);
     }
 
     public void close(int index) {
+        // 单画布局里关掉正在显示的那块屏：布局一起恢复（否则停在只剩一块空屏的状态）
+        if (singleMode && index == singleIdx) restoreSingle();
         PipPane p = pane(index);
         if (p != null) p.close();
     }
 
+    /** 当前是否处于「单画」临时布局 */
+    public boolean inSingleMode() {
+        return singleMode;
+    }
+
+    /** 单画布局显示的是第几屏（0 起；不在单画布局返回 -1） */
+    public int singleIndex() {
+        return singleMode ? singleIdx : -1;
+    }
+
     public void closeAll() {
+        singleMode = false;
+        savedWeights = null;
+        singleIdx = -1;
+        singlePrevPkg = null;
         for (PipPane p : panes) p.close();
     }
 

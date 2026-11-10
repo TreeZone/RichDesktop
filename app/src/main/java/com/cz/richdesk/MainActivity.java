@@ -564,7 +564,10 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         final android.view.GestureDetector dockGesture = new android.view.GestureDetector(this,
                 new android.view.GestureDetector.SimpleOnGestureListener() {
                     @Override public void onLongPress(MotionEvent e) {
-                        if (dockPkgs.isEmpty()) onDockAdd();   // 应用区空了也要能加图标
+                        if (dockPkgs.isEmpty()) {
+                            Ui.buzz(rvDock);            // 和图标长按同一套震动
+                            onDockAdd();
+                        }
                     }
                 });
         rvDock.setOnTouchListener((v, e) -> {
@@ -1682,6 +1685,25 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
      */
     private void openPip(String pkg, int preferred) {
         if (pkg == null) return;
+        // 未指定屏位的应用：按设置的默认打开方式走
+        //（0 = 活动画中画【默认】/ 1 = 全屏 / 2 = 单画中画）。
+        // 指定了屏位的应用不受这个设置影响，永远在它的屏位打开（并把布局切回去）。
+        if (preferred <= 0 && !pip.isAssigned(pkg)) {
+            int mode = Prefs.getOpenMode(this);
+            if (mode == Prefs.OPEN_FULLSCREEN) {
+                pip.launchFullScreen(pkg);
+                int i = pip.indexOfPkg(pkg);
+                if (i >= 0) lastActivePane = pip.pane(i);
+                if (pager.getCurrentPage() != 0) pager.setCurrentPageSmooth(0);
+                return;
+            }
+            if (mode == Prefs.OPEN_SINGLE) {
+                int idx = pip.openSingle(pkg);
+                if (idx >= 0) lastActivePane = pip.pane(idx);
+                if (pager.getCurrentPage() != 0) pager.setCurrentPageSmooth(0);
+                return;
+            }
+        }
         boolean running = pip.indexOfPkg(pkg) >= 0;
         if (!running) pip.open(pkg, preferred);
         // 刚在某个屏上打开了应用 → 那块屏成为返回键的目标（用户的心理预期就是"返回到刚开的那个"）
@@ -1870,35 +1892,35 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         // 没有「从 Dock 移除」（语义重复）；「全屏打开 / 指定画中画位置」它们也用不上。
         if (AppInfo.isBuiltin(pkg)) {
             OverlayMenu.show(this, labelOf(pkg),
-                    new CharSequence[]{"重新选择应用", "删除绑定", "添加图标"},
+                    new CharSequence[]{"添加图标", "重新选择应用", "删除绑定"},
                     which -> {
                         if (which == 0) {
+                            onDockAdd();            // 追加一个新图标（满了会提示）
+                        } else if (which == 1) {
                             showPicker(pos, 0);     // 换绑：选中谁就占这个槽位
-                        } else if (which == 1 && pos >= 0 && pos < dockPkgs.size()) {
+                        } else if (pos >= 0 && pos < dockPkgs.size()) {
                             dockPkgs.remove(pos);
                             Prefs.setDock(this, dockPkgs);
                             dockAdapter.notifyDataSetChanged();
-                        } else if (which == 2) {
-                            onDockAdd();            // 追加一个新图标（满了会提示）
                         }
                     });
             return;
         }
         OverlayMenu.show(this, labelOf(pkg),
-                new CharSequence[]{"全屏打开", "重新选择应用", "删除绑定", "指定画中画位置", "添加图标"},
+                new CharSequence[]{"添加图标", "全屏打开", "重新选择应用", "删除绑定", "指定画中画位置"},
                 which -> {
                     switch (which) {
-                        case 0: pip.launchFullScreen(pkg); break;
-                        case 1: showPicker(pos, 0); break;
-                        case 2:
+                        case 0: onDockAdd(); break;
+                        case 1: pip.launchFullScreen(pkg); break;
+                        case 2: showPicker(pos, 0); break;
+                        case 3:
                             if (pos >= 0 && pos < dockPkgs.size()) {
                                 dockPkgs.remove(pos);
                                 Prefs.setDock(this, dockPkgs);
                                 dockAdapter.notifyDataSetChanged();
                             }
                             break;
-                        case 3: showPaneAssignDialog(pkg); break;
-                        default: onDockAdd(); break;
+                        default: showPaneAssignDialog(pkg); break;
                     }
                 });
     }

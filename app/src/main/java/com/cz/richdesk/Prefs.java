@@ -705,6 +705,17 @@ public class Prefs {
         sp(c).edit().putInt("active_pane", clamp(pane, 1, PANE_MAX)).apply();
     }
 
+    /** 未指定屏位应用的默认打开方式：0 = 活动画中画（默认），1 = 全屏，2 = 单画中画 */
+    public static final int OPEN_ACTIVE = 0, OPEN_FULLSCREEN = 1, OPEN_SINGLE = 2;
+
+    public static int getOpenMode(Context c) {
+        return clamp(sp(c).getInt("open_mode", OPEN_ACTIVE), OPEN_ACTIVE, OPEN_SINGLE);
+    }
+
+    public static void setOpenMode(Context c, int mode) {
+        sp(c).edit().putInt("open_mode", clamp(mode, OPEN_ACTIVE, OPEN_SINGLE)).apply();
+    }
+
     /**
      * 每块画中画的默认打开应用（键 pane_default_1..3，1 起）。
      * 桌面启动时，空闲且有默认应用的屏会自动把它拉起来。

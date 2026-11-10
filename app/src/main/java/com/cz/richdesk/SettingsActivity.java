@@ -608,6 +608,8 @@ public class SettingsActivity extends AppCompatActivity {
         paneDefaultsBox.removeAllViews();
         int n = Prefs.getPaneCount(this);
         int active = Prefs.getActivePane(this, n);   // 默认最后一屏
+        actionTo(paneDefaultsBox, "未指定屏位的应用打开方式：" + openModeLabel(),
+                () -> pickOpenMode());
         actionTo(paneDefaultsBox, "活动画中画：画中画 " + active,
                 () -> chooseActivePane(n));
         for (int i = 1; i <= n; i++) {
@@ -624,6 +626,25 @@ public class SettingsActivity extends AppCompatActivity {
         PaneChooser.show(this, "活动画中画（未指定的应用在这里打开）",
                 paneCount, Prefs.getActivePane(this, paneCount), false, which ->
                         Prefs.setActivePane(this, which));
+    }
+
+    private String openModeLabel() {
+        switch (Prefs.getOpenMode(this)) {
+            case Prefs.OPEN_FULLSCREEN: return "全屏";
+            case Prefs.OPEN_SINGLE: return "单画中画";
+            default: return "活动画中画";
+        }
+    }
+
+    /** 未指定屏位的应用默认怎么打开：活动画中画 / 全屏 / 单画中画 */
+    private void pickOpenMode() {
+        GlassMenu.show(this, "未指定屏位的应用打开方式",
+                new CharSequence[]{"活动画中画（原行为）", "全屏打开", "单画中画（临时单屏布局）"},
+                which -> {
+                    Prefs.setOpenMode(this, which);
+                    toast("已改为「" + openModeLabel() + "」打开");
+                    rebuildPaneDefaults();
+                });
     }
 
     /** 与底部应用选择器同一套手势：上滑弹到最高、下滑关闭、列表到底再下滑也关闭 */
