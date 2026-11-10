@@ -586,11 +586,15 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
                 if (!moved) return;
                 // 跨区互换会同时改快捷区和应用区，两块都要落盘；
                 // 区内拖动只 dirty 自己那一块
-                if (dirtyShortcuts && shortcutOrder != null && host instanceof FullHost) {
-                    ((FullHost) host).onShortcutOrderChanged(new ArrayList<>(shortcutOrder));
-                }
                 if (dirtyApps && data != null) {
                     host.onAppOrderChanged(new ArrayList<>(data));
+                }
+                if (moved) {
+                    // 跨区互换走的是「内容交换」（data.set / order.set）而非「位置移动」，
+                    // 却只发了 notifyItemMoved（只挪视图、不重新绑定）→ 屏幕上的图标和
+                    // 数据错位：显示 A 的格子，data 里是 B，长按弹出的菜单就张冠李戴，
+                    // 且错位会一直留着。拖动结束统一全量重绑，强制显示=数据。
+                    notifyDataSetChanged();
                 }
             }
         };
