@@ -505,6 +505,15 @@ public class Prefs {
         sp(c).edit().putBoolean("status_bar", b).apply();
     }
 
+    /** 设置页滚动位置记忆（主页/测试页分开存）：退出时保存、进入时还原 */
+    public static int getSettingsScroll(Context c, boolean testPage) {
+        return sp(c).getInt(testPage ? "settings_scroll_test" : "settings_scroll_main", 0);
+    }
+
+    public static void setSettingsScroll(Context c, boolean testPage, int y) {
+        sp(c).edit().putInt(testPage ? "settings_scroll_test" : "settings_scroll_main", y).apply();
+    }
+
     /** 性能悬浮窗（调试工具，开关在测试功能页）：实时 CPU/GPU/内存/虚拟屏 */
     public static boolean perfOverlay(Context c) {
         return sp(c).getBoolean("perf_overlay", false);

@@ -128,16 +128,20 @@ public class SettingsActivity extends AppCompatActivity {
 
         // 切外观会重建本页（recreate）：重建前记下的滚动位置在这里还原，
         // 否则选完模式整页会跳回最顶部，想接着调下面的项还得重新滚一遍。
-        final int restoreY = pendingScrollY;
+        // 普通的「退出再进来」也有记忆：recreate 暂存不存在（-1）时读 Prefs 里
+        // 上次退出时的位置（主页/测试页分开存，进程被杀也能恢复）。
+        int restoreY = pendingScrollY;
         pendingScrollY = -1;
-        if (restoreY > 0) {
+        if (restoreY < 0) restoreY = Prefs.getSettingsScroll(this, testPage);
+        final int fRestoreY = restoreY;
+        if (fRestoreY > 0) {
             sv.getViewTreeObserver().addOnGlobalLayoutListener(
                     new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
                         @Override public void onGlobalLayout() {
                             sv.getViewTreeObserver().removeOnGlobalLayoutListener(this);
-                            sv.scrollTo(0, restoreY);
+                            sv.scrollTo(0, fRestoreY);
                             // 首帧时内容高度可能还没最终定稿（scrollTo 会被夹住），再补一次
-                            sv.post(() -> sv.scrollTo(0, restoreY));
+                            sv.post(() -> sv.scrollTo(0, fRestoreY));
                         }
                     });
         }
@@ -1275,6 +1279,16 @@ public class SettingsActivity extends AppCompatActivity {
         // 从桌面切回时壁纸可能变了 / 模式被图标切换了 → 外观不同就重建
         Ui.updateAppearance(this);
         if (Ui.dark != createdDark) recreateKeepScroll();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // 退出（返回）/ 切走时记住滚动位置，下次进来还在原地（recreate 重建走
+        // pendingScrollY 暂存，这里写 Prefs 是给「退出再进来」用的，两条路互不干扰）
+        if (scrollView != null) {
+            Prefs.setSettingsScroll(this, testPage, scrollView.getScrollY());
+        }
     }
 
     /**
