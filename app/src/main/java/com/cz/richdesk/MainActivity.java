@@ -51,6 +51,9 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     private View dockLeftDiv, dockRightDiv;
     /** 功能区里的时间/天气（左右各一套：任一侧都可能被配成「时间 + 天气」） */
     private TextView dockClock, dockWeather, dockClockL, dockWeatherL;
+    private TextView dockGap, dockGapL;
+    /** 时间面板可用文本宽度（px）：字号自适应的基准，天气文案变了要重算 */
+    private int dockPanelAvailW, dockPanelAvailWL;
     /** 日期行（年月日）：与时间行一起刷新，秒级跳 */
     private TextView dockDate, dockDateL;
     private final android.os.Handler dockHandler =
@@ -289,6 +292,34 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         setContentView(root);
         root.requestApplyInsets();
 
+        // 调试钩子：以 uid 1000 执行一条系统命令（调分辨率/密度用）
+        //   --es debug_wm "wm size reset; wm density reset"
+        android.content.Intent wmIntent = getIntent();
+        if (wmIntent != null && wmIntent.hasExtra("debug_wm")) {
+            final String wmCmd = wmIntent.getStringExtra("debug_wm");
+            wmIntent.removeExtra("debug_wm");
+            new Thread(() -> {
+                StringBuilder out = new StringBuilder();
+                boolean ok = false;
+                try {
+                    Process p = new ProcessBuilder("sh", "-c", wmCmd)
+                            .redirectErrorStream(true).start();
+                    p.getOutputStream().close();
+                    java.io.BufferedReader br = new java.io.BufferedReader(
+                            new java.io.InputStreamReader(p.getInputStream()));
+                    String line;
+                    while ((line = br.readLine()) != null) out.append(line).append(" / ");
+                    ok = p.waitFor() == 0;
+                } catch (Throwable t) {
+                    out.append("EX ").append(t);
+                }
+                android.util.Log.i("PipDesk", "debug_wm [" + wmCmd + "] ok=" + ok + " out=" + out);
+                final boolean fok = ok;
+                runOnUiThread(() -> Toast.makeText(this,
+                        "wm " + (fok ? "成功" : "失败") + "：" + wmCmd, Toast.LENGTH_LONG).show());
+            }, "debug-wm").start();
+        }
+
         // 调试钩子：没有手指（自动化截图核对）时也能把长按浮层菜单弹出来看效果
         //   --es debug_menu dock    → Dock 第一个图标的菜单
         //   --es debug_menu panel   → 左端功能区第一个图标的菜单
@@ -319,6 +350,12 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         appliedPaneCount = Prefs.getPaneCount(this);
         appliedOrientation = getResources().getConfiguration().orientation;
         appliedDpi = Prefs.getDpi(this);
+        // 「屏内渲染分辨率」入口已隐藏（部分车机上会让画中画停在旧尺寸、画面缩左上角），
+        // 旧配置里残留的 75/50 一律拉回 100，免得用户以为功能藏了效果还在。
+        if (Prefs.getRenderScale(this) != 100) {
+            Prefs.setRenderScale(this, 100);
+            Log.i("PipDesk", "屏内渲染分辨率已停用，强制回 100%");
+        }
         appliedRenderScale = Prefs.getRenderScale(this) / 100f;
         appliedPipCorner = Prefs.getPipCorner(this);
         appliedDockCorner = Prefs.getDockCorner(this);
@@ -813,8 +850,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     private void buildDockPanel(LinearLayout box, boolean left) {
         if (box == null) return;
         box.removeAllViews();
-        if (left) { dockClockL = null; dockWeatherL = null; }
-        else { dockClock = null; dockWeather = null; }
+        if (left) { dockClockL = null; dockWeatherL = null; dockGapL = null; dockPanelAvailWL = 0; }
+        else { dockClock = null; dockWeather = null; dockGap = null; dockPanelAvailW = 0; }
         if (!(left ? Prefs.dockLeftEnabled(this) : Prefs.dockRightEnabled(this))) return;
         int type = left ? Prefs.getDockLeftType(this) : Prefs.getDockRightType(this);
         if (type == Prefs.PANEL_CLOCK) buildClockPanel(box, left);
@@ -834,8 +871,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         final int pitch = dockPitchPx();
         final int ic = Ui.dp(this, Prefs.getDockIcon(this));
         List<String> pkgs = panelIcons(left);
-        if (pkgs.size() > Prefs.PANEL_SHORTCUT_MAX) {
-            pkgs = new ArrayList<>(pkgs.subList(0, Prefs.PANEL_SHORTCUT_MAX));
+        // 按「实际能占的格数」截断：多出来的图标先不显示（加大 Dock 格数就回来了）
+        int cap = panelCellCount(left);
+        if (cap <= 0) { box.setPadding(0, 0, 0, 0); return; }
+        if (pkgs.size() > cap) {
+            pkgs = new ArrayList<>(pkgs.subList(0, cap));
         }
         int padH = Ui.dp(this, 4);
         box.setPadding(padH, 0, padH, 0);
@@ -854,18 +894,29 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     }
 
     /**
-     * 一侧功能区在 Dock 里占几个格（用于统一格宽的分配）：
-     *   · 快捷功能：就按图标数算（不留空白格，需求），一个都没有时算 1 格；
-     *   · 时间 + 天气：2 格（日期/时间/天气三行要够宽）；
+     * 一侧功能区「想要」占几格（不受总格数限制）：
+     *   · 快捷功能：按图标数算（不留空白格），一个都没有时算 1 格；
+     *   · 时间 + 天气：2 格（日期/时间/天气要够宽）；
      *   · 没启用：0 格。
      */
-    private int panelCellCount(boolean left) {
+    private int rawPanelCells(boolean left) {
         boolean on = left ? Prefs.dockLeftEnabled(this) : Prefs.dockRightEnabled(this);
         if (!on) return 0;
         int type = left ? Prefs.getDockLeftType(this) : Prefs.getDockRightType(this);
-        if (type == Prefs.PANEL_CLOCK) return 2;   // 时间天气最少占 2 格（需求）
+        if (type == Prefs.PANEL_CLOCK) return 2;   // 时间天气最少占 2 格
         int n = panelIcons(left).size();
         return Math.max(1, Math.min(n, Prefs.PANEL_SHORTCUT_MAX));
+    }
+
+    /**
+     * 一侧功能区在 Dock 里占几个格。
+     *
+     * 不再有「最多 5 个」的限制（需求）：图标有几个就占几格，格宽由 dockPitchPx
+     * 统一分摊 —— 面板多了格宽变窄，中间图标区按格宽剩下多少算多少，但
+     * dockPitchPx 的分母里始终包含 Dock 全部槽位数，所以中间那块至少还有 1 格的宽度。
+     */
+    private int panelCellCount(boolean left) {
+        return rawPanelCells(left);
     }
 
     /** 一个快捷图标：固定格宽、图标居中（图标之间的间距由格宽决定，与中间图标区一致） */
@@ -882,6 +933,9 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             else openPip(pkg, 0);
         });
         box.setOnLongClickListener(v -> {
+            // 长按统一单次短震（与应用列表 / Dock 应用区一致）
+            box.setHapticFeedbackEnabled(false);
+            Ui.buzz(box);
             beginPanelDrag(left, pkg, box);
             return true;
         });
@@ -1050,17 +1104,20 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     /** 往功能区加图标：只列内置快捷方式（那才是「自己建的应用图标」） */
     private void pickPanelApp(final boolean left) {
         if (pickerDialog != null && pickerDialog.isShowing()) return;
-        if (panelIcons(left).size() >= Prefs.PANEL_SHORTCUT_MAX) {
-            toast("最多 " + Prefs.PANEL_SHORTCUT_MAX + " 个，先长按图标移走一个");
+        // 不再限制 5 个（需求）：只留一个防呆上限，图标多了格宽自己变窄
+        final int cap = Prefs.PANEL_SHORTCUT_MAX;
+        if (panelIcons(left).size() >= cap) {
+            toast("操作区最多 " + cap + " 个，先长按移走一个");
             return;
         }
         pickerDialog = new AppPickerSheet(this,
-                (left ? "左侧" : "右侧") + "功能区 · 图标（最多 " + Prefs.PANEL_SHORTCUT_MAX + " 个）",
+                (left ? "左侧" : "右侧") + "功能区 · 图标（已放 "
+                        + panelIcons(left).size() + " 个）",
                 AppListAdapter.shortcuts(), Prefs.getListColumns(this), Prefs.getIconSize(this),
                 ai -> {
                     List<String> l = panelIcons(left);
                     if (l.size() >= Prefs.PANEL_SHORTCUT_MAX) {
-                        toast("最多 " + Prefs.PANEL_SHORTCUT_MAX + " 个");
+                        toast("操作区最多 " + Prefs.PANEL_SHORTCUT_MAX + " 个");
                         return;
                     }
                     if (!l.contains(ai.pkg)) l.add(ai.pkg);
@@ -1091,26 +1148,29 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         top.setClipChildren(false);
 
         TextView date = new TextView(this);
-        date.setTextSize(11);
+        date.setTextSize(13);
+        date.setTypeface(date.getTypeface(), android.graphics.Typeface.BOLD);
         date.setTextColor(Ui.tintDim());
         date.setGravity(Gravity.CENTER);
         date.setSingleLine(true);
 
         TextView gap = new TextView(this);
         gap.setText(" · ");
-        gap.setTextSize(11);
+        gap.setTextSize(13);
+        gap.setTypeface(gap.getTypeface(), android.graphics.Typeface.BOLD);
         gap.setTextColor(Ui.tintDim());
         gap.setGravity(Gravity.CENTER);
         gap.setSingleLine(true);
 
         TextView weather = new TextView(this);
-        weather.setTextSize(11);
+        weather.setTextSize(13);
+        weather.setTypeface(weather.getTypeface(), android.graphics.Typeface.BOLD);
         weather.setTextColor(Ui.tintDim());
         weather.setGravity(Gravity.CENTER);
         weather.setSingleLine(true);
 
         TextView clock = new TextView(this);
-        clock.setTextSize(18);
+        clock.setTextSize(24);
         clock.setTextColor(Ui.tint());
         clock.setGravity(Gravity.CENTER);
         clock.setSingleLine(true);
@@ -1134,8 +1194,46 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         int padH = Ui.dp(this, 4);
         col.setPadding(padH, 0, padH, 0);
         box.addView(col);
-        if (left) { dockDateL = date; dockClockL = clock; dockWeatherL = weather; }
-        else { dockDate = date; dockClock = clock; dockWeather = weather; }
+        // 字号自适应：竖屏时格宽窄，按可用宽度把两行字号缩到「尽量大且完整」
+        int avail = w - 2 * padH;
+        if (left) { dockDateL = date; dockClockL = clock; dockWeatherL = weather;
+                    dockGapL = gap; dockPanelAvailWL = avail; }
+        else { dockDate = date; dockClock = clock; dockWeather = weather;
+               dockGap = gap; dockPanelAvailW = avail; }
+        refitClockRow(left);
+    }
+
+    /**
+     * Dock 时间面板两行字号自适应：在 availPx 宽度里取「能显示完整」的最大字号。
+     * 第一行 = 日期 · 天气（13sp 起，最低 8sp）；第二行 = 时分秒（24sp 起，最大 30sp，最低 9sp）。
+     * 天气文案变化后要再调一次（updateDockRealtime）。
+     */
+    private void refitClockRow(boolean left) {
+        int avail = left ? dockPanelAvailWL : dockPanelAvailW;
+        TextView d = left ? dockDateL : dockDate;
+        TextView g = left ? dockGapL : dockGap;
+        TextView w = left ? dockWeatherL : dockWeather;
+        TextView c = left ? dockClockL : dockClock;
+        if (avail <= 0 || d == null || w == null || c == null) return;
+        float sd = getResources().getDisplayMetrics().scaledDensity;
+
+        // 第一行：三段按同一个字号缩放（间距才能保持对齐）
+        android.text.TextPaint p = new android.text.TextPaint(d.getPaint());
+        p.setTextSize(13 * sd);
+        String join = g != null ? g.getText().toString() : " · ";
+        float rowW = (p.measureText(d.getText().toString())
+                + p.measureText(join) + p.measureText(w.getText().toString())) * 1.06f;
+        float topSp = rowW > avail ? Math.max(8f, 13f * avail / rowW) : 13f;
+        d.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, topSp);
+        if (g != null) g.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, topSp);
+        w.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, topSp);
+
+        // 第二行：时分秒 8 个字符宽度固定（tnum），竖屏缩、横屏最多放到 30sp
+        android.text.TextPaint cp = new android.text.TextPaint(c.getPaint());
+        cp.setTextSize(24 * sd);
+        float clockW = cp.measureText("00:00:00") * 1.06f;
+        float clockSp = Math.max(9f, Math.min(30f, 24f * avail / clockW));
+        c.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, clockSp);
     }
 
     private static String dateLabel(java.util.Calendar c) {
@@ -1177,8 +1275,9 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     }
 
     /** 文本没变就不 setText：避免每秒触发一次重排/重绘 */
-    private static void setTextIfChanged(TextView v, String s) {
-        if (s != null && !s.contentEquals(v.getText())) v.setText(s);
+    private static boolean setTextIfChanged(TextView v, String s) {
+        if (s != null && !s.contentEquals(v.getText())) { v.setText(s); return true; }
+        return false;
     }
 
     /** 天气/亮度/网络：15s 一跳（左右两侧只要有一侧是时间天气就要刷） */
@@ -1186,11 +1285,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         updateDockClock();
         if (dockWeather != null && dockRightBox != null
                 && dockRightBox.getVisibility() == View.VISIBLE) {
-            setTextIfChanged(dockWeather, Weather.dockLabel(this));
+            if (setTextIfChanged(dockWeather, Weather.dockLabel(this))) refitClockRow(false);
         }
         if (dockWeatherL != null && dockLeftBox != null
                 && dockLeftBox.getVisibility() == View.VISIBLE) {
-            setTextIfChanged(dockWeatherL, Weather.dockLabel(this));
+            if (setTextIfChanged(dockWeatherL, Weather.dockLabel(this))) refitClockRow(true);
         }
         // 天气缓存过期就后台拉一次（亮度判断「阴天」也靠它）
         Weather.refreshIfStale(this);
@@ -1516,23 +1615,47 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 res.add(new AppInfo(label, ri.activityInfo.packageName, ri.loadIcon(pm)));
             }
             Collections.sort(res, (a, b) -> a.label.compareToIgnoreCase(b.label));
-            // 用户拖动过的顺序优先：拖过的按记录排，新装的应用（没记录）按字母序垫在已排序的后面
+            // 用户拖动过的顺序优先：按记录重排；记录里的内置功能图标（跨区互换后
+            // 会落在应用区）也按原位插回；新装的应用（没记录）垫在后面。
             List<String> order = Prefs.getAppOrder(this);
+            List<String> shortcutOrder = Prefs.getShortcutOrder(this);
+            java.util.Set<String> slotted = shortcutOrder == null
+                    ? new java.util.HashSet<>() : new java.util.HashSet<>(shortcutOrder);
+            List<AppInfo> slottedInfos = new ArrayList<>();   // 已换进快捷区的真实应用：给 adapter 缓存图标用
+            List<AppInfo> out;
             if (!order.isEmpty()) {
-                java.util.Map<String, Integer> rank = new java.util.HashMap<>();
-                for (int i = 0; i < order.size(); i++) rank.put(order.get(i), i);
-                Collections.sort(res, (a, b) -> {
-                    Integer ra = rank.get(a.pkg), rb = rank.get(b.pkg);
-                    if (ra != null && rb != null) return Integer.compare(ra, rb);
-                    if (ra != null) return -1;
-                    if (rb != null) return 1;
-                    return a.label.compareToIgnoreCase(b.label);
-                });
+                java.util.Map<String, AppInfo> byPkg = new java.util.HashMap<>();
+                for (AppInfo a : res) byPkg.put(a.pkg, a);
+                java.util.Set<String> used = new java.util.HashSet<>();
+                List<AppInfo> ordered = new ArrayList<>(res.size());
+                for (String pkg : order) {
+                    if (!used.add(pkg)) continue;
+                    if (AppInfo.isBuiltin(pkg)) {
+                        ordered.add(new AppInfo(AppListAdapter.shortcutLabel(pkg), pkg,
+                                AppListAdapter.shortcutIcon(pkg)));
+                    } else {
+                        AppInfo ai = byPkg.get(pkg);
+                        if (ai != null) ordered.add(ai);
+                    }
+                }
+                for (AppInfo a : res) if (used.add(a.pkg)) ordered.add(a);
+                out = ordered;
+            } else {
+                out = res;
             }
+            // 已被换进快捷区的真实应用从应用区移除（渲染在快捷槽位里）
+            for (int i = out.size() - 1; i >= 0; i--) {
+                if (slotted.contains(out.get(i).pkg)) {
+                    slottedInfos.add(out.remove(i));
+                }
+            }
+            final List<AppInfo> resF = out;
+            final List<AppInfo> slottedF = slottedInfos;
             runOnUiThread(() -> {
-                appList = res;
+                appList = resF;
                 if (appListAdapter != null) {
                     appListAdapter.setData(appList);
+                    for (AppInfo a : slottedF) appListAdapter.rememberApp(a);
                     appListAdapter.notifyDataSetChanged();
                 }
                 if (dockAdapter != null) dockAdapter.notifyDataSetChanged();
@@ -1666,10 +1789,19 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             hud.setPadding(ph, Ui.dp(this, 12), ph, Ui.dp(this, 12));
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.gravity = Gravity.CENTER;   // 居中：不压状态栏、不挡顶部标题
+            // 屏幕上方居中（约 1/10 高度处）：不挡中间的画中画内容，也比正中间更不碍事
+            lp.gravity = Gravity.CENTER_HORIZONTAL | Gravity.TOP;
+            lp.topMargin = Math.max(Ui.dp(this, 48),
+                    (int) (decor.getHeight() * 0.10f));
             decor.addView(hud, lp);
         }
         hud.setText((up ? "音量 +  " : "音量 -  ") + vol[0] + " / " + vol[1]);
+        // 复用时也把位置刷新一遍（旋转/重建后 decor 高度可能变了）
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) hud.getLayoutParams();
+        lp.gravity = Gravity.CENTER_HORIZONTAL | Gravity.TOP;
+        lp.topMargin = Math.max(Ui.dp(this, 48),
+                (int) (decor.getHeight() * 0.10f));
+        hud.setLayoutParams(lp);
         hud.animate().cancel();
         hud.setAlpha(1f);
         hud.animate().alpha(0f).setStartDelay(1200).setDuration(400).start();

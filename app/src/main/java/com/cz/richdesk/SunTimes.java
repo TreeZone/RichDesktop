@@ -112,7 +112,7 @@ public class SunTimes {
     }
 
     /**
-     * 当前使用的位置：手动坐标 → 系统最后已知定位 → 北京兜底。
+     * 当前使用的位置：手动坐标 → 系统最后已知定位 → IP 反查（24h 缓存）→ 北京兜底。
      * 日落查询和天气查询共用同一个位置，保证两块数据说的是同一个地方。
      */
     public static double[] location(Context c) {
@@ -120,7 +120,10 @@ public class SunTimes {
             return new double[]{Prefs.getLatitude(c), Prefs.getLongitude(c)};
         }
         double[] loc = lastKnown(c);
-        return loc != null ? loc : new double[]{DEFAULT_LAT, DEFAULT_LNG};
+        if (loc != null) return loc;
+        double ip = Prefs.getIpLat(c);
+        if (!Double.isNaN(ip)) return new double[]{ip, Prefs.getIpLng(c)};
+        return new double[]{DEFAULT_LAT, DEFAULT_LNG};
     }
 
     /** 状态文案（设置页用） */
@@ -144,6 +147,10 @@ public class SunTimes {
         if (loc != null) {
             return String.format(Locale.US, "系统定位 %.3f, %.3f", loc[0], loc[1]);
         }
+        double ip = Prefs.getIpLat(c);
+        if (!Double.isNaN(ip)) {
+            return String.format(Locale.US, "IP定位 %.3f, %.3f", ip, Prefs.getIpLng(c));
+        }
         return String.format(Locale.US, "默认坐标（北京）%.3f, %.3f", DEFAULT_LAT, DEFAULT_LNG);
     }
 
@@ -152,9 +159,74 @@ public class SunTimes {
         return String.format(Locale.US, "%02d:%02d", minutes / 60, minutes % 60);
     }
 
+    // ------------------------------------------------------------ IP 定位兜底
+
+    private static final long IP_TTL = 24 * 60 * 60 * 1000L;
+    private static volatile boolean ipFetching;
+    /** 免 key 的 IP 反查服务，逐个试；都返回 latitude/longitude 字段 */
+    private static final String[] IP_APIS = {
+            "https://ipwho.is/",
+            "https://ipapi.co/json/",
+            "https://api.ip.sb/geoip"
+    };
+
+    /**
+     * 没有手动坐标、系统定位也拿不到时，用车机出口 IP 反查经纬度（城市级精度）。
+     * 结果缓存 24h。**只能在后台线程调**（Weather/SunTimes 的 fetch 都满足）。
+     */
+    public static void ensureIpLocation(Context c) {
+        if (!Double.isNaN(Prefs.getLatitude(c))) return;     // 手动坐标优先
+        if (lastKnown(c) != null) return;                   // 系统定位优先
+        if (!Double.isNaN(Prefs.getIpLat(c))
+                && System.currentTimeMillis() - Prefs.getIpAt(c) < IP_TTL) return;
+        if (ipFetching) return;
+        ipFetching = true;
+        try {
+            for (String api : IP_APIS) {
+                try {
+                    JSONObject o = getJson(api, 4000);
+                    double lat = o.optDouble("latitude", Double.NaN);
+                    double lng = o.optDouble("longitude", Double.NaN);
+                    if (!Double.isNaN(lat) && !Double.isNaN(lng)
+                            && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+                        Prefs.setIpLocation(c, lat, lng);
+                        Log.i(TAG, "IP定位成功：" + api + " → " + lat + "," + lng);
+                        return;
+                    }
+                } catch (Throwable t) {
+                    Log.i(TAG, "IP定位失败：" + api + "（" + t + "）");
+                }
+            }
+        } finally {
+            ipFetching = false;
+        }
+    }
+
+    private static JSONObject getJson(String url, int timeoutMs) throws Exception {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setConnectTimeout(timeoutMs);
+            conn.setReadTimeout(timeoutMs);
+            conn.setRequestProperty("Accept", "application/json");
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader r = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream(), "UTF-8"))) {
+                String line;
+                while ((line = r.readLine()) != null) sb.append(line);
+            }
+            return new JSONObject(sb.toString());
+        } finally {
+            if (conn != null) {
+                try { conn.disconnect(); } catch (Throwable ignored) { }
+            }
+        }
+    }
+
     // ------------------------------------------------------------ 联网
 
     private static void fetch(Context c) throws Exception {
+        ensureIpLocation(c);        // 没有 GPS/手动坐标时先兜底反查一次（后台线程）
         double[] loc = location(c);
         double lat = loc[0], lng = loc[1];
 

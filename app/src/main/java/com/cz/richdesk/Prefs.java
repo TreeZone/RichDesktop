@@ -174,8 +174,11 @@ public class Prefs {
     public static final int PANEL_SHORTCUT = 0;
     public static final int PANEL_CLOCK = 1;
 
-    /** 快捷功能区最多放几个图标（再多就挤到中间图标区了） */
-    public static final int PANEL_SHORTCUT_MAX = 5;
+    /**
+     * 快捷功能区的硬上限（只是防呆，防止配置文件被写坏）。
+     * 真正的限制是「Dock 总格数 − 1」：中间图标区至少留 1 格，其余都给功能区。
+     */
+    public static final int PANEL_SHORTCUT_MAX = 12;
 
     public static int getDockLeftType(Context c) {
         return clamp(sp(c).getInt("dock_left_type", PANEL_SHORTCUT), 0, 1);
@@ -251,6 +254,48 @@ public class Prefs {
         sp(c).edit().putBoolean("bright_use_weather", b).apply();
     }
 
+    // ---- 亮度写入通道：TS10 一类车机只认其中一条，允许单独开关做排除测试 ----
+
+    /** 通道① 系统设置 Settings.System.SCREEN_BRIGHTNESS */
+    public static boolean brightChSetting(Context c) {
+        return sp(c).getBoolean("bright_ch_setting", true);
+    }
+
+    public static void setBrightChSetting(Context c, boolean b) {
+        sp(c).edit().putBoolean("bright_ch_setting", b).apply();
+    }
+
+    /** 通道② 显示层 SurfaceControl.setDisplayBrightness（HWC） */
+    public static boolean brightChSurface(Context c) {
+        return sp(c).getBoolean("bright_ch_surface", true);
+    }
+
+    public static void setBrightChSurface(Context c, boolean b) {
+        sp(c).edit().putBoolean("bright_ch_surface", b).apply();
+    }
+
+    /** 通道③ 背光节点 /sys/class/backlight（需要 root） */
+    public static boolean brightChSysfs(Context c) {
+        return sp(c).getBoolean("bright_ch_sysfs", true);
+    }
+
+    public static void setBrightChSysfs(Context c, boolean b) {
+        sp(c).edit().putBoolean("bright_ch_sysfs", b).apply();
+    }
+
+    /**
+     * 最低亮度下限（百分比 0~40）。
+     * 鼎威 TS10 等车机会把过低的亮度直接当「关背光」处理——屏幕一下子全黑。
+     * 写入任何通道前都先把亮度抬到这个百分比之上，0 = 不设下限。
+     */
+    public static int getBrightFloorPct(Context c) {
+        return clamp(sp(c).getInt("bright_floor_pct", 10), 0, 40);
+    }
+
+    public static void setBrightFloorPct(Context c, int v) {
+        sp(c).edit().putInt("bright_floor_pct", clamp(v, 0, 40)).apply();
+    }
+
     /**
      * 接管系统亮度前，用户原本的亮度状态（关掉总开关时还原）。
      * mode: -1 未记录 / 0 手动 / 1 自动；value 仅手动模式有意义。
@@ -272,11 +317,21 @@ public class Prefs {
 
     /** 息屏方式：0 = 真息屏（goToSleep）；1 = 黑屏遮罩（最安全，任意触摸即恢复） */
     public static int getSleepMode(Context c) {
-        return clamp(sp(c).getInt("sleep_mode", 0), 0, 1);
+        // 固定 1（黑屏遮罩）：车机上真息屏有「黑屏唤不醒」风险，入口已隐藏，强制假息屏
+        return 1;
     }
 
     public static void setSleepMode(Context c, int mode) {
         sp(c).edit().putInt("sleep_mode", clamp(mode, 0, 1)).apply();
+    }
+
+    /** 遮罩期点亮屏幕需要的点击次数：1 = 单击，2 = 双击，3 = 三击。默认双击（防误触） */
+    public static int getWakeTaps(Context c) {
+        return clamp(sp(c).getInt("wake_taps", 2), 1, 3);
+    }
+
+    public static void setWakeTaps(Context c, int n) {
+        sp(c).edit().putInt("wake_taps", clamp(n, 1, 3)).apply();
     }
 
     /**
@@ -590,6 +645,27 @@ public class Prefs {
 
     public static void clearLocation(Context c) {
         sp(c).edit().remove("sun_lat").remove("sun_lng").apply();
+    }
+
+    /** IP 反查的经纬度缓存（24h 有效，车机没 GPS 时兜底）；lat 为 NaN 表示没有 */
+    public static double getIpLat(Context c) {
+        return Double.longBitsToDouble(sp(c).getLong("ip_lat", Double.doubleToLongBits(Double.NaN)));
+    }
+
+    public static double getIpLng(Context c) {
+        return Double.longBitsToDouble(sp(c).getLong("ip_lng", Double.doubleToLongBits(Double.NaN)));
+    }
+
+    public static long getIpAt(Context c) {
+        return sp(c).getLong("ip_at", 0);
+    }
+
+    public static void setIpLocation(Context c, double lat, double lng) {
+        sp(c).edit()
+                .putLong("ip_lat", Double.doubleToLongBits(lat))
+                .putLong("ip_lng", Double.doubleToLongBits(lng))
+                .putLong("ip_at", System.currentTimeMillis())
+                .apply();
     }
 
     /** 日落/日出缓存：分钟数 + 缓存日期（yyyyMMdd），跨天自动失效 */

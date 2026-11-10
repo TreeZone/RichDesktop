@@ -72,11 +72,14 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
     private ItemTouchHelper dragHelper;
     /** 本次拖动是否真的交换过位置：松手时用来区分「拖动」和「原地长按」 */
     private boolean dragMoved;
-    /**
-     * 快捷区的显示顺序（含「桌面设置」共 9 项，pkg 列表）。
-     * 默认按 SHORTCUT_PKGS 固定顺序；应用列表里长按拖动可改（宿主持久化）。
-     */
+    /** 快捷区的显示顺序（含「桌面设置」共 9 项，pkg 列表）。可含真实应用 pkg（跨区互换后） */
     private List<String> shortcutOrder = null;
+
+    /** 真实应用被换进快捷区后，图标/名字从这份缓存恢复（reload 后 bindShortcut 也会回填） */
+    private final java.util.Map<String, AppInfo> appCache = new java.util.HashMap<>();
+    /** 本次拖动改了哪块：松手时两块都要落盘（跨区互换会同时改两块） */
+    private boolean dirtyShortcuts;
+    private boolean dirtyApps;
 
     /** 宿主（MainActivity）在 setAdapter 前把持久化的顺序塞进来 */
     public void setShortcutOrder(List<String> order) {
@@ -106,6 +109,28 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         }
         if (slot <= 0) return AppInfo.SETTINGS_PKG;
         return SHORTCUT_PKGS[slot - 1];
+    }
+
+    /** 宿主在装载数据后把「已被换进快捷区的真实应用」塞进缓存，重载后图标才不丢 */
+    public void rememberApp(AppInfo a) {
+        if (a != null && a.pkg != null) appCache.put(a.pkg, a);
+    }
+
+    /** 在当前应用数据里找真实应用（跨区互换后快捷槽位可能放着真实 app） */
+    private AppInfo findInData(String pkg) {
+        if (data == null || pkg == null) return null;
+        for (AppInfo a : data) if (pkg.equals(a.pkg)) return a;
+        return null;
+    }
+
+    /** 换进应用区的那个 pkg 还原成 AppInfo：内置 → 自绘图标；真实 app → 缓存/数据里找 */
+    private AppInfo appInfoForSlot(String pkg) {
+        if (AppInfo.isBuiltin(pkg)) {
+            return new AppInfo(shortcutLabel(pkg), pkg, shortcutIcon(pkg));
+        }
+        AppInfo ai = findInData(pkg);
+        if (ai == null) ai = appCache.get(pkg);
+        return ai != null ? ai : new AppInfo(pkg, pkg, null);
     }
 
     public AppListAdapter(List<AppInfo> data, Host host, boolean withSettings, int iconDp) {
@@ -263,6 +288,8 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         // 图标是硬性 dp（不再被格宽缩小），列多/图标大时可能比格子的内宽还宽一点，
         // 允许它画出格子边界（居中溢出，两侧均匀），否则会被父容器裁成缺边
         cell.setClipChildren(false);
+        // 长按震动统一由 Ui.buzz 震一次（关掉默认的，ItemTouchHelper.select 还会补一刀）
+        cell.setHapticFeedbackEnabled(false);
 
         // iOS 风格圆角方遮罩：Dock 与应用列表用同一个类，外形才统一
         ImageView iv = new MaskedIconView(parent.getContext());
@@ -357,6 +384,24 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
     private void bindShortcut(AppVH vh, int slot) {
         applyIconSize(vh);
         final String pkg = shortcutPkgAt(slot);
+        // 跨区互换后快捷槽位可能放的是真实应用：按普通应用渲染/点击
+        if (!AppInfo.isBuiltin(pkg)) {
+            AppInfo found = findInData(pkg);
+            if (found == null) found = appCache.get(pkg);
+            if (found == null) found = new AppInfo(pkg, pkg, null);
+            appCache.put(pkg, found);
+            final AppInfo ai = found;
+            vh.ivIcon.setImageDrawable(ai.icon);
+            vh.tvLabel.setText(ai.label);
+            vh.itemView.setOnClickListener(v -> host.onAppClick(ai));
+            vh.itemView.setLongClickable(true);
+            vh.itemView.setOnLongClickListener(v -> {
+                if (dragEnabled) onLongPress(vh);
+                else host.onAppLongClick(ai);
+                return true;
+            });
+            return;
+        }
         vh.ivIcon.setImageDrawable(shortcutIcon(pkg));
         vh.tvLabel.setText(shortcutLabel(pkg));
         vh.itemView.setOnClickListener(v -> {
@@ -400,11 +445,21 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         if (dragHelper == null) return;
         final int pos = vh.getBindingAdapterPosition();
         if (pos < 0 || pos >= getItemCount()) return;
+        // 统一单次短震：三处（操作区 / Dock / 应用列表）手感一致
+        vh.itemView.setHapticFeedbackEnabled(false);
+        Ui.buzz(vh.itemView);
         OverlayMenu.setAnchor(vh.itemView);   // 菜单贴着这个图标弹出
         dragHelper.startDrag(vh);
         int idx = pos - offset();
         if (idx < offset()) {
-            if (host instanceof FullHost) ((FullHost) host).onShortcutLongClick(shortcutPkgAt(idx));
+            String pkg = shortcutPkgAt(idx);
+            if (AppInfo.isBuiltin(pkg)) {
+                if (host instanceof FullHost) ((FullHost) host).onShortcutLongClick(pkg);
+            } else {
+                AppInfo ai = findInData(pkg);
+                if (ai == null) ai = appCache.get(pkg);
+                if (ai != null) host.onAppLongClick(ai);
+            }
         } else if (data != null && idx >= 0 && idx < data.size()) {
             host.onAppLongClick(data.get(idx));
         }
@@ -436,12 +491,45 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
                     order.set(to, tmp);
                     notifyItemMoved(from, to);
                     dragMoved = true;
+                    dirtyShortcuts = true;
+                    return true;
+                }
+                if (from < sc && to >= sc && data != null && to - sc < data.size()) {
+                    // 跨区互换（快捷区 → 应用区）：内容互换，不是移位 ——
+                    // 快捷槽位放进这个真实应用，原槽位的内置图标换到应用区这个位置
+                    List<String> order = shortcutOrderOrInit();
+                    int ai = to - sc;
+                    String sp = order.get(from);
+                    AppInfo movedApp = data.get(ai);
+                    appCache.put(movedApp.pkg, movedApp);
+                    order.set(from, movedApp.pkg);
+                    data.set(ai, appInfoForSlot(sp));
+                    notifyItemMoved(from, to);
+                    dragMoved = true;
+                    dirtyShortcuts = true;
+                    dirtyApps = true;
+                    return true;
+                }
+                if (to < sc && from >= sc && data != null && from - sc < data.size()) {
+                    // 跨区互换（应用区 → 快捷区）：同上，方向相反
+                    List<String> order = shortcutOrderOrInit();
+                    int ai = from - sc;
+                    String sp = order.get(to);
+                    AppInfo movedApp = data.get(ai);
+                    appCache.put(movedApp.pkg, movedApp);
+                    order.set(to, movedApp.pkg);
+                    data.set(ai, appInfoForSlot(sp));
+                    notifyItemMoved(from, to);
+                    dragMoved = true;
+                    dirtyShortcuts = true;
+                    dirtyApps = true;
                     return true;
                 }
                 if (from < sc || to < sc || data == null) return false;   // 不跨区拖
                 data.add(to - sc, data.remove(from - sc));
                 notifyItemMoved(from, to);
                 dragMoved = true;
+                dirtyApps = true;
                 return true;
             }
 
@@ -475,6 +563,8 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
             public void onSelectedChanged(RecyclerView.ViewHolder vh, int actionState) {
                 if (actionState == ItemTouchHelper.ACTION_STATE_DRAG && vh != null) {
                     dragMoved = false;
+                    dirtyShortcuts = false;
+                    dirtyApps = false;
                     vh.itemView.animate().scaleX(1.12f).scaleY(1.12f).setDuration(120).start();
                     vh.itemView.setElevation(Ui.dp(vh.itemView.getContext(), 10));
                 }
@@ -491,14 +581,12 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
                 // 菜单在长按那一刻已经弹过（OverlayMenu），这里不再补弹 ——
                 // 否则「拖动后松手」就会突然蹦出一个菜单（用户反馈的老问题）。
                 if (!moved) return;
-                int pos = vh.getBindingAdapterPosition();
-                int idx = pos - offset();
-                if (idx < offset()) {
-                    // 快捷区拖动结束 → 存新顺序
-                    if (shortcutOrder != null && host instanceof FullHost) {
-                        ((FullHost) host).onShortcutOrderChanged(new ArrayList<>(shortcutOrder));
-                    }
-                } else if (data != null && idx >= 0 && idx < data.size()) {
+                // 跨区互换会同时改快捷区和应用区，两块都要落盘；
+                // 区内拖动只 dirty 自己那一块
+                if (dirtyShortcuts && shortcutOrder != null && host instanceof FullHost) {
+                    ((FullHost) host).onShortcutOrderChanged(new ArrayList<>(shortcutOrder));
+                }
+                if (dirtyApps && data != null) {
                     host.onAppOrderChanged(new ArrayList<>(data));
                 }
             }

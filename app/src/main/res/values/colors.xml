@@ -10,4 +10,6 @@
     <color name="pip_stroke">#4DFFFFFF</color>
     <color name="text_main">#FFFFFFFF</color>
     <color name="text_sub">#B3FFFFFF</color>
+    <!-- 应用图标（自适应图标背景，与图标本体的黑色一致） -->
+    <color name="ic_launcher_bg">#FF000000</color>
 </resources>

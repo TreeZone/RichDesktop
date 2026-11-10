@@ -38,6 +38,11 @@ public class Weather {
 
     private static volatile boolean fetching;
     private static volatile long lastFailAt;
+    /** 最近一次失败的原因（成功后清空）；车机上排查「天气 -」全靠它 */
+    private static volatile String lastError = "";
+
+    /** 手动刷新结果回调（回主线程） */
+    public interface Cb { void done(String msg); }
 
     private Weather() { }
 
@@ -70,6 +75,7 @@ public class Weather {
                 fetch(app);
             } catch (Throwable t) {
                 lastFailAt = System.currentTimeMillis();
+                lastError = String.valueOf(t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage());
                 Log.i(TAG, "天气获取失败，沿用旧值：" + t);
             } finally {
                 fetching = false;
@@ -77,31 +83,48 @@ public class Weather {
         }, "pipdesk-weather").start();
     }
 
-    /** 设置页手动刷新：不看缓存、不看开关，立刻拉一次 */
-    public static void forceRefresh(Context c) {
-        if (c == null || fetching) return;
+    /** 设置页手动刷新：不看缓存、不看开关，立刻拉一次；结果通过 cb 回主线程 */
+    public static void forceRefresh(Context c, final Cb cb) {
+        if (c == null || fetching) {
+            if (cb != null) cb.done(fetching ? "上一次刷新还没结束" : "无效调用");
+            return;
+        }
         final Context app = c.getApplicationContext();
         fetching = true;
         new Thread(() -> {
+            String msg;
             try {
                 fetch(app);
+                msg = "刷新成功：" + text(Prefs.getWeatherCode(app))
+                        + " " + (Prefs.getWeatherTempX10(app) / 10f) + "°"
+                        + "（位置：" + SunTimes.locationLabel(app) + "）";
             } catch (Throwable t) {
                 lastFailAt = System.currentTimeMillis();
+                lastError = String.valueOf(t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage());
+                msg = "刷新失败：" + lastError
+                        + "\n位置：" + SunTimes.locationLabel(app)
+                        + "\n" + diagnose(app);
                 Log.i(TAG, "天气获取失败：" + t);
             } finally {
                 fetching = false;
+            }
+            final String m = msg;
+            if (cb != null) {
+                android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+                h.post(() -> cb.done(m));
             }
         }, "pipdesk-weather").start();
     }
 
     private static void fetch(Context c) throws Exception {
+        SunTimes.ensureIpLocation(c);   // 没有 GPS/手动坐标时先兜底反查一次（后台线程）
         double[] loc = SunTimes.location(c);
         HttpURLConnection conn = null;
         try {
             URL url = new URL(String.format(Locale.US, API, loc[0], loc[1]));
             conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(6000);
-            conn.setReadTimeout(6000);
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(10000);
             conn.setRequestProperty("Accept", "application/json");
             StringBuilder sb = new StringBuilder();
             try (BufferedReader r = new BufferedReader(
@@ -113,6 +136,7 @@ public class Weather {
             int code = cur.getInt("weather_code");
             int tempX10 = (int) Math.round(cur.getDouble("temperature_2m") * 10);
             Prefs.setWeather(c, code, tempX10, System.currentTimeMillis());
+            lastError = "";
             Log.i(TAG, "天气已更新：" + text(code) + " " + (tempX10 / 10f) + "° code=" + code);
         } finally {
             if (conn != null) {
@@ -121,9 +145,34 @@ public class Weather {
         }
     }
 
+    /**
+     * 天气为什么是「--」：位置来源 + 上次失败原因 + 网络连通性。
+     * 设置页「天气诊断」用，也在手动刷新失败时附带展示。
+     */
+    public static String diagnose(Context c) {
+        StringBuilder b = new StringBuilder();
+        b.append("位置：").append(SunTimes.locationLabel(c));
+        // 车机往往没有定位供应商在跑，lastKnown 拿不到就会落到默认坐标
+        b.append("\n上次失败：").append(lastError.isEmpty() ? "（最近一次成功或还没试过）" : lastError);
+        b.append("\n").append(ageLabel(c));
+        // 连通性：DNS 解析 + 建连，2.5 秒超时，只测不拉数据
+        boolean net = false;
+        String netErr = "";
+        try {
+            java.net.Socket s = new java.net.Socket();
+            s.connect(new java.net.InetSocketAddress("api.open-meteo.com", 443), 2500);
+            s.close();
+            net = true;
+        } catch (Throwable t) {
+            netErr = String.valueOf(t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage());
+        }
+        b.append("\n天气服务连通：").append(net ? "正常" : "不通（" + netErr + "）");
+        if (!net) b.append("\n→ 车机当前网络到不了 open-meteo，先确认车机流量/WiFi 可用");
+        return b.toString();
+    }
+
     /** WMO 天气代码 → 中文 */
-    public static String text(int code) {
-        if (code < 0) return "天气 --";
+    public static String text(int code) {        if (code < 0) return "天气 --";
         if (code == 0) return "晴";
         if (code == 1) return "少云";
         if (code == 2) return "多云";

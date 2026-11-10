@@ -52,6 +52,50 @@ public class Shell {
         return exec(new String[]{"su", "-c", cmd});
     }
 
+    /**
+     * 同步执行并抓输出（诊断用）。普通权限拿不到输出时才试 su；
+     * 输出截断到 6000 字，够列完节点信息，又不会把日志撑爆。
+     */
+    public static String capture(String cmd) {
+        String out = execCapture(new String[]{"sh", "-c", cmd});
+        if (out == null || out.length() == 0) {
+            String su = execCapture(new String[]{"su", "-c", cmd});
+            if (su != null && su.length() > 0) out = su;
+        }
+        if (out == null) return "（命令执行失败）";
+        return out.length() > 6000 ? out.substring(0, 6000) + "…" : out;
+    }
+
+    private static String execCapture(String[] argv) {
+        Process p = null;
+        java.util.Timer killer = null;
+        try {
+            ProcessBuilder pb = new ProcessBuilder(argv);
+            pb.redirectErrorStream(true);
+            p = pb.start();
+            p.getOutputStream().close();
+            killer = new java.util.Timer("pipdesk-shell-cap", true);
+            final Process fp = p;
+            killer.schedule(new java.util.TimerTask() {
+                @Override public void run() { fp.destroy(); }
+            }, 4000);
+            BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line).append('\n');
+            int code = p.waitFor();
+            if (code == 0) return sb.toString();
+            if ("su".equals(argv[0])) hasSu = (code != 127);
+            return null;
+        } catch (Throwable t) {
+            if ("su".equals(argv[0])) hasSu = Boolean.FALSE;
+            return null;
+        } finally {
+            if (killer != null) killer.cancel();
+            if (p != null) p.destroy();
+        }
+    }
+
     private static boolean exec(String[] argv) {
         Process p = null;
         java.util.Timer killer = null;

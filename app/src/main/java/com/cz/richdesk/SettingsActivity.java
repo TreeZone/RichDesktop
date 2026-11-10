@@ -38,6 +38,8 @@ public class SettingsActivity extends AppCompatActivity {
     private LinearLayout content;
     /** 进入页面时的外观，返回/回来时对比，变了就重建（设置页没有虚拟屏，重建无副作用） */
     private boolean createdDark;
+    /** 测试功能页：带 test_page Intent 打开本类，只渲染实验性内容（亮度等），稳定后并回主页 */
+    private boolean testPage;
 
     /** 内容滚动容器：重建前记录位置、重建后还原 */
     private ScrollView scrollView;
@@ -51,6 +53,7 @@ public class SettingsActivity extends AppCompatActivity {
         FileLog.start(this);   // 设置页也可能被单独拉起，日志入口保持幂等
         Ui.updateAppearance(this);
         createdDark = Ui.dark;
+        testPage = getIntent() != null && getIntent().getBooleanExtra("test_page", false);
         androidx.appcompat.app.ActionBar bar = getSupportActionBar();
         if (bar != null) bar.hide();
 
@@ -85,7 +88,7 @@ public class SettingsActivity extends AppCompatActivity {
         content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         int padH = Ui.dp(this, 18);
-        content.setPadding(padH, Ui.dp(this, 8), padH, Ui.dp(this, 28));
+        content.setPadding(padH, 0, padH, Ui.dp(this, 28));
         sv.addView(content, new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -148,7 +151,8 @@ public class SettingsActivity extends AppCompatActivity {
         // 再读一遍同一个 Intent —— 参数还在就会"选完关掉，一秒后又自己弹出来"。
         android.content.Intent dbg = getIntent();
         boolean needRebuild = false;
-        if (dbg != null) {
+        // 测试功能页不处理这些调试钩子（页面内容不同，themeBox 等字段都是空的）
+        if (dbg != null && !testPage) {
             if (dbg.getBooleanExtra("debug_pick_theme", false)) {
                 dbg.removeExtra("debug_pick_theme");
                 content.postDelayed(this::pickThemeMode, 600);
@@ -163,7 +167,7 @@ public class SettingsActivity extends AppCompatActivity {
                 dbg.removeExtra("debug_scroll_theme");
                 content.postDelayed(() -> sv.smoothScrollTo(0, themeBox.getTop()), 500);
             }
-            // 滚到底部（核对息屏/亮度区块截图用）
+            // 滚到底部（息屏/亮度区块截图核对用）
             if (dbg.getBooleanExtra("debug_scroll_bottom", false)) {
                 dbg.removeExtra("debug_scroll_bottom");
                 content.postDelayed(() -> sv.smoothScrollTo(0, content.getHeight()), 500);
@@ -173,16 +177,6 @@ public class SettingsActivity extends AppCompatActivity {
                 int y = dbg.getIntExtra("debug_scroll_y", 0);
                 dbg.removeExtra("debug_scroll_y");
                 content.postDelayed(() -> sv.scrollTo(0, y), 450);
-            }
-            // 直接设置屏内渲染分辨率：--ei debug_render 75（50/75/100）
-            if (dbg.hasExtra("debug_render")) {
-                int pct = clamp(dbg.getIntExtra("debug_render", 100), 50, 100);
-                dbg.removeExtra("debug_render");
-                content.postDelayed(() -> {
-                    Prefs.setRenderScale(this, pct);
-                    rebuildRenderBox();
-                    toast("屏内渲染分辨率 " + renderScaleLabel(pct));
-                }, 600);
             }
             // 两侧功能区自测：--ei debug_dockleft 1 --ei debug_lefttype 1（1=时间天气 0=快捷图标）
             if (dbg.hasExtra("debug_dockleft")) {
@@ -220,6 +214,14 @@ public class SettingsActivity extends AppCompatActivity {
             }, 500);
         }
 
+        // 测试功能页（主页点版本行 5 次进入）：只渲染实验性内容。
+        // 分支必须放在所有常规 section 之前 —— 之前放在末尾，
+        // 导致测试页把主页的全部设置项都带出来了。
+        if (testPage) {
+            buildBrightness();
+            return;
+        }
+
         section("虚拟桌面");
         seek("画中画数量", 1, Prefs.PANE_MAX, 1, Prefs.getPaneCount(this),
                 v -> {
@@ -228,12 +230,8 @@ public class SettingsActivity extends AppCompatActivity {
                 }, v -> v + " 屏");
         seek("画中画 DPI", Prefs.DPI_MIN, Prefs.DPI_MAX, 20, Prefs.getDpi(this),
                 v -> Prefs.setDpi(this, v), String::valueOf);
-        // 屏内渲染分辨率：降低虚拟屏像素量换帧率（GPU 重的应用更稳，画面略糊）。
-        // 放进盒子里：点击后要重建行标签（action 的标题是建行时写死的）
-        renderBox = new LinearLayout(this);
-        renderBox.setOrientation(LinearLayout.VERTICAL);
-        content.addView(renderBox);
-        rebuildRenderBox();
+        // 「屏内渲染分辨率」「车机系统分辨率修复」等显示相关入口已全部去掉：
+        // 前者在部分车机上会让画面缩左上角，后者属于系统设置不该由桌面管。
         // 圆角只有一套：改这里画中画和 Dock 一起变（需求 1）
         seek("圆角（画中画 + Dock）", 0, Prefs.CORNER_MAX, 1, Prefs.getPipCorner(this),
                 v -> Prefs.setPipCorner(this, v), v -> v + " dp");
@@ -281,11 +279,6 @@ public class SettingsActivity extends AppCompatActivity {
                 () -> pickPanelType(false));
         children(rightSw, rightType);
 
-        note("· 两侧都可选「快捷功能」或「时间 + 天气」；不显示时那一侧的分隔竖线也不显示。\n"
-                + "· 快捷功能最多 5 个图标，不留空位；添加方式 = 长按任一图标 →「添加图标」。\n"
-                + "· 功能区图标间距与中间图标区完全一致（同一个格宽）；中间放不下时自动变窄、可滑动，"
-                + "两侧功能区不会跟着变窄。");
-
         section("应用列表");
         seek("图标大小", Prefs.ICON_MIN, Prefs.ICON_MAX, 4, Prefs.getIconSize(this),
                 v -> Prefs.setIconSize(this, v), v -> v + " dp");
@@ -303,25 +296,29 @@ public class SettingsActivity extends AppCompatActivity {
         section("壁纸");
         action("更换壁纸（静态图片）", () -> pickWallpaper());
 
-        // 息屏 & 音量：都是应用列表里的内置图标（和「主页」一样），可绑到 Dock
-        section("息屏与音量（应用列表图标，可绑 Dock）");
-        Switch trueSleep = toggle("真息屏（关 = 黑屏遮罩，最安全）", Prefs.getSleepMode(this) == 0, b -> {
-            Prefs.setSleepMode(this, b ? 0 : 1);
-            toast(b ? "息屏方式：真息屏（触摸/按键唤醒 + 到点兜底点亮）"
-                    : "息屏方式：黑屏遮罩（任意触摸立即恢复）");
-        });
-        View sleepGuard = seekChild("兜底自动亮屏（真息屏后强制点亮）", 0, Prefs.SLEEP_GUARD_MAX, 60,
-                Prefs.getSleepGuardSec(this),
-                v -> Prefs.setSleepGuardSec(this, v),
-                v -> v == 0 ? "不自动（不建议）" : (v / 60) + " 分钟");
-        children(trueSleep, sleepGuard);
-        note("· 真息屏 = 等价于按电源键：屏幕和背光全关，最省电。唤醒方式：触摸屏幕/双击/按键。\n"
-                + "· 兜底：真息屏后会挂一个闹钟，到点强制点亮——就算这台车机的触摸唤不醒系统，"
-                + "也不会「黑了回不来」。默认 3 分钟，可改成 1~10 分钟。\n"
-                + "· 黑屏遮罩 = 不真关屏，只在最上层盖一层纯黑，任意触摸立刻恢复；"
-                + "100% 安全，代价是背光还亮着、稍微费电。\n"
-                + "· 音量 ± 调的是媒体音量，点一下会在屏幕上浮出当前音量（车机系统音量条常常不显示）。");
+        // 息屏：应用列表里的内置图标（和「主页」一样），可绑到 Dock。
+        // 息屏方式固定为黑屏遮罩：不真关屏，按设定的点击次数恢复（默认双击，防误触）。
+        section("息屏");
+        action("息屏后亮屏方式：" + wakeTapsLabel(), this::pickWakeTaps);
 
+        section("说明");
+        note("· 画中画顺序固定：横排从左到右、竖排从上到下，依次是画中画 1/2/3。\n"
+                + "· 未指定屏位的应用在「活动画中画」打开（可在上面改，默认最后一屏）；\n"
+                + "  想让某个应用固定在某一屏：长按应用图标 →「指定画中画位置」。\n"
+                + "· 画中画默认应用：桌面启动时，空闲的屏会自动打开这里指定的应用。\n"
+                + "· 画中画为空时是玻璃态，点 Dock 图标即在其中打开。\n"
+                + "· 已经在画中画里的应用，再点一次图标只会回到首页，不会重开。\n"
+                + "· 长按画中画（或 Dock 图标、应用图标）可打开更多操作。\n"
+                + "· 壁纸只支持静态图片（不支持动态壁纸）。\n"
+                + "· 运行日志写入：" + FileLog.dirPath());
+        buildVersionRow();
+    }
+
+    /**
+     * 亮度整块（实验中，挂在「测试功能」页）：总开关 / 日出日落 / 天气 / 写入通道 /
+     * 亮度下限 / 诊断 / 车机亮度通道测试。哪一项验证稳定了，就把对应几行搬回主页设置。
+     */
+    private void buildBrightness() {
         // 亮度自动调节：日落后/日出后用不同亮度，阴天（联网天气）单独一档
         section("屏幕亮度（跟随日出日落 / 天气）");
 
@@ -347,11 +344,11 @@ public class SettingsActivity extends AppCompatActivity {
         });
         View nightSeek = seekChild("夜间亮度（日落后）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
                 Prefs.getBrightNight(this),
-                v -> { Prefs.setBrightNight(this, v); Brightness.applyIfAuto(this); },
+                v -> { Prefs.setBrightNight(this, v); Brightness.apply(this, v); },
                 v -> v + " / 255");
         View daySeek = seekChild("白天亮度（日出后）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
                 Prefs.getBrightDay(this),
-                v -> { Prefs.setBrightDay(this, v); Brightness.applyIfAuto(this); },
+                v -> { Prefs.setBrightDay(this, v); Brightness.apply(this, v); },
                 v -> v + " / 255");
 
         Switch weatherSw = toggleChild("跟随天气（阴雨天变暗）", Prefs.brightUseWeather(this), b -> {
@@ -362,18 +359,92 @@ public class SettingsActivity extends AppCompatActivity {
         });
         View cloudySeek = seekChild("阴天 / 雨雪亮度", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
                 Prefs.getBrightCloudy(this),
-                v -> { Prefs.setBrightCloudy(this, v); Brightness.applyIfAuto(this); },
+                v -> { Prefs.setBrightCloudy(this, v); Brightness.apply(this, v); },
                 v -> v + " / 255");
 
-        children(brightSw, sunSw, nightSeek, daySeek, weatherSw, cloudySeek);
+        // 三条写入通道 + 最低亮度下限：TS10 一类车机只认其中一条，谁黑屏就关谁
+        Switch chSet = toggleChild("通道① 系统设置（标准 Android 路径）",
+                Prefs.brightChSetting(this),
+                b -> { Prefs.setBrightChSetting(this, b); Brightness.applyIfAuto(this); });
+        Switch chSurf = toggleChild("通道② 显示层（HWC 直压，绕过系统策略）",
+                Prefs.brightChSurface(this),
+                b -> { Prefs.setBrightChSurface(this, b); Brightness.applyIfAuto(this); });
+        Switch chSys = toggleChild("通道③ 背光节点（需 root）",
+                Prefs.brightChSysfs(this),
+                b -> { Prefs.setBrightChSysfs(this, b); Brightness.applyIfAuto(this); });
+        View floorSeek = seekChild("最低亮度下限（防车机把低亮度当关屏）", 0, 40, 1,
+                Prefs.getBrightFloorPct(this),
+                v -> { Prefs.setBrightFloorPct(this, v); Brightness.apply(this, Brightness.target(this)); },
+                v -> v == 0 ? "不设下限" : "不低于 " + v + "%");
+
+        // 三层父子关系：总开关 → 跟随日出日落/跟随天气 → 各亮度滑条。
+        // 任一层父开关关掉，它下面的子项整块置灰不可改。
+        children(brightSw, sunSw, nightSeek, daySeek, weatherSw, cloudySeek,
+                chSet, chSurf, chSys, floorSeek);
+        children(sunSw, nightSeek, daySeek);
+        children(weatherSw, cloudySeek);
         action("现在为什么是这个亮度？", () -> toast(Brightness.describe(this)
                 + "\n天气：" + Weather.dockLabel(this) + "（" + Weather.ageLabel(this) + "）"
-                + "\n日落：" + SunTimes.describe(this)));
-        action("立即刷新天气（平时每 15 分钟自动刷新）", () -> {
-            Weather.forceRefresh(this);
-            toast("正在刷新天气，稍等…");
+                + "\n日落：" + SunTimes.describe(this)
+                + "\n" + Brightness.diagnose(this)));
+        action("马上按当前档位写一次亮度（车机没反应时点这个）", () -> {
+            Brightness.apply(this, Brightness.target(this));
+            new android.os.Handler(getMainLooper()).postDelayed(
+                    () -> toast("已写入 → " + Brightness.target(this) + " / 255\n"
+                            + Brightness.diagnose(this)), 900);
         });
-        note("· 两个子项（日出日落 / 天气）可以各自开关；总开关关掉时完全不碰系统亮度，"
+        action("亮度诊断（列出亮度通道/背光节点，可截图给我）", () -> {
+            toast("正在采集…");
+            new Thread(() -> {
+                final String rep = Brightness.diagnoseReport(this);
+                FileLog.append("===== 亮度诊断 =====\n" + rep);
+                runOnUiThread(() -> {
+                    try {
+                        new android.app.AlertDialog.Builder(this)
+                                .setTitle("亮度诊断")
+                                .setMessage(rep)
+                                .setPositiveButton("好", null)
+                                .show();
+                    } catch (Throwable t) {
+                        toast(rep);
+                    }
+                });
+            }, "bright-diag").start();
+        });
+        action("立即刷新天气（平时每 15 分钟自动刷新）", () -> {
+            toast("正在刷新天气，稍等…");
+            Weather.forceRefresh(this, msg -> toast(msg));
+        });
+        action("天气诊断（位置来源 / 失败原因 / 服务连通性）", () -> {
+            toast("正在检测网络…");
+            new Thread(() -> {
+                final String rep = Weather.diagnose(this);
+                FileLog.append("===== 天气诊断 =====\n" + rep);
+                runOnUiThread(() -> toast(rep));
+            }, "weather-diag").start();
+        });
+        // 车机亮度排查：TS10 一类车机的背光常被厂商服务接管，只会响应其中一条通道。
+        // 一条一条开测试，看屏幕对哪条有反应；有反应的留着，没反应的黑屏通道关掉。
+        section("车机亮度通道测试（点一条，盯 3 秒屏幕有没有变暗）");
+        action("测试① 系统设置通道：写 40%", () -> {
+            Brightness.testSetting(this, 0.4f);
+            toast("已写系统亮度 = 40%（看屏幕）");
+        });
+        action("测试② 显示层通道：写 40%", () -> {
+            Brightness.testSurface(this, 0.4f);
+            toast("已写显示层 = 40%（看屏幕）");
+        });
+        action("测试③ 背光节点通道：写 40%", () -> {
+            Brightness.testSysfs(this, 40);
+            toast("已写背光节点 = 40%（看屏幕）");
+        });
+        action("测试完：按当前档位恢复", () -> {
+            Brightness.apply(this, Brightness.target(this));
+            toast("已恢复 → " + Brightness.target(this) + " / 255");
+        });
+        note("· 拖下面三个滑条会立刻写到屏幕（不等总开关，方便你现场对亮度）；"
+                + "总开关只决定「桌面上要不要按日出日落/天气自动改」。\n"
+                + "· 两个子项（日出日落 / 天气）可以各自开关；总开关关掉时后台完全不碰亮度，"
                 + "适合车机自带自动背光的情况。\n"
                 + "· 优先级：夜间 > 阴雨天 > 白天。晚上不管阴不阴都用夜间亮度，"
                 + "否则一阴天反而更亮、很刺眼。\n"
@@ -382,17 +453,78 @@ public class SettingsActivity extends AppCompatActivity {
                 + "· 阴天判断只认「阴 / 雾 / 雨 / 雪 / 雷」，多云仍按白天亮度，"
                 + "免得稍微有点云就把屏幕压暗。\n"
                 + "· 日落/天气都联网获取，位置就是上面「日落地点」那个；断网退回固定时段。");
+    }
 
-        section("说明");
-        note("· 画中画顺序固定：横排从左到右、竖排从上到下，依次是画中画 1/2/3。\n"
-                + "· 未指定屏位的应用在「活动画中画」打开（可在上面改，默认最后一屏）；\n"
-                + "  想让某个应用固定在某一屏：长按应用图标 →「指定画中画位置」。\n"
-                + "· 画中画默认应用：桌面启动时，空闲的屏会自动打开这里指定的应用。\n"
-                + "· 画中画为空时是玻璃态，点 Dock 图标即在其中打开。\n"
-                + "· 已经在画中画里的应用，再点一次图标只会回到首页，不会重开。\n"
-                + "· 长按画中画（或 Dock 图标、应用图标）可打开更多操作。\n"
-                + "· 壁纸只支持静态图片（不支持动态壁纸）。\n"
-                + "· 运行日志写入：" + FileLog.dirPath());
+    // ------------------------------------------------------------ 息屏亮屏方式 / 版本彩蛋
+
+    private String wakeTapsLabel() {
+        switch (Prefs.getWakeTaps(this)) {
+            case 1: return "单击";
+            case 3: return "三击";
+            default: return "双击";
+        }
+    }
+
+    /** 选遮罩期点亮屏幕需要的点击次数 */
+    private void pickWakeTaps() {
+        GlassMenu.show(this, "息屏后亮屏方式",
+                new CharSequence[]{"单击亮屏", "双击亮屏（防误触）", "三击亮屏（更防误触）"},
+                which -> {
+                    Prefs.setWakeTaps(this, which + 1);
+                    // 行标题是构建时写死的，改完重建页面（保持滚动位置）才能立刻看到新值
+                    recreateKeepScroll();
+                    toast("已改为" + wakeTapsLabel() + "亮屏");
+                });
+    }
+
+    /** 连点计数状态（版本行彩蛋）；解锁后点版本行直接进测试页，不再计数、不再加行 */
+    private boolean testUnlocked;
+    private View testEntryRow;
+    private int verTaps;
+    private long verLastAt;
+
+    /** 版本行：显示构建版本；2.5 秒内连点 5 次解锁「测试功能」入口（只加一次） */
+    private void buildVersionRow() {
+        TextView tv = new TextView(this);
+        tv.setText("版本 " + versionLabel());
+        tv.setTextSize(12);
+        tv.setTextColor(Ui.tintHint());
+        tv.setShadowLayer(3, 0, 1, Ui.shadow());
+        tv.setPadding(Ui.dp(this, 4), Ui.dp(this, 14), 0, 0);
+        content.addView(tv);
+        tv.setOnClickListener(v -> {
+            if (testUnlocked) { openTestPage(); return; }   // 已解锁：直接进，不再数数
+            long now = android.os.SystemClock.uptimeMillis();
+            if (now - verLastAt > 2500) verTaps = 0;   // 点慢了重新计
+            verLastAt = now;
+            if (++verTaps >= 5) {
+                testUnlocked = true;
+                verTaps = 0;
+                toast("已解锁测试功能");
+                // 入口只加一次：解锁状态由 testUnlocked 保证，重复连点也不会多行
+                if (testEntryRow == null) {
+                    testEntryRow = action("测试功能（谨慎使用，可能造成无法恢复的影响）",
+                            this::openTestPage);
+                }
+            } else if (verTaps >= 2) {
+                toast("再点 " + (5 - verTaps) + " 次进入测试功能");
+            }
+        });
+    }
+
+    private void openTestPage() {
+        startActivity(new Intent(this, SettingsActivity.class).putExtra("test_page", true));
+    }
+
+    /** 本应用版本号：从 PackageManager 读，不依赖 BuildConfig 开关 */
+    private String versionLabel() {
+        try {
+            android.content.pm.PackageInfo pi =
+                    getPackageManager().getPackageInfo(getPackageName(), 0);
+            return pi.versionName + "（vc" + pi.versionCode + "）";
+        } catch (Throwable t) {
+            return "未知";
+        }
     }
 
     // ------------------------------------------------------------ 壁纸
@@ -465,7 +597,6 @@ public class SettingsActivity extends AppCompatActivity {
     private LinearLayout paneDefaultsBox;
     /** 外观设置卡片容器（模式/入夜/天亮/日落/地点，改一项只重建这块） */
     private LinearLayout themeBox;
-    private LinearLayout renderBox;
     /** 父开关 → 子项卡片：父开关一关，子项整块变灰不可调 */
     private final java.util.Map<Switch, List<View>> childRows = new java.util.HashMap<>();
     /** 应用列表缓存（含图标），默认应用选择器用 */
@@ -542,17 +673,25 @@ public class SettingsActivity extends AppCompatActivity {
      * 只是挂到 ScrollView 外面，所以不随内容滚走。
      */
     private void buildHeader(LinearLayout parent) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(0, Ui.dp(this, 8), Ui.dp(this, 18), Ui.dp(this, 14));
+        // 返回键和标题合并成一个按钮：整个「‹ 桌面设置」是一块热区，
+        // 按下时整块亮水波纹，点哪儿都是返回，不再有「图标能点、字不能点」的错觉。
+        LinearLayout btn = new LinearLayout(this);
+        btn.setOrientation(LinearLayout.HORIZONTAL);
+        btn.setGravity(Gravity.CENTER_VERTICAL);
+        btn.setPadding(0, Ui.dp(this, 8), Ui.dp(this, 18), Ui.dp(this, 4));
+        btn.setOnClickListener(v -> finish());
+        btn.setContentDescription("返回");
+        GradientDrawable mask = new GradientDrawable();
+        mask.setCornerRadius(Ui.dp(this, 24));
+        mask.setColor(0xFFFFFFFF);
+        btn.setBackground(new RippleDrawable(
+                ColorStateList.valueOf(Ui.dark ? 0x33FFFFFF : 0x1F000000), null, mask));
 
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        parent.addView(row, lp);
+        parent.addView(btn, lp);
 
-        // 返回键：44dp 见方的热区（原来只有一行 26sp 的字，手指很难按到）。
-        // 宽度靠 minWidth 撑出来，字形仍在最左边 —— 标题左对齐的位置和改之前几乎一样。
+        // ‹ 字形：44dp 热区撑宽度，字形仍在最左边，标题左对齐位置和之前一致
         final int box = Ui.dp(this, 44);
         TextView back = new TextView(this);
         back.setText("‹");
@@ -563,22 +702,17 @@ public class SettingsActivity extends AppCompatActivity {
         back.setTextColor(Ui.tint());
         back.setMinWidth(box);
         back.setMinHeight(box);
-        // 无底色的圆形水波纹：只在按下时有反馈，静态完全透明
-        GradientDrawable mask = new GradientDrawable();
-        mask.setShape(GradientDrawable.OVAL);
-        mask.setColor(0xFFFFFFFF);
-        back.setBackground(new RippleDrawable(
-                ColorStateList.valueOf(Ui.dark ? 0x33FFFFFF : 0x1F000000), null, mask));
-        back.setContentDescription("返回");
-        back.setOnClickListener(v -> finish());
-        row.addView(back);
+        back.setClickable(false);                   // 点击统一交给外层按钮
+        btn.addView(back);
 
         TextView t = new TextView(this);
-        t.setText("桌面设置");
+        t.setText(testPage ? "测试功能" : "桌面设置");
         t.setTextSize(20);
         t.setTextColor(Ui.tint());
         t.setShadowLayer(4, 0, 1, Ui.shadow());
-        row.addView(t);
+        t.setPadding(Ui.dp(this, 8), 0, Ui.dp(this, 24), 0);   // 右侧留热区
+        t.setClickable(false);
+        btn.addView(t);
     }
 
     private void section(String title) {
@@ -876,7 +1010,7 @@ public class SettingsActivity extends AppCompatActivity {
             if (b.length() > 0) b.append(" / ");
             b.append(AppListAdapter.shortcutLabel(p));
         }
-        if (l.size() >= Prefs.PANEL_SHORTCUT_MAX) b.append("（已满 ").append(Prefs.PANEL_SHORTCUT_MAX).append(" 个）");
+        if (l.size() >= Prefs.PANEL_SHORTCUT_MAX) b.append("（已达上限 ").append(Prefs.PANEL_SHORTCUT_MAX).append(" 个）");
         return b.toString();
     }
 
@@ -885,11 +1019,11 @@ public class SettingsActivity extends AppCompatActivity {
         return type == Prefs.PANEL_CLOCK ? "时间 + 天气" : "快捷功能（图标）";
     }
 
-    /** 选一侧功能区的内容：快捷功能（最多 5 个图标）或 时间 + 天气 */
+    /** 选一侧功能区的内容：快捷功能（按 Dock 格数自动决定能放几个）或 时间 + 天气 */
     private void pickPanelType(final boolean left) {
         final int cur = left ? Prefs.getDockLeftType(this) : Prefs.getDockRightType(this);
         GlassMenu.show(this, (left ? "左端" : "右端") + "功能区内容",
-                new CharSequence[]{"快捷功能（最多 " + Prefs.PANEL_SHORTCUT_MAX + " 个图标）",
+                new CharSequence[]{"快捷功能（图标，按 Dock 格数放）",
                         "时间 + 天气"},
                 which -> {
                     int t = which == 1 ? Prefs.PANEL_CLOCK : Prefs.PANEL_SHORTCUT;
@@ -901,29 +1035,11 @@ public class SettingsActivity extends AppCompatActivity {
                 });
     }
 
-    /** 屏内渲染分辨率档位标签 */
-    private static String renderScaleLabel(int pct) {
-        switch (pct) {
-            case 75: return "省电（75%）";
-            case 50: return "流畅（50%）";
-            default: return "标准（100%）";
-        }
-    }
-
-    /** 「屏内渲染分辨率」行：点一下切档，标签跟着刷新 */
-    private void rebuildRenderBox() {
-        if (renderBox == null) return;
-        renderBox.removeAllViews();
-        actionTo(renderBox, "屏内渲染分辨率：" + renderScaleLabel(Prefs.getRenderScale(this)),
-                () -> {
-                    int cur = Prefs.getRenderScale(this);
-                    int next = cur >= 100 ? 75 : (cur >= 75 ? 50 : 100);
-                    Prefs.setRenderScale(this, next);
-                    rebuildRenderBox();
-                    toast(next == 100 ? "已恢复 1:1 渲染（最清晰）"
-                            : "已切换：屏内应用渲染像素减少，画面更流畅（略糊）");
-                });
-    }
+    /**
+     * 显示相关：不再提供「屏内渲染分辨率」——它在部分车机上会让画中画里的应用
+     * 停在旧尺寸（画面缩到左上角），用户分不清是我们还是车机的问题，先关掉这个入口。
+     */
+    private void rebuildRenderBox() { }   // 已废弃：入口全部移除，方法留空防外部调用编译错
 
     private static String themeLabel(int mode) {
         switch (mode) {

@@ -108,7 +108,7 @@ public class DebugTapReceiver extends BroadcastReceiver {
                 android.util.Log.i("PipDesk", "DEBUG 亮度控制权已还原");
             }
             if (i.getIntExtra("weather", 0) == 1) {
-                Weather.forceRefresh(context);
+                Weather.forceRefresh(context, null);
                 android.util.Log.i("PipDesk", "DEBUG 手动刷新天气");
             }
             // 模拟长按 Dock 第 pos 格：--ei docklong <pos>（触发 onDockLongClick）

@@ -121,8 +121,10 @@ public class ScreenOff {
         layer.setClickable(true);
 
         // 极暗的提示：够看清但不会吸引小孩盯着屏幕
+        final int needTaps = Prefs.getWakeTaps(a);
         final TextView hint = new TextView(a);
-        hint.setText("轻触屏幕恢复");
+        hint.setText(needTaps == 1 ? "轻触屏幕恢复"
+                : needTaps == 2 ? "双击屏幕恢复" : "三击屏幕恢复");
         hint.setTextColor(0xFF6B6B6B);
         hint.setTextSize(13);
         hint.setAlpha(0f);
@@ -132,10 +134,20 @@ public class ScreenOff {
         layer.addView(hint, hl);
 
         final long shownAt = SystemClock.uptimeMillis();
+        // 点击计数：要几次点击才亮屏由设置决定（单击/双击/三击）。
+        // 600ms 内连着点才算同一组；超时重新从 1 计。
+        final int[] taps = {0};
+        final long[] lastTapAt = {0};
         layer.setOnTouchListener((v, e) -> {
             // 触发这次息屏的那一下还没完全结束，500ms 内不吃事件，避免瞬间又被自己点亮
             if (SystemClock.uptimeMillis() - shownAt < 500) return true;
-            dismissCurtain(a);
+            if (e.getAction() == android.view.MotionEvent.ACTION_UP) {
+                long now = SystemClock.uptimeMillis();
+                if (now - lastTapAt[0] > 600) taps[0] = 0;
+                lastTapAt[0] = now;
+                taps[0]++;
+                if (taps[0] >= needTaps) dismissCurtain(a);
+            }
             return true;
         });
         decor.addView(layer, new ViewGroup.LayoutParams(
@@ -149,7 +161,7 @@ public class ScreenOff {
         hint.postDelayed(() -> hint.animate().alpha(0.55f).setDuration(300).start(), 1200);
         hint.postDelayed(() -> hint.animate().alpha(0f).setDuration(600).start(), 4200);
 
-        Log.i(TAG, "息屏（安全遮罩）：全屏黑，任意触摸恢复");
+        Log.i(TAG, "息屏（安全遮罩）：全屏黑，" + needTaps + " 次点击恢复");
     }
 
     public static void dismissCurtain(Activity a) {
