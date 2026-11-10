@@ -67,6 +67,8 @@ public class PaneBox extends FrameLayout {
     private float[] weights = new float[0];
     private Listener listener;
     private ValueAnimator animator;
+    /** 上一次布局的参数签名：只在变化时打日志，避免每帧刷屏（排查"画中画缩小"用） */
+    private String lastLayoutSig = "";
 
     public PaneBox(Context c) {
         super(c);
@@ -302,6 +304,17 @@ public class PaneBox extends FrameLayout {
             View child = order.get(i);
             if (horizontal) child.layout(start[i], 0, end[i], h);
             else child.layout(0, start[i], w, end[i]);
+        }
+        StringBuilder sig = new StringBuilder();
+        sig.append(horizontal ? "H " : "V ").append(w).append('x').append(h).append(" n=").append(n).append(" w=[");
+        for (int i = 0; i < n; i++) {
+            if (i > 0) sig.append(',');
+            sig.append(String.format(java.util.Locale.US, "%.3f", weights[i])).append(':').append(sizes[i]);
+        }
+        sig.append(']');
+        if (!sig.toString().equals(lastLayoutSig)) {
+            lastLayoutSig = sig.toString();
+            android.util.Log.i("PipDesk", "PaneBox layout " + lastLayoutSig);
         }
 
         int thickness = handleThickness();

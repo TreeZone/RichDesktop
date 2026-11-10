@@ -116,12 +116,46 @@ public class Prefs {
     }
 
     public static void setDockLeft(Context c, List<String> list) {
+        putList(c, "dock_left", list);
+    }
+
+    /** 右侧功能区的快捷图标（只有右侧被配成「快捷功能」时才有意义） */
+    public static List<String> getDockRightIcons(Context c) {
+        return getList(c, "dock_right_icons");
+    }
+
+    public static void setDockRightIcons(Context c, List<String> list) {
+        putList(c, "dock_right_icons", list);
+    }
+
+    private static List<String> getList(Context c, String key) {
+        List<String> r = new ArrayList<>();
+        String s = sp(c).getString(key, "");
+        if (s != null && !s.isEmpty()) {
+            for (String p : s.split("\\|")) if (!p.isEmpty()) r.add(p);
+        }
+        return r;
+    }
+
+    private static void putList(Context c, String key, List<String> list) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < list.size(); i++) {
             if (i > 0) sb.append('|');
             sb.append(list.get(i));
         }
-        sp(c).edit().putString("dock_left", sb.toString()).apply();
+        sp(c).edit().putString(key, sb.toString()).apply();
+    }
+
+    /**
+     * 应用列表「快捷区」的图标顺序（9 项：桌面设置 + 8 个内置快捷方式）。
+     * 应用列表里长按拖动排序后由 MainActivity 持久化到这里。
+     */
+    public static List<String> getShortcutOrder(Context c) {
+        return getList(c, "shortcut_order");
+    }
+
+    public static void setShortcutOrder(Context c, List<String> list) {
+        putList(c, "shortcut_order", list);
     }
 
     /** Dock 右端功能区：时间 + 天气（默认关） */
@@ -131,6 +165,32 @@ public class Prefs {
 
     public static void setDockRightEnabled(Context c, boolean b) {
         sp(c).edit().putBoolean("dock_right_on", b).apply();
+    }
+
+    /**
+     * 功能区内容类型：快捷功能（图标）或 时间 + 天气。
+     * 左右两侧各自独立配置 —— 左边既可以放图标，也可以放时间（有人喜欢时间在左）。
+     */
+    public static final int PANEL_SHORTCUT = 0;
+    public static final int PANEL_CLOCK = 1;
+
+    /** 快捷功能区最多放几个图标（再多就挤到中间图标区了） */
+    public static final int PANEL_SHORTCUT_MAX = 5;
+
+    public static int getDockLeftType(Context c) {
+        return clamp(sp(c).getInt("dock_left_type", PANEL_SHORTCUT), 0, 1);
+    }
+
+    public static void setDockLeftType(Context c, int t) {
+        sp(c).edit().putInt("dock_left_type", clamp(t, 0, 1)).apply();
+    }
+
+    public static int getDockRightType(Context c) {
+        return clamp(sp(c).getInt("dock_right_type", PANEL_CLOCK), 0, 1);
+    }
+
+    public static void setDockRightType(Context c, int t) {
+        sp(c).edit().putInt("dock_right_type", clamp(t, 0, 1)).apply();
     }
 
     // ------------------------------------------------------------ 亮度（按日出日落 + 天气）

@@ -147,6 +147,7 @@ public class SettingsActivity extends AppCompatActivity {
         // 用完必须从 Intent 里删掉：applyThemeMode 会 recreate()，重建后 onCreate 会
         // 再读一遍同一个 Intent —— 参数还在就会"选完关掉，一秒后又自己弹出来"。
         android.content.Intent dbg = getIntent();
+        boolean needRebuild = false;
         if (dbg != null) {
             if (dbg.getBooleanExtra("debug_pick_theme", false)) {
                 dbg.removeExtra("debug_pick_theme");
@@ -183,6 +184,40 @@ public class SettingsActivity extends AppCompatActivity {
                     toast("屏内渲染分辨率 " + renderScaleLabel(pct));
                 }, 600);
             }
+            // 两侧功能区自测：--ei debug_dockleft 1 --ei debug_lefttype 1（1=时间天气 0=快捷图标）
+            if (dbg.hasExtra("debug_dockleft")) {
+                Prefs.setDockLeftEnabled(this, dbg.getIntExtra("debug_dockleft", 0) == 1);
+                dbg.removeExtra("debug_dockleft");
+                needRebuild = true;
+            }
+            if (dbg.hasExtra("debug_dockright")) {
+                Prefs.setDockRightEnabled(this, dbg.getIntExtra("debug_dockright", 0) == 1);
+                dbg.removeExtra("debug_dockright");
+                needRebuild = true;
+            }
+            if (dbg.hasExtra("debug_lefttype")) {
+                Prefs.setDockLeftType(this, dbg.getIntExtra("debug_lefttype", 0));
+                dbg.removeExtra("debug_lefttype");
+                needRebuild = true;
+            }
+            if (dbg.hasExtra("debug_righttype")) {
+                Prefs.setDockRightType(this, dbg.getIntExtra("debug_righttype", 0));
+                dbg.removeExtra("debug_righttype");
+                needRebuild = true;
+            }
+            // 直接设定某一侧快捷图标：--es debug_lefticons "a|b|c"（pkg 或内置 pipdesk://…）
+            if (dbg.hasExtra("debug_lefticons")) {
+                String v = dbg.getStringExtra("debug_lefticons");
+                List<String> l = new ArrayList<>();
+                if (v != null) for (String x : v.split("\\|")) if (!x.isEmpty()) l.add(x);
+                Prefs.setDockLeft(this, l);
+                dbg.removeExtra("debug_lefticons");
+                needRebuild = true;
+            }
+            if (needRebuild) content.postDelayed(() -> {
+                pendingScrollY = scrollView.getScrollY();
+                recreate();
+            }, 500);
         }
 
         section("虚拟桌面");
@@ -219,10 +254,12 @@ public class SettingsActivity extends AppCompatActivity {
         seek("Dock 图标大小", Prefs.DOCK_ICON_MIN, Prefs.DOCK_ICON_MAX, 2, Prefs.getDockIcon(this),
                 v -> Prefs.setDockIcon(this, v), v -> v + " dp（Dock 高度随之自适应）");
 
-        // Dock 左右两端的功能区（需求：左端放自建图标，右端放时间/天气，都可选）
-        toggle("左端功能区（自建图标）", Prefs.dockLeftEnabled(this), b -> {
+        // Dock 左右两端的功能区：两侧内容都能选「快捷功能」或「时间 + 天气」。
+        // 父开关关掉时，下面的内容选择/图标列表整块变灰（子级不可调）。
+        Switch leftSw = toggle("左端功能区", Prefs.dockLeftEnabled(this), b -> {
             Prefs.setDockLeftEnabled(this, b);
-            if (b && Prefs.getDockLeft(this).isEmpty()) {
+            if (b && Prefs.getDockLeft(this).isEmpty()
+                    && Prefs.getDockLeftType(this) == Prefs.PANEL_SHORTCUT) {
                 // 第一次打开先给一套能用的：返回 / 主页 / 最近任务
                 List<String> d = new ArrayList<>();
                 d.add(AppInfo.BACK_PKG);
@@ -232,10 +269,31 @@ public class SettingsActivity extends AppCompatActivity {
                 toast("已放入默认图标：返回 / 主页 / 最近任务");
             }
         });
-        action("左区已放：" + dockLeftNames(), () ->
-                toast("在桌面上点左区末尾「＋」添加，长按图标移除或移到 Dock"));
-        toggle("右端时间 + 天气", Prefs.dockRightEnabled(this),
+        View leftType = actionChild("左端内容：" + panelLabel(Prefs.getDockLeftType(this)),
+                () -> pickPanelType(true));
+        // 只有「快捷功能」才有图标可列（时间天气没有图标），按当前类型决定显不显示
+        View leftIcons = Prefs.getDockLeftType(this) == Prefs.PANEL_SHORTCUT
+                ? actionChild("左端图标：" + dockLeftNames(),
+                        () -> toast("长按桌面功能区空白处添加图标；长按图标可移除或移到中间图标区"))
+                : null;
+        if (leftIcons != null) children(leftSw, leftType, leftIcons);
+        else children(leftSw, leftType);
+
+        Switch rightSw = toggle("右端功能区", Prefs.dockRightEnabled(this),
                 b -> Prefs.setDockRightEnabled(this, b));
+        View rightType = actionChild("右端内容：" + panelLabel(Prefs.getDockRightType(this)),
+                () -> pickPanelType(false));
+        View rightIcons = Prefs.getDockRightType(this) == Prefs.PANEL_SHORTCUT
+                ? actionChild("右端图标：" + dockRightNames(),
+                        () -> toast("长按桌面功能区空白处添加图标；长按图标可移除或移到中间图标区"))
+                : null;
+        if (rightIcons != null) children(rightSw, rightType, rightIcons);
+        else children(rightSw, rightType);
+
+        note("· 两侧都可选「快捷功能」或「时间 + 天气」；不显示时那一侧的分隔竖线也不显示。\n"
+                + "· 快捷功能最多 5 个图标；添加方式 = 长按桌面功能区末尾的空白格（不挂常驻「＋」）。\n"
+                + "· 功能区图标间距与中间图标区完全一致（同一个格宽）；中间放不下时自动变窄、可滑动，"
+                + "两侧功能区不会跟着变窄。");
 
         section("应用列表");
         seek("图标大小", Prefs.ICON_MIN, Prefs.ICON_MAX, 4, Prefs.getIconSize(this),
@@ -256,15 +314,16 @@ public class SettingsActivity extends AppCompatActivity {
 
         // 息屏 & 音量：都是应用列表里的内置图标（和「主页」一样），可绑到 Dock
         section("息屏与音量（应用列表图标，可绑 Dock）");
-        toggle("真息屏（关 = 黑屏遮罩，最安全）", Prefs.getSleepMode(this) == 0, b -> {
+        Switch trueSleep = toggle("真息屏（关 = 黑屏遮罩，最安全）", Prefs.getSleepMode(this) == 0, b -> {
             Prefs.setSleepMode(this, b ? 0 : 1);
             toast(b ? "息屏方式：真息屏（触摸/按键唤醒 + 到点兜底点亮）"
                     : "息屏方式：黑屏遮罩（任意触摸立即恢复）");
         });
-        seek("兜底自动亮屏（真息屏后强制点亮）", 0, Prefs.SLEEP_GUARD_MAX, 60,
+        View sleepGuard = seekChild("兜底自动亮屏（真息屏后强制点亮）", 0, Prefs.SLEEP_GUARD_MAX, 60,
                 Prefs.getSleepGuardSec(this),
                 v -> Prefs.setSleepGuardSec(this, v),
                 v -> v == 0 ? "不自动（不建议）" : (v / 60) + " 分钟");
+        children(trueSleep, sleepGuard);
         note("· 真息屏 = 等价于按电源键：屏幕和背光全关，最省电。唤醒方式：触摸屏幕/双击/按键。\n"
                 + "· 兜底：真息屏后会挂一个闹钟，到点强制点亮——就算这台车机的触摸唤不醒系统，"
                 + "也不会「黑了回不来」。默认 3 分钟，可改成 1~10 分钟。\n"
@@ -275,7 +334,7 @@ public class SettingsActivity extends AppCompatActivity {
         // 亮度自动调节：日落后/日出后用不同亮度，阴天（联网天气）单独一档
         section("屏幕亮度（跟随日出日落 / 天气）");
 
-        toggle("总开关：自动调节屏幕亮度", Prefs.brightAuto(this), b -> {
+        Switch brightSw = toggle("总开关：自动调节屏幕亮度", Prefs.brightAuto(this), b -> {
             Prefs.setBrightAuto(this, b);
             if (b) {
                 Weather.refreshIfStale(this);       // 先把天气捞一下，阴天判断才准
@@ -289,33 +348,33 @@ public class SettingsActivity extends AppCompatActivity {
             }
         });
 
-        toggle("跟随日出日落（日落后变暗）", Prefs.brightUseSun(this), b -> {
+        Switch sunSw = toggleChild("跟随日出日落（日落后变暗）", Prefs.brightUseSun(this), b -> {
             Prefs.setBrightUseSun(this, b);
             if (b) SunTimes.refreshIfStaleAsync(this);
             Brightness.applyIfAuto(this);
             toast(b ? "已开启：日落后切到夜间亮度" : "已关闭：不再按日落变暗");
         });
-        seek("夜间亮度（日落后）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
+        View nightSeek = seekChild("夜间亮度（日落后）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
                 Prefs.getBrightNight(this),
                 v -> { Prefs.setBrightNight(this, v); Brightness.applyIfAuto(this); },
                 v -> v + " / 255");
+        View daySeek = seekChild("白天亮度（日出后）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
+                Prefs.getBrightDay(this),
+                v -> { Prefs.setBrightDay(this, v); Brightness.applyIfAuto(this); },
+                v -> v + " / 255");
 
-        toggle("跟随天气（阴雨天变暗）", Prefs.brightUseWeather(this), b -> {
+        Switch weatherSw = toggleChild("跟随天气（阴雨天变暗）", Prefs.brightUseWeather(this), b -> {
             Prefs.setBrightUseWeather(this, b);
             if (b) Weather.refreshIfStale(this);
             Brightness.applyIfAuto(this);
             toast(b ? "已开启：阴/雨/雪天切到阴天亮度" : "已关闭：不再按天气变暗");
         });
-        seek("阴天 / 雨雪亮度", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
+        View cloudySeek = seekChild("阴天 / 雨雪亮度", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
                 Prefs.getBrightCloudy(this),
                 v -> { Prefs.setBrightCloudy(this, v); Brightness.applyIfAuto(this); },
                 v -> v + " / 255");
 
-        seek("白天亮度（其余情况）", Prefs.BRIGHT_MIN, Prefs.BRIGHT_MAX, 5,
-                Prefs.getBrightDay(this),
-                v -> { Prefs.setBrightDay(this, v); Brightness.applyIfAuto(this); },
-                v -> v + " / 255");
-
+        children(brightSw, sunSw, nightSeek, daySeek, weatherSw, cloudySeek);
         action("现在为什么是这个亮度？", () -> toast(Brightness.describe(this)
                 + "\n天气：" + Weather.dockLabel(this) + "（" + Weather.ageLabel(this) + "）"
                 + "\n日落：" + SunTimes.describe(this)));
@@ -323,7 +382,7 @@ public class SettingsActivity extends AppCompatActivity {
             Weather.forceRefresh(this);
             toast("正在刷新天气，稍等…");
         });
-        note("· 三个子项（日出日落 / 天气）可以各自开关；总开关关掉时完全不碰系统亮度，"
+        note("· 两个子项（日出日落 / 天气）可以各自开关；总开关关掉时完全不碰系统亮度，"
                 + "适合车机自带自动背光的情况。\n"
                 + "· 优先级：夜间 > 阴雨天 > 白天。晚上不管阴不阴都用夜间亮度，"
                 + "否则一阴天反而更亮、很刺眼。\n"
@@ -416,6 +475,8 @@ public class SettingsActivity extends AppCompatActivity {
     /** 外观设置卡片容器（模式/入夜/天亮/日落/地点，改一项只重建这块） */
     private LinearLayout themeBox;
     private LinearLayout renderBox;
+    /** 父开关 → 子项卡片：父开关一关，子项整块变灰不可调 */
+    private final java.util.Map<Switch, List<View>> childRows = new java.util.HashMap<>();
     /** 应用列表缓存（含图标），默认应用选择器用 */
     private List<AppInfo> appCache;
 
@@ -551,11 +612,11 @@ public class SettingsActivity extends AppCompatActivity {
     }
 
     private LinearLayout card() {
-        return card(content);
+        return card(content, false);
     }
 
-    /** 卡片挂到指定容器（动态列表用），样式与普通卡片一致 */
-    private LinearLayout card(ViewGroup parent) {
+    /** 卡片挂到指定容器（动态列表用）。child 仅用于父子联动登记，样式与普通卡片一致 */
+    private LinearLayout card(ViewGroup parent, boolean child) {
         LinearLayout c = new LinearLayout(this);
         c.setOrientation(LinearLayout.VERTICAL);
         c.setBackground(Ui.glass(this, 16));
@@ -571,9 +632,20 @@ public class SettingsActivity extends AppCompatActivity {
     interface IntSetter { void set(int v); }
     interface IntFormatter { String format(int v); }
 
-    private void seek(String title, final int min, final int max, final int step,
+    private View seek(String title, final int min, final int max, final int step,
                       int value, final IntSetter setter, final IntFormatter fmt) {
-        LinearLayout c = card();
+        return seekIn(content, title, min, max, step, value, setter, fmt, false);
+    }
+
+    /** 子级滑条：缩进 + 左侧亮条，视觉上属于上面那个父开关 */
+    private View seekChild(String title, final int min, final int max, final int step,
+                           int value, final IntSetter setter, final IntFormatter fmt) {
+        return seekIn(content, title, min, max, step, value, setter, fmt, true);
+    }
+
+    private View seekIn(ViewGroup parent, String title, final int min, final int max, final int step,
+                        int value, final IntSetter setter, final IntFormatter fmt, boolean child) {
+        LinearLayout c = card(parent, child);
 
         LinearLayout head = new LinearLayout(this);
         head.setOrientation(LinearLayout.HORIZONTAL);
@@ -668,6 +740,7 @@ public class SettingsActivity extends AppCompatActivity {
             @Override public void onStartTrackingTouch(SeekBar s) { }
             @Override public void onStopTrackingTouch(SeekBar s) { }
         });
+        return c;
     }
 
     private static int clamp(int v, int lo, int hi) {
@@ -676,12 +749,22 @@ public class SettingsActivity extends AppCompatActivity {
 
     interface BoolSetter { void set(boolean b); }
 
-    private void toggle(String title, boolean value, final BoolSetter l) {
-        toggleTo(content, title, value, l);
+    private Switch toggle(String title, boolean value, final BoolSetter l) {
+        return toggleIn(content, title, value, l, false);
     }
 
-    private void toggleTo(ViewGroup parent, String title, boolean value, final BoolSetter l) {
-        LinearLayout c = card(parent);
+    /** 子级开关：缩进 + 亮条 */
+    private Switch toggleChild(String title, boolean value, final BoolSetter l) {
+        return toggleIn(content, title, value, l, true);
+    }
+
+    private Switch toggleTo(ViewGroup parent, String title, boolean value, final BoolSetter l) {
+        return toggleIn(parent, title, value, l, false);
+    }
+
+    private Switch toggleIn(ViewGroup parent, String title, boolean value,
+                            final BoolSetter l, boolean child) {
+        LinearLayout c = card(parent, child);
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -695,20 +778,65 @@ public class SettingsActivity extends AppCompatActivity {
 
         Switch sw = new Switch(this);
         sw.setChecked(value);
-        sw.setOnCheckedChangeListener((btn, checked) -> l.set(checked));
+        sw.setOnCheckedChangeListener((btn, checked) -> {
+            l.set(checked);
+            // 父开关直接控制子项能不能调：关掉就整块变灰、不可点/不可拖
+            List<View> kids = childRows.get(btn);
+            if (kids != null) setRowsEnabled(kids, checked);
+        });
         row.addView(sw);
         c.addView(row);
+        return sw;
+    }
+
+    /**
+     * 登记「父开关 → 子项卡片」的关系：子项初始可用状态跟着父开关走。
+     * 设置页是一次性建好的静态页面，所以父子联动只能"就地变灰"，
+     * 不能像外观那样整页重建（那会丢掉滚动位置、也会闪一下）。
+     */
+    private void children(Switch parent, View... kids) {
+        List<View> l = new ArrayList<>();
+        java.util.Collections.addAll(l, kids);
+        childRows.put(parent, l);
+        setRowsEnabled(l, parent.isChecked());
+    }
+
+    /** 递归启用/禁用一整个卡片（SeekBar 拖不动、行不可点、文字变淡） */
+    private void setRowsEnabled(List<View> rows, boolean en) {
+        for (View r : rows) {
+            r.setAlpha(en ? 1f : 0.38f);
+            setEnabledDeep(r, en);
+        }
+    }
+
+    private void setEnabledDeep(View v, boolean en) {
+        v.setEnabled(en);
+        v.setClickable(en);
+        if (v instanceof SeekBar) ((SeekBar) v).setEnabled(en);
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) setEnabledDeep(g.getChildAt(i), en);
+        }
     }
 
     interface Action { void run(); }
 
-    private void action(String title, final Action a) {
-        actionTo(content, title, a);
+    private View action(String title, final Action a) {
+        return actionIn(content, title, a, false);
+    }
+
+    /** 子级行（缩进 + 亮条） */
+    private View actionChild(String title, final Action a) {
+        return actionIn(content, title, a, true);
     }
 
     /** 指定挂到哪个容器：动态重建的内容必须落在自己的盒子里，否则会越点越多 */
-    private void actionTo(ViewGroup parent, String title, final Action a) {
-        LinearLayout c = card(parent);
+    private View actionTo(ViewGroup parent, String title, final Action a) {
+        return actionIn(parent, title, a, false);
+    }
+
+    private View actionIn(ViewGroup parent, String title, final Action a, boolean child) {
+        LinearLayout c = card(parent, child);
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -728,20 +856,51 @@ public class SettingsActivity extends AppCompatActivity {
 
         c.addView(row);
         c.setOnClickListener(v -> a.run());
+        return c;
     }
 
     // ------------------------------------------------------------ 深浅色模式
 
     /** Dock 左区已放的图标名（设置页回显用） */
     private String dockLeftNames() {
-        List<String> l = Prefs.getDockLeft(this);
-        if (l.isEmpty()) return "（空，点桌面左区「＋」添加）";
+        return namesOf(Prefs.getDockLeft(this));
+    }
+
+    /** Dock 右区已放的图标名 */
+    private String dockRightNames() {
+        return namesOf(Prefs.getDockRightIcons(this));
+    }
+
+    private String namesOf(List<String> l) {
+        if (l.isEmpty()) return "（空，点桌面功能区「＋」添加）";
         StringBuilder b = new StringBuilder();
         for (String p : l) {
             if (b.length() > 0) b.append(" / ");
             b.append(AppListAdapter.shortcutLabel(p));
         }
+        if (l.size() >= Prefs.PANEL_SHORTCUT_MAX) b.append("（已满 ").append(Prefs.PANEL_SHORTCUT_MAX).append(" 个）");
         return b.toString();
+    }
+
+    /** 功能区内容类型文案 */
+    private static String panelLabel(int type) {
+        return type == Prefs.PANEL_CLOCK ? "时间 + 天气" : "快捷功能（图标）";
+    }
+
+    /** 选一侧功能区的内容：快捷功能（最多 5 个图标）或 时间 + 天气 */
+    private void pickPanelType(final boolean left) {
+        final int cur = left ? Prefs.getDockLeftType(this) : Prefs.getDockRightType(this);
+        GlassMenu.show(this, (left ? "左端" : "右端") + "功能区内容",
+                new CharSequence[]{"快捷功能（最多 " + Prefs.PANEL_SHORTCUT_MAX + " 个图标）",
+                        "时间 + 天气"},
+                which -> {
+                    int t = which == 1 ? Prefs.PANEL_CLOCK : Prefs.PANEL_SHORTCUT;
+                    if (left) Prefs.setDockLeftType(this, t);
+                    else Prefs.setDockRightType(this, t);
+                    // 本页的行标题是建行时写死的，改完重建整页最省事（滚动位置会被还原）
+                    if (scrollView != null) pendingScrollY = scrollView.getScrollY();
+                    recreate();
+                });
     }
 
     /** 屏内渲染分辨率档位标签 */

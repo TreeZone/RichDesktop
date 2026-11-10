@@ -122,7 +122,7 @@ public class PipPane {
                 surfaceH = h;
                 android.graphics.SurfaceTexture st = texture.getSurfaceTexture();
                 if (st != null) st.setDefaultBufferSize(buf(w), buf(h));
-                if (vd != null && !resizeDisplay(buf(w), buf(h), dpi)) scheduleRecreate();
+                if (vd != null && !resizeDisplay(buf(w), buf(h), density())) scheduleRecreate();
             }
         });
 
@@ -167,7 +167,7 @@ public class PipPane {
                     // 旋转/分屏：优先原地 resize（等价于设备旋转，应用收到 config change），
                     // 销毁重建会让屏内应用掉到手机主屏上（不 resize 时才有这个兜底）
                     if (vd != null && (buf(w) != displayW || buf(h) != displayH)
-                            && !resizeDisplay(buf(w), buf(h), dpi)) {
+                            && !resizeDisplay(buf(w), buf(h), density())) {
                         scheduleRecreate();
                     }
                 }
@@ -216,12 +216,31 @@ public class PipPane {
     public void setDpi(int dpi) {
         if (this.dpi == dpi) return;
         this.dpi = dpi;
-        if (vd != null && !resizeDisplay(buf(surfaceW), buf(surfaceH), dpi)) scheduleRecreate();
+        // 改 dpi = 改密度配置：HyperOS 上原地 resize 不会让屏内应用重新测量，
+        // 窗口会停在旧像素尺寸上（画面缩到左上角），所以一律重建虚拟屏。
+        if (vd != null) {
+            scheduleRecreate();
+        }
     }
 
     /** 面板像素 → 虚拟屏/纹理 buffer 像素（乘渲染比例，最小 1） */
     private int buf(int viewPx) {
         return Math.max(1, Math.round(viewPx * renderScale));
+    }
+
+    /**
+     * 虚拟屏密度（dpi）也按渲染比例一起缩。
+     *
+     * 只缩小像素、不缩 dpi 的后果：屏内应用看到的「dp 尺寸」跟着变小 —— 同一个界面
+     * 在 75% 下只剩 3/4 的逻辑宽度，应用要么挤成小窗、要么直接换一套窄屏布局，
+     * 表现就是「画面等比缩小」而不是「全屏但糊一点」。
+     *
+     * 像素和 dpi 同比例缩，逻辑尺寸（dp）就与 100% 完全一致：布局/字号/控件位置
+     * 一模一样，只是实际渲染的像素少了 25%，再由 TextureView 放大铺满整个面板 ——
+     * 这才是「全屏 + 分辨率降低」。
+     */
+    private int density() {
+        return Math.max(72, Math.round(dpi * renderScale));
     }
 
     /**
@@ -235,9 +254,10 @@ public class PipPane {
         renderScale = s;
         Log.i(TAG, "pane " + index + " renderScale=" + renderScale);
         if (vd == null || surfaceW <= 0 || surfaceH <= 0) return;
-        SurfaceTexture st = texture.getSurfaceTexture();
-        if (st != null) st.setDefaultBufferSize(buf(surfaceW), buf(surfaceH));
-        if (!resizeDisplay(buf(surfaceW), buf(surfaceH), dpi)) scheduleRecreate();
+        // 像素和 dpi 同时变：原地 resize 实测在这台车机上会让屏内应用卡在旧尺寸
+        // （只在左上角画自己那块，看起来就是「画面等比变小」）。重建虚拟屏才行，
+        // 应用会被重新拉起（这一项本来也是「性能设置」，改一次就够）。
+        scheduleRecreate();
     }
 
     /**
@@ -269,7 +289,7 @@ public class PipPane {
         surfaceH = h;
         SurfaceTexture st = texture.getSurfaceTexture();
         if (st != null) st.setDefaultBufferSize(buf(w), buf(h));
-        if (vd != null && !resizeDisplay(buf(w), buf(h), dpi)) scheduleRecreate();
+        if (vd != null && !resizeDisplay(buf(w), buf(h), density())) scheduleRecreate();
     }
 
     /**
@@ -616,11 +636,11 @@ public class PipPane {
         int baseFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
                 | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
         try {
-            vd = dm.createVirtualDisplay("PipDesk-" + index, w, h, dpi, surface, baseFlags | FLAG_TRUSTED);
+            vd = dm.createVirtualDisplay("PipDesk-" + index, w, h, density(), surface, baseFlags | FLAG_TRUSTED);
         } catch (Throwable t1) {
             Log.w(TAG, "trusted display 失败，退回普通屏", t1);
             try {
-                vd = dm.createVirtualDisplay("PipDesk-" + index, w, h, dpi, surface, baseFlags);
+                vd = dm.createVirtualDisplay("PipDesk-" + index, w, h, density(), surface, baseFlags);
             } catch (Throwable t2) {
                 Log.w(TAG, "createVirtualDisplay 失败", t2);
                 vd = null;

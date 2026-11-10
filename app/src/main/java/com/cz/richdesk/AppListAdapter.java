@@ -72,6 +72,27 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
     private ItemTouchHelper dragHelper;
     /** 本次拖动是否真的交换过位置：松手时用来区分「拖动」和「原地长按」 */
     private boolean dragMoved;
+    /**
+     * 快捷区的显示顺序（含「桌面设置」共 9 项，pkg 列表）。
+     * 默认按 SHORTCUT_PKGS 固定顺序；应用列表里长按拖动可改（宿主持久化）。
+     */
+    private List<String> shortcutOrder = null;
+
+    /** 宿主（MainActivity）在 setAdapter 前把持久化的顺序塞进来 */
+    public void setShortcutOrder(List<String> order) {
+        if (order != null && order.size() == SHORTCUT_PKGS.length + 1) {
+            shortcutOrder = new ArrayList<>(order);
+        }
+    }
+
+    /** slot（0..8）→ 伪包名：按可配置顺序取，配置缺失时退回固定顺序 */
+    private String shortcutPkgAt(int slot) {
+        if (shortcutOrder != null && slot >= 0 && slot < shortcutOrder.size()) {
+            return shortcutOrder.get(slot);
+        }
+        if (slot <= 0) return AppInfo.SETTINGS_PKG;
+        return SHORTCUT_PKGS[slot - 1];
+    }
 
     public AppListAdapter(List<AppInfo> data, Host host, boolean withSettings, int iconDp) {
         this(data, host, withSettings, iconDp, true);
@@ -87,6 +108,8 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
     }
 
     public interface FullHost extends Host {
+        /** 应用列表快捷区拖动排序结束：宿主持久化新顺序 */
+        default void onShortcutOrderChanged(java.util.List<String> order) { }
         void onThemeToggle();
         /** 长按「深浅模式」图标（可以把它放进 Dock） */
         void onThemeLongClick();
@@ -294,7 +317,7 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
     /** 快捷方式格子：slot 0 = 桌面设置，1..4 = SHORTCUT_PKGS —— 五个走同一套点击/长按 */
     private void bindShortcut(AppVH vh, int slot) {
         applyIconSize(vh);
-        final String pkg = slot <= 0 ? AppInfo.SETTINGS_PKG : SHORTCUT_PKGS[slot - 1];
+        final String pkg = shortcutPkgAt(slot);
         vh.ivIcon.setImageDrawable(shortcutIcon(pkg));
         vh.tvLabel.setText(shortcutLabel(pkg));
         vh.itemView.setOnClickListener(v -> {
@@ -339,8 +362,7 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
             @Override
             public int getMovementFlags(@NonNull RecyclerView rvc, @NonNull RecyclerView.ViewHolder vh) {
                 int pos = vh.getBindingAdapterPosition();
-                // 快捷方式区（前 offset 个）不可拖
-                if (pos < offset() || pos >= getItemCount()) return makeMovementFlags(0, 0);
+                if (pos < 0 || pos >= getItemCount()) return makeMovementFlags(0, 0);
                 return makeMovementFlags(ItemTouchHelper.UP | ItemTouchHelper.DOWN
                         | ItemTouchHelper.LEFT | ItemTouchHelper.RIGHT, 0);
             }
@@ -350,8 +372,17 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
                                   @NonNull RecyclerView.ViewHolder a, @NonNull RecyclerView.ViewHolder b) {
                 int sc = offset();
                 int from = a.getBindingAdapterPosition(), to = b.getBindingAdapterPosition();
-                if (from < sc || to < sc || data == null
-                        || from >= getItemCount() || to >= getItemCount()) return false;
+                if (from < 0 || to < 0 || from >= getItemCount() || to >= getItemCount()) return false;
+                if (from < sc && to < sc) {
+                    // 快捷区内部换位（9 个功能图标之间）
+                    if (shortcutOrder == null) return false;
+                    String tmp = shortcutOrder.set(from, shortcutOrder.get(to));
+                    shortcutOrder.set(to, tmp);
+                    notifyItemMoved(from, to);
+                    dragMoved = true;
+                    return true;
+                }
+                if (from < sc || to < sc || data == null) return false;   // 不跨区拖
                 data.add(to - sc, data.remove(from - sc));
                 notifyItemMoved(from, to);
                 dragMoved = true;
@@ -386,13 +417,23 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
                 int pos = vh.getBindingAdapterPosition();
                 int idx = pos - offset();
                 if (moved) {
-                    if (data != null && idx >= 0 && idx < data.size()) {
+                    if (idx < offset()) {
+                        // 快捷区拖动结束 → 存新顺序
+                        if (shortcutOrder != null && host instanceof FullHost) {
+                            ((FullHost) host).onShortcutOrderChanged(new ArrayList<>(shortcutOrder));
+                        }
+                    } else if (data != null && idx >= 0 && idx < data.size()) {
                         host.onAppOrderChanged(new ArrayList<>(data));
                     }
                     return;
                 }
                 // 没拖动 = 长按原地松手 → 弹原来的长按菜单
-                if (data != null && idx >= 0 && idx < data.size()) host.onAppLongClick(data.get(idx));
+                if (idx < offset()) {
+                    String pkg = shortcutPkgAt(idx);
+                    if (host instanceof FullHost) ((FullHost) host).onShortcutLongClick(pkg);
+                } else if (data != null && idx >= 0 && idx < data.size()) {
+                    host.onAppLongClick(data.get(idx));
+                }
             }
         };
         dragHelper = new ItemTouchHelper(cb);
