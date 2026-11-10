@@ -1171,6 +1171,8 @@ public class SettingsActivity extends AppCompatActivity {
     private void applyThemeMode(int mode) {
         if (mode == Prefs.getThemeMode(this)) return;
         Prefs.setThemeMode(this, mode);
+        // 用户在设置里明确选了外观模式 → 桌面图标点出来的「临时深浅色」立刻作废
+        Ui.clearTransientDark();
         Ui.updateAppearance(this);
         // 手动/定时模式：把结果同步给系统夜间模式，画中画里的应用才会跟着变深/变浅
         if (mode != Prefs.THEME_AUTO) Ui.applySystemNightMode(this, Ui.dark);

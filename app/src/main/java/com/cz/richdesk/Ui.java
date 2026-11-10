@@ -105,6 +105,37 @@ public class Ui {
     // ------------------------------------------------------------ 深浅色外观
 
     /**
+     * 桌面「深浅模式」图标点出来的**临时**外观：只在本次进程内有效，不写配置。
+     *
+     * 需求：点图标只是"现在就切一下"，不许改设置里的外观模式。所以：
+     *  - 不落盘 → 重启桌面/重启机器后自然回到设置里的模式；
+     *  - 记一个基线 {@link #transientBaseAuto}（点下去那一刻"本该是什么"），
+     *    之后每次自动判定（跟随时间的到点、系统夜间模式变化、壁纸变化）都重算一遍，
+     *    一旦结果跟基线不同 = 自动触发该换色了 → 临时值作废，按自动结果走。
+     */
+    private static volatile Boolean transientDark;
+    private static volatile boolean transientBaseAuto;
+    private static volatile boolean transientBaseValid;
+
+    /** 点「深浅模式」图标：临时切到 target，不碰 Prefs */
+    public static void setTransientDark(Context c, boolean target) {
+        transientBaseAuto = computeAutoDark(c);
+        transientBaseValid = true;
+        transientDark = target;
+        dark = target;
+    }
+
+    /** 临时外观作废（用户在设置里明确选了外观模式 / 系统层面真的变了） */
+    public static void clearTransientDark() {
+        transientDark = null;
+        transientBaseValid = false;
+    }
+
+    public static boolean hasTransientDark() {
+        return transientDark != null;
+    }
+
+    /**
      * 计算当前外观：
      *  - 手动深色/浅色：直接用用户选择；
      *  - 跟随时间：入夜区间内深色（固定时段，或联网日落/日出）；
@@ -113,26 +144,38 @@ public class Ui {
      * 壁纸亮度在后台算一次并缓存，壁纸变化时调 invalidateWallpaper()。
      */
     public static void updateAppearance(Context c) {
+        boolean auto = computeAutoDark(c);
+        Boolean t = transientDark;
+        if (t != null) {
+            // 自动判定的结果跟"临时切换时"不一样了 → 自动触发该生效，临时值作废
+            if (!transientBaseValid || auto != transientBaseAuto) {
+                clearTransientDark();
+            } else {
+                dark = t;
+                return;
+            }
+        }
+        dark = auto;
+    }
+
+    /** 按设置算出「本该是什么外观」，不含临时切换。会顺带触发壁纸亮度后台重算 */
+    private static boolean computeAutoDark(Context c) {
         int mode = Prefs.getThemeMode(c);
         if (mode == Prefs.THEME_DARK) {
-            dark = true;
-            return;
+            return true;
         }
         if (mode == Prefs.THEME_LIGHT) {
-            dark = false;
-            return;
+            return false;
         }
         if (mode == Prefs.THEME_TIME) {
-            dark = SunTimes.isDarkNow(c);
-            return;
+            return SunTimes.isDarkNow(c);
         }
         // auto：先看系统深色模式（Android 10+ 的夜间模式）
         try {
             Configuration conf = c.getResources().getConfiguration();
             if ((conf.uiMode & Configuration.UI_MODE_NIGHT_MASK)
                     == Configuration.UI_MODE_NIGHT_YES) {
-                dark = true;
-                return;
+                return true;
             }
         } catch (Throwable ignored) { }
         // 系统没开深色 → 按壁纸亮度。
@@ -140,13 +183,10 @@ public class Ui {
         // 绝不在调用线程（onCreate / TIME_TICK 都是主线程）同步解码整张壁纸 ——
         // 那是启动卡顿和 ANR 的老根因。
         Boolean cached = wallpaperDarkCache;
-        if (cached != null) {
-            dark = cached;
-        } else {
-            Boolean last = lastKnownWallpaperDark;
-            dark = last != null ? last : true;
-            requestWallpaperRecheck(c);
-        }
+        if (cached != null) return cached;
+        Boolean last = lastKnownWallpaperDark;
+        requestWallpaperRecheck(c);
+        return last != null ? last : true;
     }
 
     /** 后台重算壁纸亮度（去重：已有重算在跑就不重复起）；完成后回调主线程 */

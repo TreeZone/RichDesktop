@@ -72,6 +72,14 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
     private final List<String> dockPkgs = new ArrayList<>();
     private List<AppInfo> appList;
+    /**
+     * 全部已安装应用（包名 → AppInfo），**与列表分区无关**。
+     *
+     * appList 只含「应用区」里的应用 —— 用户把某个 app 拖进快捷区后它就不在 appList 里了。
+     * Dock 找图标如果只看 appList，那个 app 的 Dock 图标就会退化成系统默认图标
+     * （用户反馈：改过位置后重启桌面 / 切深浅色，Dock 图标全变成默认图标）。
+     */
+    private final java.util.Map<String, AppInfo> allApps = new java.util.HashMap<>();
     private DockAdapter dockAdapter;
     private AppListAdapter appListAdapter;
     private android.app.Dialog pickerDialog;
@@ -361,6 +369,19 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             final int which = dbgIntent.getIntExtra("debug_page", 0);
             dbgIntent.removeExtra("debug_page");
             root.postDelayed(() -> pager.setCurrentPage(which), 900);
+        }
+
+        // 调试钩子：无手指时直接在画中画里开一个应用，验证虚拟屏链路
+        //   --es debug_open <包名> [--ei debug_open_pane 0]
+        if (dbgIntent != null && dbgIntent.hasExtra("debug_open")) {
+            final String pkg = dbgIntent.getStringExtra("debug_open");
+            final int pane = dbgIntent.getIntExtra("debug_open_pane", 0);
+            dbgIntent.removeExtra("debug_open");
+            dbgIntent.removeExtra("debug_open_pane");
+            root.postDelayed(() -> {
+                Log.i("PipDesk", "debug_open " + pkg + " pane=" + pane);
+                openPip(pkg, pane);
+            }, 1600);
         }
 
         if (!DataDirFix.ok()) {
@@ -1677,8 +1698,14 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             }
             final List<AppInfo> resF = out;
             final List<AppInfo> slottedF = slottedInfos;
+            // 全量索引：Dock 找图标用它，跟「应用区/快捷区」的分区无关
+            final java.util.Map<String, AppInfo> allF = new java.util.HashMap<>();
+            for (AppInfo a : res) allF.put(a.pkg, a);
+            for (AppInfo a : slottedInfos) allF.put(a.pkg, a);
             runOnUiThread(() -> {
                 appList = resF;
+                allApps.clear();
+                allApps.putAll(allF);
                 if (appListAdapter != null) {
                     appListAdapter.setData(appList);
                     for (AppInfo a : slottedF) appListAdapter.rememberApp(a);
@@ -1782,9 +1809,13 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             return icon == null ? null
                     : new AppInfo(AppListAdapter.shortcutLabel(pkg), pkg, icon);
         }
-        if (appList == null || pkg == null) return null;
-        for (AppInfo a : appList) if (a.pkg.equals(pkg)) return a;
-        return null;
+        if (pkg == null) return null;
+        if (appList != null) {
+            for (AppInfo a : appList) if (pkg.equals(a.pkg)) return a;
+        }
+        // 兜底：全量索引。应用被拖进快捷区后就不在 appList 里了，
+        // 但它在 Dock 上的图标还得画得出来（否则退化成系统默认图标）
+        return allApps.get(pkg);
     }
 
     @Override
@@ -1998,17 +2029,20 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     }
 
     /**
-     * 应用列表里的「深浅模式」图标：点一下立刻在深色/浅色之间切换。
-     * 切换即锁定为手动模式（原来的「跟随安卓 / 跟随时间」被覆盖，可在设置页改回）。
+     * 应用列表 / Dock 里的「深浅模式」图标：点一下**临时**在深色/浅色之间切换。
+     *
+     * 需求：不许改设置里的外观模式。所以这里只改内存里的 Ui.dark（Ui.setTransientDark），
+     * 一个字都不写 Prefs —— 重启桌面 / 重启机器后仍是设置里的模式；
+     * 跟随时间到点、系统夜间模式变化、壁纸变化这些"自动触发"发生时，
+     * Ui.updateAppearance 会重算并丢掉这个临时值，按真实情况走。
      */
     @Override
     public void onThemeToggle() {
         boolean toDark = !Ui.dark;
-        Prefs.setThemeMode(this, toDark ? Prefs.THEME_DARK : Prefs.THEME_LIGHT);
-        Ui.updateAppearance(this);
-        syncSystemNightMode(Ui.dark);   // 屏内应用（虚拟屏）跟着系统一起变
+        Ui.setTransientDark(this, toDark);   // 临时外观：不落盘
+        syncSystemNightMode(Ui.dark);        // 屏内应用（虚拟屏）跟着系统一起变
         refreshAppearance();
-        toast(toDark ? "已切换到深色模式" : "已切换到浅色模式");
+        toast(toDark ? "已临时切换到深色模式" : "已临时切换到浅色模式");
     }
 
     /** 长按「深浅模式」图标：切换 / 放进 Dock（放进 Dock 后桌面上就直接点得着） */
@@ -2075,6 +2109,9 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     private void restartLauncher() {
         toast("正在重启桌面…");
         pendingToFront = true;
+        // 「重启桌面」= 回到设置里的外观模式：丢掉图标点出来的临时深浅色。
+        // 这里是 recreate()，进程没死，光靠静态字段不会自己失效 —— 必须显式清。
+        Ui.clearTransientDark();
         recreate();
     }
 

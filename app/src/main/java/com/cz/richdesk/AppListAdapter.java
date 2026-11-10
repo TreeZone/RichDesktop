@@ -390,12 +390,42 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         vh.ivIcon.setImageDrawable(ai.icon);
         applyIconSize(vh);
         vh.tvLabel.setText(ai.label);
-        vh.itemView.setOnClickListener(v -> host.onAppClick(ai));
+        bindAppActions(vh, ai);
+    }
+
+    /**
+     * 应用区格子的点击 / 长按。
+     *
+     * 关键：跨区互换后，应用区里可能躺着一个**内置功能图标**（桌面设置 / 深浅模式 /
+     * 重启桌面 / 返回 / 主页 / 息屏 / 最近任务 / 音量±）。这种格子虽然排在应用区，
+     * 行为必须还是内置那套（点=执行，长按=执行一次 / 放 Dock），
+     * 不能退化成本来给真实应用的「画中画打开 / 全屏打开 / 指定画中画位置 / 绑定到 Dock」
+     * —— 之前只按位置判断，换位后就变成普通应用的菜单了（用户反馈的 bug）。
+     */
+    private void bindAppActions(AppVH vh, final AppInfo ai) {
+        // 只有桌面应用页（withSettings=true，快捷区独立成格子）才需要区分：
+        // 「选应用」弹窗里 withSettings=false，内置图标本身就是普通可选条目，
+        // 点击必须走 onAppClick → onPick，不能变成"执行一次"。
+        final boolean builtin = withSettings && AppInfo.isBuiltin(ai.pkg);
+        vh.itemView.setOnClickListener(v -> {
+            if (builtin) {
+                if (host instanceof FullHost) ((FullHost) host).onShortcutClick(ai.pkg);
+            } else {
+                host.onAppClick(ai);
+            }
+        });
         vh.itemView.setLongClickable(true);
         vh.itemView.setOnLongClickListener(v -> {
             // 长按立刻弹菜单（浮层，不抢手势）；检测到拖动就把菜单关掉继续换位
-            if (dragEnabled) onLongPress(vh);
-            else host.onAppLongClick(ai);
+            if (dragEnabled) {
+                onLongPress(vh);
+                return true;
+            }
+            if (builtin) {
+                if (host instanceof FullHost) ((FullHost) host).onShortcutLongClick(ai.pkg);
+                return true;
+            }
+            host.onAppLongClick(ai);
             return true;
         });
     }
@@ -499,7 +529,14 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
                 if (ai != null) host.onAppLongClick(ai);
             }
         } else if (data != null && idx < data.size()) {
-            host.onAppLongClick(data.get(idx));
+            AppInfo ai = data.get(idx);
+            // 应用区里也可能躺着内置功能图标（跨区互换后）：长按仍走内置菜单，
+            // 否则会弹出真实应用的那套选项（用户反馈的 bug）
+            if (withSettings && AppInfo.isBuiltin(ai.pkg)) {
+                if (host instanceof FullHost) ((FullHost) host).onShortcutLongClick(ai.pkg);
+            } else {
+                host.onAppLongClick(ai);
+            }
         }
     }
 
