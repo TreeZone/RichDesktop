@@ -38,6 +38,40 @@ public class Prefs {
         return v < lo ? lo : (v > hi ? hi : v);
     }
 
+    // ------------------------------------------------------------ 性能模式
+
+    /**
+     * 低性能模式（弱 GPU 车机用）：只把玻璃材质降级为纯色、关掉窗口背景模糊，
+     * 其余绘制 / 布局 / 触摸 / 虚拟屏逻辑与高性能模式完全一致。
+     * **默认 true（低性能）**：车机是主要部署目标，装完即省合成带宽；
+     * 想要原来的玻璃外观，在设置页关掉本开关即可（关掉后所有绘制路径与旧版本完全一致）。
+     */
+    public static boolean perfLow(Context c) {
+        return sp(c).getBoolean("perf_low", true);
+    }
+
+    public static void setPerfLow(Context c, boolean low) {
+        sp(c).edit().putBoolean("perf_low", low).apply();
+    }
+
+    // ------------------------------------------------------------ 应用列表名称
+
+    /**
+     * 应用名称是否垫一块浅色底板（黑字）。
+     *
+     * 桌面是透壁纸的，名字默认按「背后那块壁纸」自动定黑白（见 WallText）——
+     * 壁纸花、半明半暗或带细高光时仍可能糊。打开本开关后不再看壁纸：
+     * 名字底下画一块半透明白色圆角底，字固定黑色，任何壁纸上都读得清。
+     * 默认 false = 保持原来的「随壁纸自动变色」。
+     */
+    public static boolean appNamePlate(Context c) {
+        return sp(c).getBoolean("app_name_plate", false);
+    }
+
+    public static void setAppNamePlate(Context c, boolean on) {
+        sp(c).edit().putBoolean("app_name_plate", on).apply();
+    }
+
     // ------------------------------------------------------------ Dock 绑定
 
     public static List<String> getDock(Context c) {

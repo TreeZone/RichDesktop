@@ -212,6 +212,12 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     /** 深浅色外观变化：所有面板一起刷 */
     public void refreshAppearance() {
         for (PipPane p : panes) p.refreshAppearance();
+        refreshHandles();
+    }
+
+    /** 性能模式切换：分隔条在玻璃渐变 / 纯色之间重画 */
+    public void refreshHandles() {
+        if (container != null) container.refreshHandles();
     }
 
     public void setDpi(int value) {

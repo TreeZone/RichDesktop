@@ -2,44 +2,47 @@ package com.cz.richdesk;
 
 import android.content.Context;
 import android.graphics.Canvas;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.text.Layout;
 import android.widget.TextView;
 
 /**
- * 跟着「背后壁纸颜色」自动变字色的 TextView。
+ * 桌面文字：压在壁纸上的应用名 / 页面标题（overWallpaper = true），
+ * 以及弹窗里压在玻璃上的文字（overWallpaper = false）。
  *
- * 用户需求：应用列表里的应用名，深色/浅色模式下到底是黑字还是白字，
- * **要看壁纸那一块的实际颜色**，不能只按外观模式拍。浅色模式 + 深色壁纸时，
- * 原来的黑字直接糊在深色背景上，看不见。
+ * 字色**只跟外观模式走**，不再按壁纸取样（需求 2026-11-10）：
  *
- * 取样区域取的是**文字真正绘制的那一小块**（行宽 × 行高，上下各扩 40%），
- * 而不是整个控件矩形：标签的控件宽是整格宽度，里面有大量空白甚至别的壁纸颜色，
- * 按整个格子取样会把「文字压在哪」这件事平均掉，判出来经常是错的。
+ *   浅色模式：加底板 = 白底黑字；不加底板 = 白字
+ *   深色模式：加底板 = 黑底白字；不加底板 = 黑字
  *
- * 注意：硬件加速下 View 只是平移时不会重跑 onDraw，所以滚动要靠外部调 refresh()。
+ * 弹窗（压在玻璃上）例外：字色跟玻璃底色相反 —— 浅色外观黑字、深色外观白字，
+ * 否则浅玻璃上压白字直接看不见。
+ *
+ * 底板按**文字实际占的那一行**画（行宽 × 行高外扩），不按整个控件：标签控件的宽度
+ * 是整格，整格涂底会变成一条横贯的长条，和图标完全不对齐。
  */
 public class WallText extends TextView {
 
-    /** true：按壁纸取样定色（桌面上直接压壁纸的场合）；false：按外观定色（弹窗里的浅/深玻璃上） */
+    /** true：桌面上直接压壁纸；false：弹窗里压在浅/深玻璃上 */
     private boolean overWallpaper;
 
     /** 次要文字（比如页面标题）：颜色淡一档 */
     private boolean dim;
 
-    /** true：每个文字按自己脚下那块壁纸取色；false：整页统一（默认关，桌面用 true） */
-    private boolean adaptive;
+    /** 名称底板（设置里的「应用名称背景」） */
+    private boolean plate;
+    private final Paint platePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final RectF plateRect = new RectF();
+    private float plateRadius = -1f;
 
-    /** 上次取样用的文字矩形 + 壁纸版本 + 外观，任一变化才重新算 */
-    private int lastL = Integer.MIN_VALUE, lastT, lastR, lastB;
-    private int lastVer = Integer.MIN_VALUE;
+    /** 上次用到的外观 + 是否需要重算（底板/使用场景变化时置位） */
     private boolean lastDark;
+    private boolean dirty = true;
 
-    /** 上次用的字色 / 明暗档位（-1 表示还没定过），避免重复 set 引起无谓重绘 */
+    /** 上次用的字色 / 阴影档位，避免重复 set 引起无谓重绘 */
     private int lastColor = Integer.MIN_VALUE;
     private int lastTone = -1;
-
-    /** 最近一次测到的背景相对亮度（-1 = 没有样本），调试用 */
-    private float lastLum = -1f;
 
     private final int[] box = new int[4];
     private final int[] locTmp = new int[2];
@@ -50,17 +53,25 @@ public class WallText extends TextView {
         // 行数/对齐/省略号交给调用方设置：标题要单行不省略，标签要单行省略，两者不一样
     }
 
-    /** 打开「逐行随壁纸自适应」 */
-    public void setAdaptive(boolean v) {
-        if (adaptive != v) {
-            adaptive = v;
-            invalidate();
-        }
+    /**
+     * 应用名称底板：开启后字色按深浅模式固定（白底黑字 / 黑底白字）。
+     * 必须清掉字色缓存，否则 syncColor 会因为「外观没变」直接 return，颜色不翻转。
+     */
+    public void setPlate(boolean v) {
+        if (plate == v) return;
+        plate = v;
+        dirty = true;
+        invalidate();
+    }
+
+    public boolean isPlate() {
+        return plate;
     }
 
     public void setOverWallpaper(boolean v) {
         if (overWallpaper != v) {
             overWallpaper = v;
+            dirty = true;
             invalidate();
         }
     }
@@ -68,20 +79,15 @@ public class WallText extends TextView {
     public void setDim(boolean v) {
         if (dim != v) {
             dim = v;
+            dirty = true;
             invalidate();
         }
     }
 
-    /** 最近一次测到的背景相对亮度（0~1，-1 表示无样本），排查颜色判定用 */
-    public float lastLum() {
-        return lastLum;
-    }
-
-    /** 立刻按当前位置取一次样（不等绘制），调试用 */
+    /** 调试用：按当前位置取一次壁纸亮度（0~1，-1 表示无样本） */
     public float sampleNow() {
         computeBox();
-        lastLum = WallTint.sampleRelLum(this, box[0], box[1], box[2], box[3]);
-        return lastLum;
+        return WallTint.sampleRelLum(this, box[0], box[1], box[2], box[3]);
     }
 
     /** 调试用：当前取样矩形，格式 "l,t,r,b" */
@@ -93,24 +99,44 @@ public class WallText extends TextView {
     @Override
     protected void onDraw(Canvas cv) {
         syncColor();
+        if (plate) drawPlate(cv);
         super.onDraw(cv);
     }
 
     /**
-     * 强制重新按当前位置取色。
-     *
-     * 为什么需要它：硬件加速下 View 的绘制被缓存成 RenderNode，**只是位置移动**
-     * （列表滚动）时系统直接复用缓存、根本不会再调 onDraw —— 所以「在 onDraw 里
-     * 检查位置变化」这条路在滚动时是死代码，颜色会一直停在第一次算出的值。
-     * 滚动时由宿主动手调这个方法，把缓存清掉并 invalidate，才会真正重算。
+     * 在文字实际占的那一块（行宽 × 行高，再外扩一点）画圆角底板。
      */
-    public void refresh() {
-        lastL = Integer.MIN_VALUE;
-        lastVer = Integer.MIN_VALUE;
-        invalidate();
+    private void drawPlate(Canvas cv) {
+        float l, t, r, b;
+        Layout lay = getLayout();
+        if (lay != null && lay.getLineCount() > 0) {
+            int pl = getCompoundPaddingLeft();
+            int pt = getExtendedPaddingTop();
+            l = pl + lay.getLineLeft(0);
+            r = pl + lay.getLineRight(0);
+            t = pt + lay.getLineTop(0);
+            b = pt + lay.getLineBottom(0);
+        } else {
+            l = 0; t = 0; r = getWidth(); b = getHeight();
+        }
+        float ts = getTextSize();
+        float padX = ts * 0.34f;      // 左右留白：够成一个"药丸"，又不会盖住旁边的格子
+        float padY = ts * 0.10f;
+        plateRect.set(l - padX, t - padY, r + padX, b + padY);
+        // 文字被省略号截到控件边界时，底板不能画出控件外（会被父容器裁出硬边）
+        if (plateRect.left < 0) plateRect.left = 0;
+        if (plateRect.top < 0) plateRect.top = 0;
+        if (plateRect.right > getWidth()) plateRect.right = getWidth();
+        if (plateRect.bottom > getHeight()) plateRect.bottom = getHeight();
+        if (plateRadius < 0) plateRadius = Math.max(2f, ts * 0.36f);
+        platePaint.setStyle(Paint.Style.FILL);
+        // 底板配色跟着深浅模式：深色外观 = 黑底（配白字），浅色外观 = 白底（配黑字）。
+        // 都留一点透明度，压在花壁纸上不至于像贴了张不干胶。
+        platePaint.setColor(Ui.dark ? 0xF00A0C10 : 0xF2FFFFFF);
+        cv.drawRoundRect(plateRect, plateRadius, plateRadius, platePaint);
     }
 
-    /** 算出文字实际绘制的矩形（窗口坐标），写进 box[4] */
+    /** 算出文字实际绘制的矩形（窗口坐标），写进 box[4]，调试取样用 */
     private void computeBox() {
         getLocationInWindow(locTmp);
         int x = locTmp[0], y = locTmp[1];
@@ -123,7 +149,6 @@ public class WallText extends TextView {
             r = x + pl + (int) Math.ceil(lay.getLineRight(0));
             t = y + pt + lay.getLineTop(0);
             b = y + pt + lay.getLineBottom(0);
-            // 上下各扩 40%：字形周围那圈留白也是背景，只盯笔画会被壁纸的细高光骗
             int pad = Math.max(2, (b - t) * 2 / 5);
             t -= pad;
             b += pad;
@@ -135,55 +160,54 @@ public class WallText extends TextView {
         box[3] = b;
     }
 
+    /**
+     * 定字色。四种组合全部只由「外观模式 + 底板 + 是否压壁纸」决定，
+     * 不再随位置/壁纸变化，所以只在任一项变化时重算一次。
+     */
     private void syncColor() {
-        int ver = overWallpaper ? WallTint.version() : 0;
-        if (overWallpaper) computeBox();
-        if (ver == lastVer && Ui.dark == lastDark
-                && box[0] == lastL && box[1] == lastT && box[2] == lastR && box[3] == lastB) {
-            return;
-        }
-        lastVer = ver;
+        if (!dirty && Ui.dark == lastDark) return;
+        dirty = false;
         lastDark = Ui.dark;
-        lastL = box[0];
-        lastT = box[1];
-        lastR = box[2];
-        lastB = box[3];
 
-        boolean bright;
-        if (!overWallpaper) {
-            bright = !Ui.dark;
-            lastLum = -1f;
-        } else if (adaptive) {
-            float l = WallTint.sampleRelLum(this, box[0], box[1], box[2], box[3]);
-            lastLum = l;
-            // 无样本（动态壁纸）时才退回外观
-            bright = l < 0 ? !Ui.dark : WallTint.isBrightLum(l);
+        // 是否白字：
+        //   有底板   → 深色白字 / 浅色黑字
+        //   压壁纸   → 浅色白字 / 深色黑字（需求）
+        //   压玻璃   → 深色白字 / 浅色黑字（跟玻璃底色相反，否则浅玻璃上看不见）
+        boolean white = plate ? Ui.dark : (overWallpaper ? !Ui.dark : Ui.dark);
+
+        int color, shadow, tone;
+        if (plate) {
+            // 底板本身就够对比，不要阴影（黑字压黑底/白字压白底时阴影只会发脏）
+            color = white ? 0xFFFFFFFF : 0xFF000000;
+            shadow = 0;
+            tone = white ? 2 : 3;
+        } else if (white) {
+            color = dim ? 0xCCFFFFFF : 0xF2FFFFFF;
+            // 白字的阴影要比黑字重：经常压在米色、浅蓝这类中亮背景上，
+            // 靠这层深阴影把轮廓压出来。
+            shadow = dim ? 0x99000000 : 0xCC000000;
+            tone = 0;
         } else {
-            bright = WallTint.isBrightGlobal();
-            lastLum = -1f;
-        }
-
-        int color;
-        int shadow;
-        if (bright) {
             color = dim ? 0xB3000000 : 0xE6000000;
             // 黑字配白晕：壁纸局部偏暗时也能看清（相当于一圈浅色描边）
             shadow = dim ? 0x66FFFFFF : 0x99FFFFFF;
-        } else {
-            color = dim ? 0xCCFFFFFF : 0xF2FFFFFF;
-            // 白字的阴影要比黑字重：默认给白字（见 WallTint.REL_BRIGHT），
-            // 就会经常压在米色、浅蓝这类中亮背景上，靠这层深阴影把轮廓压出来。
-            shadow = dim ? 0x99000000 : 0xCC000000;
+            tone = 1;
         }
-        // 颜色没变就不要 set：setTextColor 会再 invalidate 一次，滚动节流刷新时会白抖
-        int tone = bright ? 1 : 0;
+
+        // 颜色没变就不要 set：setTextColor 会再 invalidate 一次
         if (color != lastColor) {
             lastColor = color;
             setTextColor(color);
         }
+        // tone 唯一决定 (白/黑字 + 有无阴影)，阴影只在档位真变时重设 ——
+        // setShadowLayer 内部会 invalidate，每帧调一次等于自我刷屏。
         if (tone != lastTone) {
             lastTone = tone;
-            setShadowLayer(bright ? 3.5f : 4f, 0, 1, shadow);
+            if (shadow == 0) {
+                setShadowLayer(0, 0, 0, 0);
+            } else {
+                setShadowLayer(white ? 4f : 3.5f, 0, 1, shadow);
+            }
         }
     }
 }

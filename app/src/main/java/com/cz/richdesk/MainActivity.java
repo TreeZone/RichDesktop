@@ -93,6 +93,17 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     private int appliedDockCorner = -1, appliedDockCount = -1, appliedIconSize = -1;
     private int appliedDockIcon = -1;
     private int appliedListColumns = -1;
+    /** 当前已应用的性能模式：从设置页切回来只在这一项变化时重刷全部外观（默认低性能） */
+    private boolean appliedPerfLow = true;
+    /**
+     * 当前已应用的深浅色：设置页改「外观模式」时只改 Ui.dark 并重建设置页自己，
+     * 桌面这边返回时走 applySettings() 的增量刷新 —— 它按各配置项比对，没有一项跟
+     * Ui.dark 挂钩，于是 Dock 玻璃、画中画（虚拟桌面）玻璃底都停在旧配色。
+     * 这里存一份已应用的深浅色，变了就整块重刷。
+     */
+    private boolean appliedDark = true;
+    /** 应用列表「应用名称背景」开关的上次值：变了要重绑列表，否则名字底板不出现/不消失 */
+    private boolean appliedNamePlate = false;
     /** 当前已应用的方向（旋转后要重建画中画，但切深浅色不能重建） */
     private int appliedOrientation = Configuration.ORIENTATION_UNDEFINED;
     private boolean appliedStatusBar = true;
@@ -224,6 +235,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 全局绘制开关必须早于任何 Ui.glass / Ui.clipRounded 调用
+        Ui.syncPerfMode(this);
         instance = this;
         FileLog.start(this);       // 日志落盘（排查车机问题用），越早启动越完整
         Watchdog.start();          // 主线程卡死自动 dump 堆栈，车机上不用连 adb 也能取到现场
@@ -342,6 +355,14 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             }, 1500);
         }
 
+        // 调试钩子：没有手指（自动化截图核对）时也能翻页
+        //   --ei debug_page 1 → 直接翻到应用列表页
+        if (dbgIntent != null && dbgIntent.hasExtra("debug_page")) {
+            final int which = dbgIntent.getIntExtra("debug_page", 0);
+            dbgIntent.removeExtra("debug_page");
+            root.postDelayed(() -> pager.setCurrentPage(which), 900);
+        }
+
         if (!DataDirFix.ok()) {
             Toast.makeText(this, "配置暂时存不住：请安装权限模块后重启手机",
                     Toast.LENGTH_LONG).show();
@@ -363,6 +384,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         appliedDockIcon = Prefs.getDockIcon(this);
         appliedIconSize = Prefs.getIconSize(this);
         appliedListColumns = Prefs.getListColumns(this);
+        appliedPerfLow = Prefs.perfLow(this);
+        appliedNamePlate = Prefs.appNamePlate(this);
 
         pip = new PipManager(this, paneBox);
         pip.setListener(new PipManager.Listener() {
@@ -406,6 +429,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
         // 深浅色外观：先按手动/系统模式立即生效，壁纸亮度在后台精确算完后刷新
         Ui.updateAppearance(this);
+        appliedDark = Ui.dark;
         // 壁纸亮度后台重算完成 → 主线程回这里比对并刷新（不再在主线程等解码）
         Ui.onWallpaperRechecked = this::refreshAppearanceIfChanged;
         // 不是「跟随安卓」时，把结果反推给系统：开机后桌面和屏内应用保持一致
@@ -627,7 +651,6 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
         WallText title = new WallText(this, true);
         title.setDim(true);
-        title.setAdaptive(true);
         appListTitle = title;
         title.setText("全部应用　·　点按＝画中画　长按＝更多");
         title.setTextSize(12);
@@ -656,49 +679,13 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
         appListAdapter = new AppListAdapter(null, this, true, Prefs.getIconSize(this));
         rvApps.setAdapter(appListAdapter);
+        // 名字底板是配置项，Adapter 本身不读配置：建好后立刻按当前值同步一次
+        appListAdapter.setNamePlate(Prefs.appNamePlate(this));
         appListAdapter.setShortcutOrder(Prefs.getShortcutOrder(this));
         appListAdapter.attachDragHelper(rvApps);   // 长按拖动排序（原地松手仍是菜单）
-        // 列表滚动时 View 只是平移，硬件加速会复用绘制缓存、不重跑 onDraw，
-        // 「在 onDraw 里按位置取色」在滚动过程中等于死代码 —— 所以由宿主定期主动刷新：
-        // 滚动中每 90ms 一次（跟上手感），停下时再补一次（落在最终位置）。
-        rvApps.addOnScrollListener(new RecyclerView.OnScrollListener() {
-            private long last;
-            private int accDy;
-
-            @Override
-            public void onScrolled(RecyclerView rv, int dx, int dy) {
-                // 滚动中的刷新是滚动卡顿的老根因（每个可见标签都重取样），
-                // 节流 = 时间（≥120ms）+ 空间（累计滚过约一行高度 48px）双门槛
-                accDy += dy;
-                if (Math.abs(accDy) < 48) return;
-                long now = android.os.SystemClock.uptimeMillis();
-                if (now - last < 120) return;
-                last = now;
-                accDy = 0;
-                repaintWallText(rv);
-            }
-
-            @Override
-            public void onScrollStateChanged(RecyclerView rv, int newState) {
-                if (newState == RecyclerView.SCROLL_STATE_IDLE) {
-                    accDy = 0;
-                    repaintWallText(rv);
-                }
-            }
-        });
+        // 以前这里还挂了一个滚动监听，每 120ms 把每个可见名字重新按壁纸取色。
+        // 字色现在只跟外观模式走（与位置无关），滚动重取样纯属白烧 CPU —— 一并去掉。
         return page;
-    }
-
-    /** 递归清掉 WallText 的取色缓存，让它在下次绘制时按当前位置重新识别壁纸明暗 */
-    private void repaintWallText(View v) {
-        if (v instanceof WallText) {
-            ((WallText) v).refresh();
-            return;
-        }
-        if (v instanceof ViewGroup) {
-            ViewGroup g = (ViewGroup) v;
-            for (int i = 0; i < g.getChildCount(); i++) repaintWallText(g.getChildAt(i));
-        }
     }
 
     private boolean isLandscape() {
@@ -2122,6 +2109,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     /** 外观（深浅色）变化后，把桌面上所有玻璃和文字刷成新配色 */
     private void refreshAppearance() {
         if (rvDock == null) return;
+        appliedDark = Ui.dark;      // 这里刷完即「已应用」，避免下次回来重复整块重刷
         if (dockRow != null) dockRow.setBackground(Ui.glass(this, Prefs.getDockCorner(this)));
         if (dockLeftDiv != null) dockLeftDiv.setBackground(glassDivider());
         if (dockRightDiv != null) dockRightDiv.setBackground(glassDivider());
@@ -2134,9 +2122,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         buildDockPanel(dockRightBox, false);
         dockAdapter.notifyDataSetChanged();
         appListAdapter.notifyDataSetChanged();
-        // 文字颜色由「背后壁纸」决定 → 外观/壁纸一变，让标签重新取样
-        if (appListTitle != null) appListTitle.refresh();
-        if (rvApps != null) repaintWallText(rvApps);
+        // 名字 / 标题的字色只跟外观走：重新绑定 + invalidate 即可（WallText 自己会比对 Ui.dark）
+        if (appListTitle != null) appListTitle.invalidate();
         pip.refreshAppearance();
         applyDockSlots();
     }
@@ -2287,6 +2274,31 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
     /** 从设置页返回时的增量刷新 */
     private void applySettings() {
+        // 深浅色可能刚在设置页里改过：Ui.dark 变了就必须整块重刷外观，
+        // 否则 Dock 玻璃 / 画中画（虚拟桌面）玻璃底 / 图标底板还停在旧配色 ——
+        // 低性能模式下是纯色底，看着就是「切了深浅色但桌面没变」。
+        Ui.updateAppearance(this);
+        boolean appearanceChanged = appliedDark != Ui.dark;
+        appliedDark = Ui.dark;
+
+        // 性能模式是全局绘制开关：变了同样要重刷所有背景。
+        // 只改 View 属性，不碰虚拟屏和屏内应用。
+        boolean perfLow = Prefs.perfLow(this);
+        boolean perfChanged = perfLow != appliedPerfLow;
+        if (perfChanged) {
+            appliedPerfLow = perfLow;
+            Ui.syncPerfMode(this);
+        }
+        if (perfChanged || appearanceChanged) {
+            refreshAppearance();
+            pip.refreshHandles();              // 分隔条按新配色重画
+        }
+        // 应用名称底板：只重绑列表，不动布局/虚拟屏
+        boolean namePlate = Prefs.appNamePlate(this);
+        if (namePlate != appliedNamePlate) {
+            appliedNamePlate = namePlate;
+            appListAdapter.setNamePlate(namePlate);
+        }
         int paneCount = Prefs.getPaneCount(this);
         int dpi = Prefs.getDpi(this);
         int pipCorner = Prefs.getPipCorner(this);

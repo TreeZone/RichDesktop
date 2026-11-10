@@ -67,6 +67,10 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
      * 否则按壁纸取色会拿到弹窗外面那块壁纸的亮度，反而更糊。
      */
     private final boolean overWallpaper;
+    /** 应用名称底板（设置项「应用名称背景」）：开=垫浅白底 + 黑字，关=随壁纸自动变色 */
+    private boolean namePlate;
+    /** 应用名字号：11 在车机上偏小，12.5 兼顾「看得清」和「长名字不挤成两行」 */
+    private static final float LABEL_SP = 12.5f;
     /** 是否允许长按拖动排序（桌面应用页 = true，选择器弹窗 = false） */
     private boolean dragEnabled;
     private ItemTouchHelper dragHelper;
@@ -301,12 +305,10 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         // 看起来反而更大。现在两边都是硬性 iconDp，同 dp 必然同大小。
         cell.addView(iv, new LinearLayout.LayoutParams(px, px));
 
-        // 名字的颜色由「背后壁纸」决定（浅壁纸→黑字，深壁纸→白字），不跟外观模式走。
-        // 逐行自适应：每个名字只看自己脚底下那块壁纸，滚动时跟着变 —— 壁纸一半亮一半暗
-        // 时（比如米色在上、深绿在下）整页统一一个色号必然有一半糊掉，所以按行判。
+        // 名字颜色只跟外观模式走（浅色白字 / 深色黑字；开名称底板则白底黑字 / 黑底白字），
+        // 不再按壁纸取样 —— 取样结果会随壁纸明暗跳，用户要的是"跟模式固定"。
         WallText tv = new WallText(parent.getContext(), overWallpaper);
-        tv.setAdaptive(true);
-        tv.setTextSize(11);
+        tv.setTextSize(LABEL_SP);
         tv.setGravity(Gravity.CENTER);
         tv.setMaxLines(1);
         tv.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -345,6 +347,38 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
     @Override
     public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int position) {
         AppVH vh = (AppVH) holder;
+        bindCell(vh, position);
+        // 「应用名称背景」开关可能刚在设置页里改过：每次绑定按当前值同步一次
+        // （setPlate 幂等，值没变直接返回，不触发重绘）
+        bindNamePlate(vh.tvLabel);
+    }
+
+    /**
+     * 名称底板：只在「压在壁纸上的应用列表页」生效。
+     * 选应用弹窗里的同一个网格是压在玻璃面板上的（overWallpaper=false），那里垫白底
+     * 反而像贴纸，所以一律不加。
+     */
+    private void bindNamePlate(WallText tv) {
+        boolean on = namePlate && overWallpaper;
+        tv.setPlate(on);
+        if (on) {
+            // 底板自带留白，TextView 再留内边距会把整块底板撑宽
+            tv.setPadding(0, 0, 0, 0);
+        }
+    }
+
+    /** 设置页切换「应用名称背景」后由宿主调用 */
+    public void setNamePlate(boolean on) {
+        if (namePlate == on) return;
+        namePlate = on;
+        notifyDataSetChanged();
+    }
+
+    public boolean isNamePlate() {
+        return namePlate;
+    }
+
+    private void bindCell(AppVH vh, int position) {
         // 前 5 个快捷图标：桌面设置 / 深浅模式 / 重启桌面 / 返回 / 主页 —— 和普通应用一模一样的格子
         if (withSettings && position < offset()) {
             bindShortcut(vh, position);
@@ -422,13 +456,14 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
 
     static class AppVH extends RecyclerView.ViewHolder {
         final ImageView ivIcon;
-        final TextView tvLabel;
+        /** 名字是 WallText（随壁纸自动变色的 TextView）；底板模式也由它自己画 */
+        final WallText tvLabel;
 
         AppVH(View v) {
             super(v);
             LinearLayout ll = (LinearLayout) v;
             ivIcon = (ImageView) ll.getChildAt(0);
-            tvLabel = (TextView) ll.getChildAt(1);
+            tvLabel = (WallText) ll.getChildAt(1);
         }
     }
 

@@ -69,11 +69,20 @@ public class Brightness {
 
     /**
      * 自动模式开着才生效。调用方：桌面 onResume、15s 定时器、设置页改完立即预览。
-     * 写系统设置是轻量 binder 调用，可以直接在主线程做；背光节点那条走异步 shell。
+     *
+     * 主线程只做一次配置判断就返回：目标值计算 + Settings.System 读写 +
+     * SurfaceControl 反射调用全部丢到单线程后台。这几步都是同步 binder，
+     * 弱 CPU 车机上一次能占掉十几毫秒，正好落在 15s 定时器的那一帧上。
+     * 写入时序与通道行为完全不变（仍是每 15s 重压一次三条通道）。
      */
     public static void applyIfAuto(Context c) {
         if (c == null || !Prefs.brightAuto(c)) return;
-        apply(c, target(c));
+        final Context app = c.getApplicationContext();
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            bg().post(() -> apply(app, target(app)));
+        } else {
+            apply(app, target(app));
+        }
     }
 
     public static void apply(Context c, int value) {
@@ -189,8 +198,9 @@ public class Brightness {
     private static Method mSetBrightness;
     private static Object displayToken;
 
-    /** SurfaceControl.setDisplayBrightness(token, 0~1)：绕过 framework 的亮度策略 */
-    private static boolean setDisplayBrightness(float p) {
+    /** SurfaceControl.setDisplayBrightness(token, 0~1)：绕过 framework 的亮度策略
+     *  synchronized：反射结果由后台线程和「通道测试」主线程共用，避免并发初始化 */
+    private static synchronized boolean setDisplayBrightness(float p) {
         try {
             Class<?> sc = Class.forName("android.view.SurfaceControl");
             if (displayToken == null) {
@@ -302,10 +312,31 @@ public class Brightness {
             new android.os.Handler(android.os.Looper.getMainLooper());
     private static Runnable pendingBacklight;
 
-    private static String lastLogged = "";
-    private static String lastReport = "";
-    private static int lastSysfsValue = -1;
-    private static int maxCache = 0;
+    /** 亮度写入专用后台线程：懒启动，只有开了自动亮度才会创建 */
+    private static volatile android.os.Handler bgHandler;
+
+    private static android.os.Handler bg() {
+        android.os.Handler h = bgHandler;
+        if (h == null) {
+            synchronized (Brightness.class) {
+                h = bgHandler;
+                if (h == null) {
+                    android.os.HandlerThread t =
+                            new android.os.HandlerThread("pipdesk-brightness");
+                    t.start();
+                    h = new android.os.Handler(t.getLooper());
+                    bgHandler = h;
+                }
+            }
+        }
+        return h;
+    }
+
+    // 现在由后台线程写、设置页主线程读（describe / diagnose），volatile 保证可见
+    private static volatile String lastLogged = "";
+    private static volatile String lastReport = "";
+    private static volatile int lastSysfsValue = -1;
+    private static volatile int maxCache = 0;
 
     /**
      * 关掉总开关时把亮度控制权还给系统：原来自动就恢复自动，原来手动就恢复原数值。

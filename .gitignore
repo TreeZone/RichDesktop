@@ -29,3 +29,6 @@ local.properties
 # 系统
 .DS_Store
 Thumbs.db
+
+# 助手工作目录（本地记忆/调试产物）
+.workbuddy/

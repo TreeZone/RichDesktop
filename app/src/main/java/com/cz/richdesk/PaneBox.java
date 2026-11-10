@@ -188,6 +188,11 @@ public class PaneBox extends FrameLayout {
         }
     }
 
+    /** 性能模式切换后让分隔条按新配色重画（Handle.onDraw 每次都读 Ui.isLowPerf()） */
+    public void refreshHandles() {
+        for (Handle h : handles) h.invalidate();
+    }
+
     // ------------------------------------------------------------ 拖动条
 
     private void syncHandles() {

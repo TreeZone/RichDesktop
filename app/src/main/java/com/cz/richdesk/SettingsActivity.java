@@ -36,6 +36,8 @@ import java.util.List;
 public class SettingsActivity extends AppCompatActivity {
 
     private LinearLayout content;
+    /** 整页根容器：低性能开关切换时要就地换掉罩层（不等重建） */
+    private FrameLayout root;
     /** 进入页面时的外观，返回/回来时对比，变了就重建（设置页没有虚拟屏，重建无副作用） */
     private boolean createdDark;
     /** 测试功能页：带 test_page Intent 打开本类，只渲染实验性内容（亮度等），稳定后并回主页 */
@@ -55,9 +57,17 @@ public class SettingsActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         FileLog.start(this);   // 设置页也可能被单独拉起，日志入口保持幂等
+        Ui.syncPerfMode(this);   // 全局绘制开关：早于所有卡片 / 罩层创建
         Ui.updateAppearance(this);
         createdDark = Ui.dark;
         testPage = getIntent() != null && getIntent().getBooleanExtra("test_page", false);
+        // 调试钩子（无手指自动化截图核对用，与 debug_set_theme 同一思路）：
+        //   --ez debug_name_plate true → 打开「应用名称背景」开关
+        // 必须在建页面之前处理，否则开关的初始状态还是旧值。
+        if (getIntent() != null && getIntent().hasExtra("debug_name_plate")) {
+            Prefs.setAppNamePlate(this, getIntent().getBooleanExtra("debug_name_plate", false));
+            getIntent().removeExtra("debug_name_plate");
+        }
         androidx.appcompat.app.ActionBar bar = getSupportActionBar();
         if (bar != null) bar.hide();
 
@@ -73,16 +83,11 @@ public class SettingsActivity extends AppCompatActivity {
         }
 
         FrameLayout root = new FrameLayout(this);
+        this.root = root;
 
         // 玻璃罩：只压暗/提亮一点点，模糊负责质感（模糊不可用时这一层保证文字可读）
-        GradientDrawable scrim = new GradientDrawable(
-                GradientDrawable.Orientation.TL_BR,
-                Ui.dark ? new int[]{Ui.canBlur() ? 0x59070B12 : 0xA6070B12,
-                        Ui.canBlur() ? 0x40070B12 : 0x8C070B12}
-                        : new int[]{Ui.canBlur() ? 0x8CFFFFFF : 0xCFFFFFFF,
-                        Ui.canBlur() ? 0x73F2F5FA : 0xBFEDF1F8});
-        root.setBackground(scrim);
-        // Android 12+ 才真正模糊（安卓 9~11 内部直接跳过）
+        root.setBackground(buildScrim());
+        // Android 12+ 才真正模糊（低性能模式 / 安卓 9~11 内部直接跳过）
         Ui.blurWindow(getWindow(), 40);
 
         final ScrollView sv = new ScrollView(this);
@@ -187,6 +192,18 @@ public class SettingsActivity extends AppCompatActivity {
                 dbg.removeExtra("debug_scroll_y");
                 content.postDelayed(() -> sv.scrollTo(0, y), 450);
             }
+            // 性能模式开关自测：--ez debug_perf_low true
+            // 走的是开关监听里同一套逻辑（同步静态开关 → 当场换罩层/清模糊 → 重建）
+            if (dbg.hasExtra("debug_perf_low")) {
+                final boolean v = dbg.getBooleanExtra("debug_perf_low", true);
+                dbg.removeExtra("debug_perf_low");
+                content.postDelayed(() -> {
+                    Prefs.setPerfLow(this, v);
+                    Ui.syncPerfMode(this);
+                    applyPerfModeNow();
+                    content.postDelayed(this::recreateKeepScroll, 160);
+                }, 800);
+            }
             // 两侧功能区自测：--ei debug_dockleft 1 --ei debug_lefttype 1（1=时间天气 0=快捷图标）
             if (dbg.hasExtra("debug_dockleft")) {
                 Prefs.setDockLeftEnabled(this, dbg.getIntExtra("debug_dockleft", 0) == 1);
@@ -249,6 +266,18 @@ public class SettingsActivity extends AppCompatActivity {
                 b -> Prefs.setShowStatusBar(this, b));
 
         section("外观");
+        toggle("低性能模式（纯色显示）", Prefs.perfLow(this), b -> {
+            Prefs.setPerfLow(this, b);
+            Ui.syncPerfMode(this);
+            // 先当场把模糊 / 罩层换掉（不依赖重建），再重建一次换掉所有卡片背景。
+            // 只靠重建的话，窗口背景模糊经常要等下次进页面才真正消失。
+            applyPerfModeNow();
+            content.postDelayed(this::recreateKeepScroll, 160);
+        });
+        // 应用列表里的名字默认按「背后壁纸」自动取黑白；壁纸花的时候仍会糊，
+        // 打开这个开关就改成「垫一块浅白底 + 黑字」，不再看壁纸。
+        toggle("应用名称背景", Prefs.appNamePlate(this),
+                b -> Prefs.setAppNamePlate(this, b));
         themeBox = new LinearLayout(this);
         themeBox.setOrientation(LinearLayout.VERTICAL);
         content.addView(themeBox);
@@ -1161,6 +1190,54 @@ public class SettingsActivity extends AppCompatActivity {
     private void recreateKeepScroll() {
         if (scrollView != null) pendingScrollY = scrollView.getScrollY();
         recreate();
+    }
+
+    /**
+     * 整页罩层：深色 = 压暗，浅色 = 提亮。
+     * 能模糊时可以让它更透（质感交给模糊）；不能模糊（低性能模式 / 安卓 9~11）时
+     * 改成接近不透明的纯色 —— 低性能模式要的是「纯色、不糊」，不能又透又糊。
+     */
+    private GradientDrawable buildScrim() {
+        boolean blur = Ui.canBlur();
+        if (blur) {
+            return new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                    Ui.dark ? new int[]{0x59070B12, 0x40070B12}
+                            : new int[]{0x8CFFFFFF, 0x73F2F5FA});
+        }
+        return new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                Ui.dark ? new int[]{0xE60A0E15, 0xD8121722}
+                        : new int[]{0xF8E9EEF6, 0xF2E1E7F0});
+    }
+
+    /**
+     * 低性能开关：**当场**生效，不等 Activity 重建。
+     *
+     * 为什么必须这样：窗口背景模糊（setBackgroundBlurRadius）是挂在 Window 上的，
+     * 重建 Activity 时窗口里的模糊不一定按新值刷掉 —— 用户看到的就是「从高性能切到
+     * 低性能后背景还在糊，得退出设置页重进才变成纯色」。这里直接对当前窗口重写一遍
+     * 半径（低性能 = 0），顺手清掉 FLAG_BLUR_BEHIND 与 blurBehindRadius，再把罩层
+     * 换成不透明版本。卡片背景（玻璃 / 纯色）由随后的 recreate 一次性换掉。
+     */
+    private void applyPerfModeNow() {
+        if (root != null) root.setBackground(buildScrim());
+        android.view.Window w = getWindow();
+        if (w == null) return;
+        Ui.blurWindow(w, 40);
+        if (android.os.Build.VERSION.SDK_INT >= 31) {
+            try {
+                android.view.WindowManager.LayoutParams lp = w.getAttributes();
+                boolean changed = false;
+                if ((lp.flags & android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND) != 0) {
+                    lp.flags &= ~android.view.WindowManager.LayoutParams.FLAG_BLUR_BEHIND;
+                    changed = true;
+                }
+                if (lp.getBlurBehindRadius() != 0) {
+                    lp.setBlurBehindRadius(0);
+                    changed = true;
+                }
+                if (changed) w.setAttributes(lp);
+            } catch (Throwable ignored) { }
+        }
     }
 
     /** 外观相关的几行重建，其它设置不动。

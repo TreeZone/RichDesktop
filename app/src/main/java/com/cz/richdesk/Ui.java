@@ -49,6 +49,38 @@ public class Ui {
     /** 当前是否深色外观（深玻璃 + 白字）。updateAppearance() 里计算 */
     public static volatile boolean dark = true;
 
+    /**
+     * 低性能模式（Prefs.perf_low）：**默认 true**。
+     *
+     * 只改两件事，其余绘制 / 布局 / 触摸 / 虚拟屏逻辑与高性能模式逐字一致：
+     *   1. 玻璃材质降级为不透明纯色（{@link #glassColors()} / {@link #glass()} /
+     *      {@link #glassPanel()}，亮边 {@link #glassStroke()} 一并去掉）；
+     *   2. 关闭窗口背景模糊（{@link #canBlur()} 为 false、{@link #blurWindow()} 写 0）。
+     *
+     * 由 MainActivity / SettingsActivity 的 onCreate 通过 syncPerfMode() 从配置同步；
+     * 静态初值也设 true，保证冷启动时若某个 Receiver/Broadcast 先于 Activity 跑起来，
+     * 在 sync 之前同样走低性能路径。
+     */
+    private static volatile boolean lowPerf = true;
+
+    public static boolean isLowPerf() {
+        return lowPerf;
+    }
+
+    public static void syncPerfMode(Context c) {
+        lowPerf = Prefs.perfLow(c);
+    }
+
+    /** 低性能模式：玻璃面板的纯色底（深、浅外观各一档） */
+    public static int flatBg() {
+        return dark ? 0xFF141821 : 0xFFF2F4F8;
+    }
+
+    /** 低性能模式：弹窗 / 卡片的纯色底 */
+    public static int flatPanel() {
+        return dark ? 0xFF1B2230 : 0xFFFFFFFF;
+    }
+
     /** 壁纸亮度缓存：null = 还没测过。只在后台线程解码时写入 */
     private static volatile Boolean wallpaperDarkCache;
     /** 上一次测得的壁纸亮度：后台重算期间拿它顶住外观，不让主线程等解码 */
@@ -65,9 +97,9 @@ public class Ui {
         return Math.round(v * density(c));
     }
 
-    /** 当前系统是否支持窗口背景模糊（Android 12 / API 31 起） */
+    /** 当前系统是否支持窗口背景模糊（Android 12 / API 31 起）。低性能模式一律不支持 */
     public static boolean canBlur() {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.S;
+        return !lowPerf && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S;
     }
 
     // ------------------------------------------------------------ 深浅色外观
@@ -251,12 +283,17 @@ public class Ui {
      * 浅色外观 = 白玻璃。两档只差底色，透明度是同一套 GLASS_ALPHA_*。
      */
     public static int[] glassColors() {
+        if (lowPerf) {
+            int c = flatBg();
+            return new int[]{c, c};
+        }
         return dark ? new int[]{GLASS_ALPHA_TOP << 24, GLASS_ALPHA_BOTTOM << 24}
                 : new int[]{0x9CFFFFFF, 0x4DFFFFFF};
     }
 
-    /** 玻璃材质的 1dp 亮边色（与 {@link #glassColors()} 配套） */
+    /** 玻璃材质的 1dp 亮边色（与 {@link #glassColors()} 配套）。纯色模式不画亮边 */
     public static int glassStroke() {
+        if (lowPerf) return 0x00000000;
         return dark ? 0x33FFFFFF : 0x80FFFFFF;
     }
 
@@ -274,6 +311,13 @@ public class Ui {
      */
     public static Drawable glass(Context c, int radiusDp) {
         int r = dp(c, radiusDp);
+        if (lowPerf) {
+            // 纯色替代玻璃：圆角保持不变，只去掉半透明与渐变高光
+            GradientDrawable g = new GradientDrawable();
+            g.setColor(flatBg());
+            g.setCornerRadius(r);
+            return g;
+        }
         GradientDrawable g = new GradientDrawable(
                 GradientDrawable.Orientation.TL_BR, glassColors());
         g.setStroke(Math.max(1, dp(c, 1)), glassStroke());
@@ -287,6 +331,13 @@ public class Ui {
      */
     public static Drawable glassPanel(Context c, int radiusDp) {
         int r = dp(c, radiusDp);
+        if (lowPerf) {
+            // 纯色替代玻璃面板：圆角保持不变，只去掉半透明与渐变
+            GradientDrawable g = new GradientDrawable();
+            g.setColor(flatPanel());
+            g.setCornerRadius(r);
+            return g;
+        }
         boolean blur = canBlur();
         GradientDrawable g;
         if (dark) {
@@ -316,6 +367,12 @@ public class Ui {
         if (w == null) return;
         if (Build.VERSION.SDK_INT < 31) return;   // 安卓 9~11：没有背景模糊，靠半透明底兜底
         try {
+            if (lowPerf) {
+                // 低性能模式：明确写 0。模式可能在窗口存活期间被切换，只 return 会让
+                // 之前设过的模糊一直生效 —— GPU 每帧都要采样背后正在出帧的画中画。
+                w.setBackgroundBlurRadius(0);
+                return;
+            }
             // 只做「背景模糊」：跟随窗口背景的绘制区域（= 玻璃板矩形），
             // 不用 FLAG_BLUR_BEHIND —— 它按整个窗口矩形做模糊，
             // 会在玻璃板外留出一圈"糊掉但没底"的边带（就是用户看到的"外圈遮挡"）。
