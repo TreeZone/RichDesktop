@@ -1303,6 +1303,13 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         dockAdapter.setSlotWidth(slotW);
         rvDock.setPadding(side, 0, side, 0);   // 纵向内边距由 dockRow 统一给
         dockAdapter.notifyDataSetChanged();
+        // 排查「应用栏明明放得下却还能左右滑」用：range - extent 必须 ≤ 0，
+        // 大于 0 就是内容比视口宽，rvDock 会把横滑手势吃掉、翻不到应用列表页。
+        final int fAvail = avail, fContent = content, fSide = side;
+        rvDock.post(() -> Log.i("PipDesk", "dock 格宽=" + appliedSlotWidth + " 可用=" + fAvail
+                + " 内容=" + fContent + " 留白=" + fSide
+                + " 可滚距离=" + (rvDock.computeHorizontalScrollRange()
+                - rvDock.computeHorizontalScrollExtent())));
     }
 
     @Override
