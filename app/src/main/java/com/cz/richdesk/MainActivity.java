@@ -558,6 +558,15 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         rvDock.setOverScrollMode(View.OVER_SCROLL_NEVER);
         rvDock.setClipToPadding(false);
         rvDock.setBackground(null);          // 玻璃在 dockRow 上（三段共用）
+        // 添加入口：长按 Dock 空白处（不再挂常驻「＋」，需求：跟功能区一样去掉加号）。
+        // 注意：空 RecyclerView 的触摸走它自己的手势处理，不会触发 view 级长按 ——
+        // 所以这里必须用 GestureDetector 识别长按，setOnLongClickListener 永远不响。
+        final android.view.GestureDetector dockGesture = new android.view.GestureDetector(this,
+                new android.view.GestureDetector.SimpleOnGestureListener() {
+                    @Override public void onLongPress(MotionEvent e) {
+                        if (dockPkgs.isEmpty()) onDockAdd();   // 应用区空了也要能加图标
+                    }
+                });
         rvDock.setOnTouchListener((v, e) -> {
             // 只有在应用栏真的「放不下」、必须自己横向滚动时才拦截翻页手势。
             // 判断用「可滚距离 > 12dp」而不是 canScrollHorizontally：后者常常因为
@@ -569,12 +578,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                     v.getParent().requestDisallowInterceptTouchEvent(true);
                 }
             }
+            dockGesture.onTouchEvent(e);
             return false;
-        });
-        // 添加入口：长按 Dock 空白处（不再挂常驻「＋」，需求：跟功能区一样去掉加号）
-        rvDock.setOnLongClickListener(v -> {
-            onDockAdd();
-            return true;
         });
         // Dock 用配置高度：RecyclerView 在 wrap_content 下会被量成 0，
         // 内容就会溢出到画中画区域上（之前"格子跑到画中画底部"就是这个原因）
@@ -1865,20 +1870,22 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         // 没有「从 Dock 移除」（语义重复）；「全屏打开 / 指定画中画位置」它们也用不上。
         if (AppInfo.isBuiltin(pkg)) {
             OverlayMenu.show(this, labelOf(pkg),
-                    new CharSequence[]{"重新选择应用", "删除绑定"},
+                    new CharSequence[]{"重新选择应用", "删除绑定", "添加图标"},
                     which -> {
                         if (which == 0) {
                             showPicker(pos, 0);     // 换绑：选中谁就占这个槽位
-                        } else if (pos >= 0 && pos < dockPkgs.size()) {
+                        } else if (which == 1 && pos >= 0 && pos < dockPkgs.size()) {
                             dockPkgs.remove(pos);
                             Prefs.setDock(this, dockPkgs);
                             dockAdapter.notifyDataSetChanged();
+                        } else if (which == 2) {
+                            onDockAdd();            // 追加一个新图标（满了会提示）
                         }
                     });
             return;
         }
         OverlayMenu.show(this, labelOf(pkg),
-                new CharSequence[]{"全屏打开", "重新选择应用", "删除绑定", "指定画中画位置"},
+                new CharSequence[]{"全屏打开", "重新选择应用", "删除绑定", "指定画中画位置", "添加图标"},
                 which -> {
                     switch (which) {
                         case 0: pip.launchFullScreen(pkg); break;
@@ -1890,7 +1897,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                                 dockAdapter.notifyDataSetChanged();
                             }
                             break;
-                        default: showPaneAssignDialog(pkg); break;
+                        case 3: showPaneAssignDialog(pkg); break;
+                        default: onDockAdd(); break;
                     }
                 });
     }
