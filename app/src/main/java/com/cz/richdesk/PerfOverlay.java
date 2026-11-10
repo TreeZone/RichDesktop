@@ -25,12 +25,15 @@ import java.io.FileReader;
  *   RAM   —— 系统内存（/proc/meminfo，失败退回 ActivityManager.MemoryInfo）；
  *   APP   —— 本进程 PSS / Java 堆 used/max；
  *   thr/fd/dsp —— 线程数 / fd 数 / 系统 Display 数（dsp 比 pane 数多 = 虚拟屏泄漏）；
- *   p0..  —— 每块画中画：包名 / 累计帧数 / 距上一帧毫秒 / 虚拟屏状态。
+ *   UI    —— 桌面主线程：每秒帧数 / 最大间隔 / 掉帧数(>32ms) / 明显顿挫数(>100ms)；
+ *   p0..  —— 每块画中画：包名 / 累计帧数 / 每秒帧数 / 本秒最大帧间隔 / >100ms 次数 / 屏状态。
  *
  * 卡顿排查先看这几条：
  *   · displays 持续上涨 = 虚拟屏泄漏；
  *   · threads 上涨     = 线程泄漏；
- *   · pss 涨而 heap 不涨 = native / 显存问题。
+ *   · pss 涨而 heap 不涨 = native / 显存问题；
+ *   · 某块画的 max 突然几百 ms，而 UI 行正常 = 屏内应用或合成卡（不是桌面主线程）；
+ *   · UI 行同时出现几百 ms = 桌面主线程被占住（触摸注入 / 列表重载 / 回调里干活）。
  * 高频触摸日志默认关闭，需要时创建 /sdcard/pipdesk_verbose 打开（见 PipDebug）。
  *
  * 兼容性策略（要求尽量兼容所有安卓设备）：
@@ -59,6 +62,17 @@ public final class PerfOverlay {
     private static String gpuNode;
     private static boolean gpuBusyPair;         // gpubusy 是 busy/total 两列，需差分
     private static long gpuLastBusy, gpuLastTotal;
+    /** 只能 root 读的节点（部分车机 SoC）：su 起进程很重，3 秒采一次，其余秒沿用旧值 */
+    private static String gpuSuNode;
+    private static String gpuSuLast = "-";
+    private static long gpuNextSuAt;
+    private static long gpuNextProbeAt;         // 探测失败时节流，别每秒扫目录
+    private static boolean gpuSuTried;          // su 探测只试一次，失败就不再反复起进程
+
+    /** 每块画中画上次的累计帧数（算每秒 fps 用） */
+    private static long[] lastFrames = new long[0];
+    /** 落盘用的采样计数（每 5 秒写一行，便于事后翻日志） */
+    private static int tickCount;
 
     private PerfOverlay() { }
 
@@ -102,6 +116,7 @@ public final class PerfOverlay {
             wm.addView(tv, lp);
             view = tv;
             shown = true;
+            UiJank.start();          // 主线程抖动监测（只在悬浮窗打开时跑）
             startLoop();
             Log.i(TAG, "性能悬浮窗已显示");
         } catch (Throwable t) {
@@ -120,6 +135,7 @@ public final class PerfOverlay {
         view = null;
         shown = false;
         stopLoop();
+        UiJank.stop();
         Log.i(TAG, "性能悬浮窗已隐藏");
     }
 
@@ -153,6 +169,10 @@ public final class PerfOverlay {
             text = "perf err: " + t.getClass().getSimpleName();
         }
         final String s = text;
+        if (++tickCount % 5 == 0) {
+            // 每 5 秒留一行到日志：抖动是瞬时的，事后能翻历史比盯着屏幕有用
+            FileLog.append("PERFOV " + s.replace('\n', ' '));
+        }
         TextView tv = view;
         if (tv != null) {
             tv.post(() -> {
@@ -199,13 +219,28 @@ public final class PerfOverlay {
                 .append(" dsp ").append(displayCount()).append('\n');
         PipManager p = pip;
         if (p != null) {
-            for (int i = 0; i < p.count(); i++) {
+            // 主线程抖动：和每块画的帧间隔对照，就能分清是「谁卡」
+            long[] ui = new long[4];
+            UiJank.take(ui);
+            b.append("UI ").append(ui[0]).append("fps max").append(ui[1]).append("ms")
+                    .append(" drop ").append(ui[2]).append(" >100:").append(ui[3]).append('\n');
+
+            int n = p.count();
+            if (lastFrames.length < n) lastFrames = new long[n];
+            long[] gap = new long[2];
+            for (int i = 0; i < n; i++) {
                 PipPane pane = p.pane(i);
                 if (pane == null) continue;
+                long total = pane.frames();
+                long fps = total >= lastFrames[i] ? total - lastFrames[i] : 0;
+                lastFrames[i] = total;
+                pane.takeGapStats(gap);
                 b.append("p").append(i).append('=')
                         .append(pane.pkg() == null ? "idle" : pane.pkg())
-                        .append(" f=").append(pane.frames())
-                        .append(' ').append(pane.msSinceLastFrame()).append("ms")
+                        .append(" f=").append(total)
+                        .append(" ").append(fps).append("fps")
+                        .append(" max").append(gap[0]).append("ms")
+                        .append(" >100:").append(gap[1])
                         .append(" st=").append(pane.displayState()).append('\n');
             }
         }
@@ -296,6 +331,10 @@ public final class PerfOverlay {
 
     /** 已知 GPU 节点形态：单列百分比 / busy total 两列 / 文本行里带 load xx% */
     private static String probeGpuNode() {
+        // 探测失败时不要每秒全扫（列目录 + 读文件在车机上不算便宜），5 秒重试一次
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now < gpuNextProbeAt) return null;
+        gpuNextProbeAt = now + 5000;
         // ① Adreno（高通）：/sys/class/kgsl/kgsl-N/gpubusy —— 扫目录，不写死 kgsl-3d0
         File kgsl = new File("/sys/class/kgsl");
         String[] dirs = kgsl.list();
@@ -348,10 +387,45 @@ public final class PerfOverlay {
             gpuNode = "/proc/gpustat";
             return gpuNode;
         }
+        // ⑥ 上面全读不到（节点权限被锁，部分车机 SoC 是 root-only）：用 su 探一次，
+        //    读到就记住路径，之后由 gpuUsage 的 su 通道按 3 秒一次采样。
+        //    su 只试一次：没有 root 的设备反复起进程纯属浪费。
+        if (!gpuSuTried) {
+            gpuSuTried = true;
+            String txt = Shell.capture(
+                    "for f in /proc/gpustat /sys/kernel/gpu/gpu_busy"
+                            + " /sys/kernel/gpu/utilisation;"
+                            + " do v=$(cat $f 2>/dev/null); [ -n \"$v\" ] && echo \"$f=$v\"; done");
+            if (txt != null && txt.contains("=")) {
+                for (String line : txt.split("\n")) {
+                    int eq = line.indexOf('=');
+                    if (eq <= 0) continue;
+                    String path = line.substring(0, eq).trim();
+                    String val = line.substring(eq + 1).trim();
+                    if (val.isEmpty() || val.contains("（")) continue;
+                    gpuSuNode = path;
+                    Log.i(TAG, "GPU 走 su 通道：" + path + " 样例=" + val);
+                    break;
+                }
+            }
+        }
         return null;                            // 一条都读不到：下个采样周期重试
     }
 
     private static String gpuUsage() {
+        // 需要 root 的节点：su 起进程开销大，3 秒采一次，中间沿用上次的值
+        String su = gpuSuNode;
+        if (su != null) {
+            long now = android.os.SystemClock.uptimeMillis();
+            if (now >= gpuNextSuAt) {
+                gpuNextSuAt = now + 3000;
+                String txt = Shell.capture("cat " + su + " 2>/dev/null");
+                if (txt != null && !txt.contains("（")) {
+                    gpuSuLast = su.endsWith("gpustat") ? parseGpuLoad(txt) : parsePercent(txt);
+                }
+            }
+            return gpuSuLast;
+        }
         String node = gpuNode;
         if (node == null) node = probeGpuNode();
         if (node == null) return "-";
@@ -390,6 +464,31 @@ public final class PerfOverlay {
             gpuNode = null;                     // 节点失效，下个周期重新探测
             return "-";
         }
+    }
+
+    /** /proc/gpustat 一类文本：找 "load 37%" 这种行 */
+    private static String parseGpuLoad(String txt) {
+        if (txt == null) return "-";
+        for (String line : txt.split("\n")) {
+            int i = line.indexOf("load");
+            if (i >= 0) {
+                String num = line.substring(i + 4).replaceAll("[^0-9]", "");
+                if (!num.isEmpty()) {
+                    long v = parseLong(num);
+                    return Math.max(0, Math.min(100, v)) + "%";
+                }
+            }
+        }
+        return "-";
+    }
+
+    /** 单值节点：可能是 0~100 也可能是千分比（>100 就按千分比折算） */
+    private static String parsePercent(String txt) {
+        String num = txt == null ? "" : txt.replaceAll("[^0-9]", "");
+        if (num.isEmpty()) return "-";
+        long v = parseLong(num);
+        if (v > 100) v /= 10;
+        return Math.max(0, Math.min(100, v)) + "%";
     }
 
     private static long parseLong(String s) {

@@ -78,6 +78,9 @@ public class PipPane {
     /** 纹理出帧计数 / 最后一次出帧时刻：画面"冻结"的判断依据（重启日志里带上） */
     private long frames;
     private long lastFrameAt;
+    /** 本统计窗口（1s）内最大帧间隔 / >100ms 的断档次数：卡顿定位用，PerfOverlay 读一次清一次 */
+    private long gapMaxWin;
+    private long gapOver100Win;
     /** 这块屏上当前跑着的应用：换应用时必须清屏，否则旧应用的 task 还留在栈里会串台 */
     private String livePkg;
     /** 应用被「全屏打开」搬去主屏了：回到桌面时要搬回本屏继续显示 */
@@ -182,8 +185,16 @@ public class PipPane {
 
             @Override
             public void onSurfaceTextureUpdated(SurfaceTexture st) {
+                // 帧间隔统计：这里能真实反映「屏内画面多久来一帧」，
+                // 从 16ms 跳到 200ms 就是用户肉眼看到的卡顿。
+                long now = android.os.SystemClock.uptimeMillis();
+                if (lastFrameAt > 0) {
+                    long gap = now - lastFrameAt;
+                    if (gap > gapMaxWin) gapMaxWin = gap;
+                    if (gap > 100) gapOver100Win++;
+                }
                 frames++;
-                lastFrameAt = android.os.SystemClock.uptimeMillis();
+                lastFrameAt = now;
             }
         });
 
@@ -588,6 +599,20 @@ public class PipPane {
 
     public long frames() {
         return frames;
+    }
+
+    /**
+     * 取走本统计窗口的帧间隔统计并清零（PerfOverlay 每秒调一次）：
+     *   out[0] = 本窗口内最大帧间隔 ms
+     *   out[1] = 本窗口内 >100ms 的断档次数
+     * 两个数一起看才有意义：fps 低但最大间隔小 = 应用本身出帧慢；
+     * 最大间隔突然几百 ms = 真的卡住了（合成/主线程/屏内应用三者之一）。
+     */
+    public synchronized void takeGapStats(long[] out) {
+        out[0] = gapMaxWin;
+        out[1] = gapOver100Win;
+        gapMaxWin = 0;
+        gapOver100Win = 0;
     }
 
     /**
