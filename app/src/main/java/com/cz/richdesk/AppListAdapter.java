@@ -449,9 +449,13 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         vh.itemView.setHapticFeedbackEnabled(false);
         OverlayMenu.setAnchor(vh.itemView);   // 菜单贴着这个图标弹出
         dragHelper.startDrag(vh);
+        // 区域划分：pos 0..offset()-1 是快捷区，之后才是应用区（data 下标 = pos - offset）。
+        // 之前写成 idx < offset()，把快捷区后面的前 9 个应用也当成了快捷区 ——
+        // 长按 A 应用弹出的是别的（快捷区）图标的名称和菜单（用户报的错乱就是这个）。
         int idx = pos - offset();
-        if (idx < offset()) {
-            String pkg = shortcutPkgAt(idx);
+        if (idx < 0) {
+            // 快捷区：pos 本身就是槽位（0..8）
+            String pkg = shortcutPkgAt(pos);
             if (AppInfo.isBuiltin(pkg)) {
                 if (host instanceof FullHost) ((FullHost) host).onShortcutLongClick(pkg);
             } else {
@@ -459,7 +463,7 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
                 if (ai == null) ai = appCache.get(pkg);
                 if (ai != null) host.onAppLongClick(ai);
             }
-        } else if (data != null && idx >= 0 && idx < data.size()) {
+        } else if (data != null && idx < data.size()) {
             host.onAppLongClick(data.get(idx));
         }
     }

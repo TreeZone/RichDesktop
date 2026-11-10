@@ -419,11 +419,25 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
 
     // ------------------------------------------------------------ 打开
 
-    /** 这个应用是否显式指定了画中画屏位 */
+    /** 这个应用是否显式指定了画中画屏位（「指定屏位」 + 「每屏默认应用」都算） */
     public boolean isAssigned(String pkg) {
-        if (pkg == null) return false;
-        int explicit = Prefs.getPaneOf(app, pkg);
-        return explicit >= 1 && explicit <= panes.size();
+        return paneOf(pkg) >= 0;
+    }
+
+    /**
+     * 应用归属的屏位（0 起），没归属返回 -1：
+     *   1) 长按菜单「指定画中画位置」（pane_map）；
+     *   2) 设置里「每屏默认应用」（pane_default_N）—— 开机会自动在那一屏打开它，
+     *      用户同样认为它是"指定了屏位"的应用，单画布局下点它必须恢复原布局。
+     */
+    private int paneOf(String pkg) {
+        if (pkg == null) return -1;
+        int explicit = Prefs.getPaneOf(app, pkg);   // 1 起
+        if (explicit >= 1 && explicit <= panes.size()) return explicit - 1;
+        for (int i = 1; i <= panes.size(); i++) {
+            if (pkg.equals(Prefs.getDefaultApp(app, i))) return i - 1;
+        }
+        return -1;
     }
 
     /**
@@ -432,8 +446,8 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
      * 画中画顺序固定：横排从左到右、竖排从上到下依次是 1/2/3。
      */
     public int pickPane(String pkg) {
-        int explicit = Prefs.getPaneOf(app, pkg);   // 1 起
-        if (explicit >= 1 && explicit <= panes.size()) return explicit - 1;
+        int own = paneOf(pkg);                      // 指定屏位 / 每屏默认应用 → 回归属的屏
+        if (own >= 0) return own;
         int existing = indexOfPkg(pkg);
         if (existing >= 0) return existing;
         return Prefs.getActivePane(app, panes.size()) - 1;

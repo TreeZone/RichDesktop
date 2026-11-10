@@ -1205,6 +1205,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         col.setLayoutParams(new LinearLayout.LayoutParams(w, ViewGroup.LayoutParams.MATCH_PARENT));
         int padH = Ui.dp(this, 4);
         col.setPadding(padH, 0, padH, 0);
+        // 面板高度变化（改 Dock 图标大小 → Dock 变高/变矮）后重新收敛字号：
+        // 构建时 box.getHeight() 还是旧值，只能等这次布局完成再按新高度调一次
+        col.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or2, ob) -> {
+            if (b - t != ob - ot) refitClockRow(left);
+        });
         box.addView(col);
         // 字号自适应：竖屏时格宽窄，按可用宽度把两行字号缩到「尽量大且完整」
         int avail = w - 2 * padH;
@@ -1216,8 +1221,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     }
 
     /**
-     * Dock 时间面板两行字号自适应：在 availPx 宽度里取「能显示完整」的最大字号。
+     * Dock 时间面板两行字号自适应：宽度、高度**双向**取「能显示完整」的最大字号。
      * 第一行 = 日期 · 天气（13sp 起，最低 8sp）；第二行 = 时分秒（24sp 起，最大 30sp，最低 9sp）。
+     * 宽度：在 availPx 里量出两行文本需要的宽，超了就按比例缩。
+     * 高度：两行的行高加起来不能超过面板实际高度 —— Dock 图标改小后 Dock 变矮，
+     * 只按宽度放大会把字裁掉（用户报的「时间日期显示不全」就是这个）。
      * 天气文案变化后要再调一次（updateDockRealtime）。
      */
     private void refitClockRow(boolean left) {
@@ -1229,6 +1237,13 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         if (avail <= 0 || d == null || w == null || c == null) return;
         float sd = getResources().getDisplayMetrics().scaledDensity;
 
+        // 高度预算：面板实际高度（已布局用真实值；没布局按「图标 dp + Dock 上下 padding」估算）
+        LinearLayout box = left ? dockLeftBox : dockRightBox;
+        int availH = (box != null && box.getHeight() > 0)
+                ? box.getHeight()
+                : Ui.dp(this, Prefs.getDockIcon(this)) + Ui.dp(this, 16);
+        int hBudget = availH - Ui.dp(this, 4);   // 留一点呼吸缝
+
         // 第一行：三段按同一个字号缩放（间距才能保持对齐）
         android.text.TextPaint p = new android.text.TextPaint(d.getPaint());
         p.setTextSize(13 * sd);
@@ -1236,15 +1251,26 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         float rowW = (p.measureText(d.getText().toString())
                 + p.measureText(join) + p.measureText(w.getText().toString())) * 1.06f;
         float topSp = rowW > avail ? Math.max(8f, 13f * avail / rowW) : 13f;
-        d.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, topSp);
-        if (g != null) g.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, topSp);
-        w.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, topSp);
 
         // 第二行：时分秒 8 个字符宽度固定（tnum），竖屏缩、横屏最多放到 30sp
         android.text.TextPaint cp = new android.text.TextPaint(c.getPaint());
         cp.setTextSize(24 * sd);
         float clockW = cp.measureText("00:00:00") * 1.06f;
         float clockSp = Math.max(9f, Math.min(30f, 24f * avail / clockW));
+
+        // 高度上限：两行行高（≈1.4×字号）之和超出面板高 → 两行等比例压缩
+        //（保证两行都完整显示，宁可字小一点也不裁字）
+        float hTop = topSp * sd * 1.4f;
+        float hClock = clockSp * sd * 1.4f;
+        if (hBudget > 0 && hTop + hClock > hBudget) {
+            float scale = hBudget / (hTop + hClock);
+            topSp = Math.max(6f, topSp * scale);
+            clockSp = Math.max(7f, clockSp * scale);
+        }
+
+        d.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, topSp);
+        if (g != null) g.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, topSp);
+        w.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, topSp);
         c.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, clockSp);
     }
 
@@ -1714,6 +1740,10 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         // 也要先恢复单画前的布局，否则单画布局永远退不回去。
         // 恢复后强制走一遍 open：PipPane.open 对已运行的应用是幂等的（不重建虚拟屏），
         // 只会把应用所在的屏重新放回显示。
+        if (pip.inSingleMode()) {
+            FileLog.append("单画中点击 " + pkg
+                    + " 指定屏位=" + pip.isAssigned(pkg) + " 已在运行=" + running);
+        }
         if (pip.inSingleMode() && (preferred >= 1 || pip.isAssigned(pkg))) {
             pip.restoreSingleLayout();
             running = false;
