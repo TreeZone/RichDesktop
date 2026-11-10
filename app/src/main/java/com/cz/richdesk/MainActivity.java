@@ -51,13 +51,19 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     private View dockLeftDiv, dockRightDiv;
     /** 功能区里的时间/天气（左右各一套：任一侧都可能被配成「时间 + 天气」） */
     private TextView dockClock, dockWeather, dockClockL, dockWeatherL;
+    /** 日期行（年月日）：与时间行一起刷新，秒级跳 */
+    private TextView dockDate, dockDateL;
     private final android.os.Handler dockHandler =
             new android.os.Handler(android.os.Looper.getMainLooper());
     /** 15s 一跳：刷时间/天气，顺带跑一次亮度自动调节（目标没变不会重复写系统设置） */
+    /** 秒针每秒一跳（文本没变不会重绘）；天气/亮度按 15 跳一次 */
+    private int dockTickCount;
+
     private final Runnable dockTick = new Runnable() {
         @Override public void run() {
-            updateDockRealtime();
-            dockHandler.postDelayed(this, 15000);
+            updateDockClock();
+            if (dockTickCount++ % 15 == 0) updateDockRealtime();
+            dockHandler.postDelayed(this, 1000);
         }
     };
 
@@ -237,14 +243,26 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         pager.addView(buildAppListPage());
         pager.setCurrentPage(0);
         // 翻页闸门（需求）：主页只能在 Dock 上左滑去应用页；应用页整页右滑回主页
-        pager.setSwipeGate((fromPage, toNext, x, y) -> {
-            if (fromPage == 0) {
-                if (!toNext) return false;   // 主页不能右滑（右边没有页）
-                // 只允许从 Dock 区域起手：Dock 顶沿 = pager 高 - dockWrap 高
+        pager.setSwipeGate(new SimplePager.SwipeGate() {
+            @Override public boolean allowSwipe(int fromPage, boolean toNext, float x, float y) {
+                if (fromPage == 0) {
+                    if (!toNext) return false;   // 主页不能右滑（右边没有页）
+                    // 只允许从 Dock 区域起手：Dock 顶沿 = pager 高 - dockWrap 高
+                    return inDock(y);
+                }
+                return !toNext;                  // 应用页：整页右滑回主页，左滑不翻
+            }
+
+            @Override public float strictness(float x, float y) {
+                // Dock 区：手指本来就贴在那儿点图标，稍微一碰就翻页太容易误触。
+                // 2.2 倍位移门槛 + 2.2 倍速度门槛，正常「甩一下」照样能翻。
+                return inDock(y) ? 2.2f : 1f;
+            }
+
+            private boolean inDock(float y) {
                 return dockWrap != null && dockWrap.getHeight() > 0
                         && y >= pager.getHeight() - dockWrap.getHeight();
             }
-            return !toNext;                  // 应用页：整页右滑回主页，左滑不翻
         });        FrameLayout root = new FrameLayout(this);
         root.addView(pager, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -489,6 +507,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 v.getParent().requestDisallowInterceptTouchEvent(true);
             }
             return false;
+        });
+        // 添加入口：长按 Dock 空白处（不再挂常驻「＋」，需求：跟功能区一样去掉加号）
+        rvDock.setOnLongClickListener(v -> {
+            onDockAdd();
+            return true;
         });
         // Dock 用配置高度：RecyclerView 在 wrap_content 下会被量成 0，
         // 内容就会溢出到画中画区域上（之前"格子跑到画中画底部"就是这个原因）
@@ -777,8 +800,9 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
      *
      * · 格宽与中间图标区完全一致（同一个 dockPitch），图标都在各自格子里居中，
      *   两处图标的间距天然相同。
-     * · 不挂常驻「＋」：末尾留一个空白格（透明、可长按），长按它添加图标；
-     *   格子数 = min(图标数+1, 5)，最少 2 格 —— 保证任何时候都有一个够宽的长按目标。
+     * · 不留「＋」也不留空白格（需求：不要占一个空位）。添加入口挪到图标的
+     *   长按菜单里（第一项「添加图标」）；只有在图标数为 0 时才留一格空白，
+     *   否则面板宽度为 0 就没地方长按了。
      */
     private void buildShortcutPanel(LinearLayout box, boolean left) {
         final int pitch = dockPitchPx();
@@ -790,12 +814,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         int padH = Ui.dp(this, 4);
         box.setPadding(padH, 0, padH, 0);
         for (final String pkg : pkgs) box.addView(shortcutIcon(pkg, left, ic, pitch));
-        // 空白格：长按添加（到 5 个就不留空白格 —— 想加先长按图标移走一个）
-        int cells = panelCellCount(left);
-        if (pkgs.size() < cells) {
+        if (pkgs.isEmpty()) {
+            // 一个图标都没有：留一格透明的长按区当作「添加」入口
             View blank = new View(this);
             blank.setLayoutParams(new LinearLayout.LayoutParams(
-                    (cells - pkgs.size()) * pitch, ViewGroup.LayoutParams.MATCH_PARENT));
+                    pitch, ViewGroup.LayoutParams.MATCH_PARENT));
             blank.setOnLongClickListener(v -> {
                 pickPanelApp(left);
                 return true;
@@ -806,8 +829,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
     /**
      * 一侧功能区在 Dock 里占几个格（用于统一格宽的分配）：
-     *   · 快捷功能：图标数 + 1 个空白格（长按添加用），最少 2 格、最多 5 格；
-     *   · 时间 + 天气：按 1 格算（它的宽度大致就是一个格宽，不按格数算就会挤到中间图标）；
+     *   · 快捷功能：就按图标数算（不留空白格，需求），一个都没有时算 1 格；
+     *   · 时间 + 天气：2 格（日期/时间/天气三行要够宽）；
      *   · 没启用：0 格。
      */
     private int panelCellCount(boolean left) {
@@ -816,8 +839,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         int type = left ? Prefs.getDockLeftType(this) : Prefs.getDockRightType(this);
         if (type == Prefs.PANEL_CLOCK) return 2;   // 时间天气最少占 2 格（需求）
         int n = panelIcons(left).size();
-        return Math.min(Math.max(Math.min(n, Prefs.PANEL_SHORTCUT_MAX) + 1, 2),
-                Prefs.PANEL_SHORTCUT_MAX);
+        return Math.max(1, Math.min(n, Prefs.PANEL_SHORTCUT_MAX));
     }
 
     /** 一个快捷图标：固定格宽、图标居中（图标之间的间距由格宽决定，与中间图标区一致） */
@@ -841,12 +863,14 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         return box;
     }
 
-    /** 功能区图标的长按菜单（原地长按松手时弹出） */
+    /** 功能区图标的长按菜单（原地长按松手时弹出；添加入口也在这里） */
     private void showPanelIconMenu(final boolean left, final String pkg) {
         GlassMenu.show(this, labelOf(pkg),
-                new CharSequence[]{"移到 Dock 图标区", "从功能区移除"},
+                new CharSequence[]{"添加图标", "移到 Dock 图标区", "从功能区移除"},
                 which -> {
                     if (which == 0) {
+                        pickPanelApp(left);
+                    } else if (which == 1) {
                         if (dockPkgs.size() >= Prefs.getDockCount(this)) {
                             toast("Dock 已满，可在设置里加大格数");
                             return;
@@ -867,7 +891,15 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 });
     }
 
-    /** 长按进入拖动待命：手指没动就松手 = 菜单（finishPanelDrag 里转），拖走 = 排序 */
+    /** 长按后「停住不动」多久自动弹菜单（一移动就取消，改为拖动） */
+    private static final long PANEL_MENU_DELAY = 280;
+    private Runnable pendingPanelMenu;
+
+    /**
+     * 长按进入待命：先给一点时间判断「是要拖还是要菜单」——
+     * 手指一动就取消计时器、直接开拖；停住不动 280ms 就先把菜单弹出来，
+     * 不用等松手（需求：长按即弹菜单，检测到拖动则关掉菜单开始移动）。
+     */
     private void beginPanelDrag(boolean left, String pkg, View cell) {
         LinearLayout box = left ? dockLeftBox : dockRightBox;
         List<String> l = panelIcons(left);
@@ -880,8 +912,23 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         panelDragView = cell;
         panelDragIndex = panelDragCur = idx;
         panelDragMoved = false;
+        panelDragStartRawX = -1;   // 起手位置在第一次 MOVE 时才记（长按时 DOWN 已过去）
         cell.animate().scaleX(1.14f).scaleY(1.14f).setDuration(120).start();
         cell.setElevation(Ui.dp(this, 10));
+        // 停住不动 → 自动弹菜单；一旦开始拖动就取消（见 cancelPendingPanelMenu）
+        cancelPendingPanelMenu();
+        pendingPanelMenu = () -> {
+            pendingPanelMenu = null;
+            finishPanelDrag(left, true);
+        };
+        dockHandler.postDelayed(pendingPanelMenu, PANEL_MENU_DELAY);
+    }
+
+    private void cancelPendingPanelMenu() {
+        if (pendingPanelMenu != null) {
+            dockHandler.removeCallbacks(pendingPanelMenu);
+            pendingPanelMenu = null;
+        }
     }
 
     /**
@@ -897,7 +944,10 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             case android.view.MotionEvent.ACTION_MOVE: {
                 if (panelDragStartRawX < 0) panelDragStartRawX = e.getRawX();
                 float dx = e.getRawX() - panelDragStartRawX;
-                panelDragMoved |= Math.abs(dx) > Ui.dp(this, 8);
+                // 12dp：手指按着不动时的轻微抖动不算「拖动」，免得松手时不弹菜单
+                boolean movedNow = Math.abs(dx) > Ui.dp(this, 12);
+                if (movedNow && !panelDragMoved) cancelPendingPanelMenu();  // 开始拖 → 别再弹菜单
+                panelDragMoved |= movedNow;
                 v.setTranslationX(dx);
                 int pitch = Math.max(1, dockPitchPx());
                 int n = panelDragList.size();
@@ -916,33 +966,41 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             }
             case android.view.MotionEvent.ACTION_UP:
             case android.view.MotionEvent.ACTION_CANCEL:
-                finishPanelDrag(left);
+                cancelPendingPanelMenu();
+                finishPanelDrag(left, false);
                 return true;
         }
         return true;
     }
 
-    /** 拖动结束：换过位置就落盘重建，没换 = 原地长按 → 弹菜单 */
-    private void finishPanelDrag(boolean left) {
+    /**
+     * 拖动结束。
+     *
+     * @param forceMenu true = 长按后停住不动（计时器到点）：弹菜单；
+     *                  false = 手指抬起：只要动过就只落盘/复位，绝不再弹菜单
+     *                  （之前用「有没有跨格」判断，拖了一下没跨过一格松手会突然弹菜单，很突兀）
+     */
+    private void finishPanelDrag(boolean left, boolean forceMenu) {
         if (panelDragIndex < 0) return;
         View cell = panelDragView;
         if (cell != null) {
             cell.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
             cell.setElevation(0);
         }
-        boolean moved = panelDragMoved && panelDragCur != panelDragIndex;
+        boolean dragged = panelDragMoved;
+        boolean reordered = panelDragCur != panelDragIndex;
         List<String> l = panelDragList;
         String pkg = l.get(Math.max(0, Math.min(panelDragCur, l.size() - 1)));
         panelDragIndex = panelDragCur = -1;
         panelDragView = null;
         panelDragCells.clear();
         panelDragList = null;
-        if (moved) {
-            setPanelIcons(left, l);
-            buildDockPanel(left ? dockLeftBox : dockRightBox, left);
+        if (!forceMenu && (dragged || reordered)) {
+            if (reordered) setPanelIcons(left, l);
+            buildDockPanel(left ? dockLeftBox : dockRightBox, left);   // 清掉残留位移
             applyDockSlots();
         } else {
-            buildDockPanel(left ? dockLeftBox : dockRightBox, left);   // 清掉残留位移
+            buildDockPanel(left ? dockLeftBox : dockRightBox, left);
             showPanelIconMenu(left, pkg);
         }
     }
@@ -981,35 +1039,85 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         pickerDialog.show();
     }
 
-    /** 时间 + 天气：竖排两行（左右两侧可以各有一套） */
+    /**
+     * 时间 + 天气：竖排两行（左右两侧可以各有一套）。
+     *
+     * 需求后的版式：
+     *   第一行  2026-11-10 · 晴 12°   （日期和天气合并一行，灰色小字）
+     *   第二行  11:07:18              （当前时间，18sp 加粗，视觉主体）
+     * 建的时候就把文字填上 —— 面板可能被 applyDockSlots 重建，空 TextView 会把宽度塌成一条。
+     */
     private void buildClockPanel(LinearLayout box, boolean left) {
         LinearLayout col = new LinearLayout(this);
         col.setOrientation(LinearLayout.VERTICAL);
         col.setGravity(Gravity.CENTER);
-        TextView clock = new TextView(this);
-        clock.setTextSize(14);
-        clock.setTextColor(Ui.tint());
-        clock.setGravity(Gravity.CENTER);
+        col.setClipChildren(false);
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER);
+        top.setClipChildren(false);
+
+        TextView date = new TextView(this);
+        date.setTextSize(11);
+        date.setTextColor(Ui.tintDim());
+        date.setGravity(Gravity.CENTER);
+        date.setSingleLine(true);
+
+        TextView gap = new TextView(this);
+        gap.setText(" · ");
+        gap.setTextSize(11);
+        gap.setTextColor(Ui.tintDim());
+        gap.setGravity(Gravity.CENTER);
+        gap.setSingleLine(true);
+
         TextView weather = new TextView(this);
         weather.setTextSize(11);
         weather.setTextColor(Ui.tintDim());
         weather.setGravity(Gravity.CENTER);
-        // 建的时候就把文字填上：面板可能被 applyDockSlots 重建，空 TextView 会把宽度塌成一条
+        weather.setSingleLine(true);
+
+        TextView clock = new TextView(this);
+        clock.setTextSize(18);
+        clock.setTextColor(Ui.tint());
+        clock.setGravity(Gravity.CENTER);
+        clock.setSingleLine(true);
+        clock.setTypeface(clock.getTypeface(), android.graphics.Typeface.BOLD);
+        // 等宽数字：秒在跳的时候整行不会左右抖
+        clock.setFontFeatureSettings("tnum");
+
         java.util.Calendar cal = java.util.Calendar.getInstance();
-        clock.setText(String.format(java.util.Locale.US, "%02d:%02d",
-                cal.get(java.util.Calendar.HOUR_OF_DAY),
-                cal.get(java.util.Calendar.MINUTE)));
+        date.setText(dateLabel(cal));
         weather.setText(Weather.dockLabel(this));
+        clock.setText(timeLabel(cal));
+
+        top.addView(date);
+        top.addView(gap);
+        top.addView(weather);
+        col.addView(top);
         col.addView(clock);
-        col.addView(weather);
         // 面板宽度 = 占的格数 × 统一格宽（时间天气最少 2 格），内容居中
         int w = panelCellCount(left) * dockPitchPx();
         col.setLayoutParams(new LinearLayout.LayoutParams(w, ViewGroup.LayoutParams.MATCH_PARENT));
         int padH = Ui.dp(this, 4);
         col.setPadding(padH, 0, padH, 0);
         box.addView(col);
-        if (left) { dockClockL = clock; dockWeatherL = weather; }
-        else { dockClock = clock; dockWeather = weather; }
+        if (left) { dockDateL = date; dockClockL = clock; dockWeatherL = weather; }
+        else { dockDate = date; dockClock = clock; dockWeather = weather; }
+    }
+
+    private static String dateLabel(java.util.Calendar c) {
+        return String.format(java.util.Locale.US, "%04d-%02d-%02d",
+                c.get(java.util.Calendar.YEAR),
+                c.get(java.util.Calendar.MONTH) + 1,
+                c.get(java.util.Calendar.DAY_OF_MONTH));
+    }
+
+    private static String timeLabel(java.util.Calendar c) {
+        return String.format(java.util.Locale.US, "%02d:%02d:%02d",
+                c.get(java.util.Calendar.HOUR_OF_DAY),
+                c.get(java.util.Calendar.MINUTE),
+                c.get(java.util.Calendar.SECOND));
     }
 
     /** 玻璃竖线：竖向渐变（上下淡出），比一条实线更像玻璃切面 */
@@ -1021,24 +1129,36 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         return g;
     }
 
-    /** 时间/天气/亮度：15s 一跳（左右两侧只要有一侧是时间天气就要刷） */
+    /**
+     * 时钟每秒一跳（要显示秒），天气/亮度这类重活仍按 15 秒一次 ——
+     * 每帧都去看天气缓存、写系统亮度只会白烧 CPU。
+     */
+    private void updateDockClock() {
+        if (dockClock == null && dockClockL == null) return;
+        java.util.Calendar cal = java.util.Calendar.getInstance();
+        String date = dateLabel(cal);
+        String time = timeLabel(cal);
+        if (dockDate != null) setTextIfChanged(dockDate, date);
+        if (dockClock != null) setTextIfChanged(dockClock, time);
+        if (dockDateL != null) setTextIfChanged(dockDateL, date);
+        if (dockClockL != null) setTextIfChanged(dockClockL, time);
+    }
+
+    /** 文本没变就不 setText：避免每秒触发一次重排/重绘 */
+    private static void setTextIfChanged(TextView v, String s) {
+        if (s != null && !s.contentEquals(v.getText())) v.setText(s);
+    }
+
+    /** 天气/亮度/网络：15s 一跳（左右两侧只要有一侧是时间天气就要刷） */
     private void updateDockRealtime() {
-        String hhmm = null;
-        if (dockClockL != null || dockClock != null) {
-            java.util.Calendar cal = java.util.Calendar.getInstance();
-            hhmm = String.format(java.util.Locale.US, "%02d:%02d",
-                    cal.get(java.util.Calendar.HOUR_OF_DAY),
-                    cal.get(java.util.Calendar.MINUTE));
-        }
-        if (dockClock != null && dockRightBox != null
+        updateDockClock();
+        if (dockWeather != null && dockRightBox != null
                 && dockRightBox.getVisibility() == View.VISIBLE) {
-            dockClock.setText(hhmm);
-            if (dockWeather != null) dockWeather.setText(Weather.dockLabel(this));
+            setTextIfChanged(dockWeather, Weather.dockLabel(this));
         }
-        if (dockClockL != null && dockLeftBox != null
+        if (dockWeatherL != null && dockLeftBox != null
                 && dockLeftBox.getVisibility() == View.VISIBLE) {
-            dockClockL.setText(hhmm);
-            if (dockWeatherL != null) dockWeatherL.setText(Weather.dockLabel(this));
+            setTextIfChanged(dockWeatherL, Weather.dockLabel(this));
         }
         // 天气缓存过期就后台拉一次（亮度判断「阴天」也靠它）
         Weather.refreshIfStale(this);
@@ -1084,8 +1204,16 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 ? dockWrap.getWidth() : getResources().getDisplayMetrics().widthPixels;
         int slots = Math.max(1, Prefs.getDockCount(this));
         int panels = panelCellCount(true) + panelCellCount(false);
+        int divW = 2 * Math.max(1, Ui.dp(this, 2));   // 两条玻璃竖线也要从可用宽里扣掉
+        // 功能区 box 自己还有左右各 4dp padding（有面板时才有）
+        int panelPad = 0;
+        if (panelCellCount(true) > 0) panelPad += 8;
+        if (panelCellCount(false) > 0) panelPad += 8;
         int lo = Ui.dp(this, 46), hi = Ui.dp(this, 96);
-        int pitch = (dockW - 2 * Ui.dp(this, 8)) / (slots + panels);
+        // 分母用「Dock 槽位数」而不是实际图标数：格宽不能因为中间应用少就被放大，
+        // 否则功能区（≤5 格）会跟着撑得很宽，把中间图标区的地盘挤掉。
+        int fixed = 2 * Ui.dp(this, 8) + divW + Ui.dp(this, panelPad) + Ui.dp(this, 6);  // 6dp 取整余量
+        int pitch = (dockW - fixed) / Math.max(1, slots + panels);
         return Math.max(lo, Math.min(hi, pitch));
     }
 
@@ -1117,9 +1245,18 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                     - (panelCellCount(true) + panelCellCount(false)) * pitch;
         }
         int avail = Math.max(Ui.dp(this, 46), availW);
+        int cells = Math.min(slots, Math.max(1, dockPkgs.size()));
         int slotW = pitch;
-        int cells = Math.min(slots, dockPkgs.size() + 1);
-        int side = Math.max(Ui.dp(this, 8), (avail - cells * slotW) / 2);
+        // 能放下就绝不滚动：极端情况下（格宽被夹到 46dp 下限）内容仍可能超出，
+        // 这时才把格宽压到刚好放下 —— 只有压到 40dp 还不下才真的交给 RecyclerView 滑
+        if (cells > 0 && cells * slotW > avail) {
+            int fit = avail / cells;
+            if (fit >= Ui.dp(this, 40)) slotW = fit;
+        }
+        int content = cells * slotW;
+        int side = content >= avail
+                ? Math.max(Ui.dp(this, 4), (avail - content) / 2)
+                : Math.max(Ui.dp(this, 8), (avail - content) / 2);
         if (slots == appliedSlotCount && slotW == appliedSlotWidth
                 && cells == appliedSlotCells && side == appliedSidePad) return;
         appliedSlotCount = slots;

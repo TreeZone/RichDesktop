@@ -32,9 +32,20 @@ public class SimplePager extends ViewGroup {
     public interface SwipeGate {
         /** @param toNext true = 手指左滑（翻向下一页） */
         boolean allowSwipe(int fromPage, boolean toNext, float downX, float downY);
+
+        /**
+         * 起手位置的「严格度」：1 = 普通；越大越难翻（位移门槛和速度门槛都乘它）。
+         * Dock 这种手指常驻、稍微一划就想干别的区域，调大一点能压掉误触。
+         */
+        default float strictness(float downX, float downY) {
+            return 1f;
+        }
     }
 
     private SwipeGate gate;
+
+    /** 本次手势的严格度（DOWN 时按起手位置算一次） */
+    private float strict = 1f;
 
     public void setSwipeGate(SwipeGate g) {
         gate = g;
@@ -109,7 +120,7 @@ public class SimplePager extends ViewGroup {
      * 提高阈值不会影响正常滑动，但能把误判压下去。
      */
     private float dragSlop() {
-        return touchSlop * 2.2f;
+        return touchSlop * 2.2f * strict;
     }
 
     @Override
@@ -121,6 +132,8 @@ public class SimplePager extends ViewGroup {
                 directionDecided = false;
                 horizontalIntent = false;
                 dragging = false;
+                strict = gate == null ? 1f
+                        : Math.max(1f, gate.strictness(ev.getX(), ev.getY()));
                 if (!scroller.isFinished()) {
                     scroller.abortAnimation();
                 }
@@ -158,6 +171,8 @@ public class SimplePager extends ViewGroup {
             case MotionEvent.ACTION_DOWN:
                 downX = lastX = ev.getX();
                 downY = lastY = ev.getY();
+                strict = gate == null ? 1f
+                        : Math.max(1f, gate.strictness(ev.getX(), ev.getY()));
                 if (!scroller.isFinished()) {
                     scroller.abortAnimation();
                 }
@@ -196,8 +211,8 @@ public class SimplePager extends ViewGroup {
                     float vx = velocity.getXVelocity();
                     int w = getWidth();
                     int target = currentPage;
-                    if (Math.abs(vx) > FLING_MIN) {
-                        // 快速滑动：直接翻页
+                    if (Math.abs(vx) > FLING_MIN * strict) {
+                        // 快速滑动：直接翻页（Dock 区门槛更高，轻扫不翻）
                         target = vx < 0 ? currentPage + 1 : currentPage - 1;
                     } else {
                         // 慢速：看滑过了多少

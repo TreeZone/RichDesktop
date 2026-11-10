@@ -274,7 +274,7 @@ public class SettingsActivity extends AppCompatActivity {
         // 只有「快捷功能」才有图标可列（时间天气没有图标），按当前类型决定显不显示
         View leftIcons = Prefs.getDockLeftType(this) == Prefs.PANEL_SHORTCUT
                 ? actionChild("左端图标：" + dockLeftNames(),
-                        () -> toast("长按桌面功能区空白处添加图标；长按图标可移除或移到中间图标区"))
+                        () -> toast("长按功能区图标 →「添加图标」；也可移除或移到中间图标区"))
                 : null;
         if (leftIcons != null) children(leftSw, leftType, leftIcons);
         else children(leftSw, leftType);
@@ -285,13 +285,13 @@ public class SettingsActivity extends AppCompatActivity {
                 () -> pickPanelType(false));
         View rightIcons = Prefs.getDockRightType(this) == Prefs.PANEL_SHORTCUT
                 ? actionChild("右端图标：" + dockRightNames(),
-                        () -> toast("长按桌面功能区空白处添加图标；长按图标可移除或移到中间图标区"))
+                        () -> toast("长按功能区图标 →「添加图标」；也可移除或移到中间图标区"))
                 : null;
         if (rightIcons != null) children(rightSw, rightType, rightIcons);
         else children(rightSw, rightType);
 
         note("· 两侧都可选「快捷功能」或「时间 + 天气」；不显示时那一侧的分隔竖线也不显示。\n"
-                + "· 快捷功能最多 5 个图标；添加方式 = 长按桌面功能区末尾的空白格（不挂常驻「＋」）。\n"
+                + "· 快捷功能最多 5 个图标，不留空位；添加方式 = 长按任一图标 →「添加图标」。\n"
                 + "· 功能区图标间距与中间图标区完全一致（同一个格宽）；中间放不下时自动变窄、可滑动，"
                 + "两侧功能区不会跟着变窄。");
 

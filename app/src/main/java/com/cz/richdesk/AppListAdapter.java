@@ -344,15 +344,46 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
 
     // ------------------------------------------------------------ 长按拖动排序
 
+    /** 长按后停住不动多久自动弹菜单；一动就取消、改为拖动 */
+    private static final long MENU_DELAY = 280;
+    private Runnable pendingMenu;
+    private boolean menuHandedOff;
+
+    private void cancelPendingMenu(View any) {
+        if (pendingMenu != null) {
+            any.removeCallbacks(pendingMenu);
+            pendingMenu = null;
+        }
+    }
+
     /**
-     * 长按入口：进入拖动待命（手指没动就松手的话由 clearView 转成菜单）。
+     * 长按入口：进入拖动待命 + 起一个 280ms 停手计时器 ——
+     * 停住不动就把菜单弹出来（不用等松手），手指一动就取消计时器、纯拖动。
      * 只有普通应用格子能拖；前 5 个快捷方式是功能位，固定在最前。
      */
-    private void onLongPress(RecyclerView.ViewHolder vh) {
+    private void onLongPress(final RecyclerView.ViewHolder vh) {
         if (dragHelper == null) return;
         int pos = vh.getBindingAdapterPosition();
         if (pos < offset() || pos >= getItemCount()) return;
+        final View item = vh.itemView;
+        cancelPendingMenu(item);
+        menuHandedOff = false;
         dragHelper.startDrag(vh);
+        pendingMenu = () -> {
+            pendingMenu = null;
+            menuHandedOff = true;
+            item.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
+            item.setElevation(0);
+            int p = vh.getBindingAdapterPosition();
+            int idx = p - offset();
+            if (idx < offset()) {
+                String pkg = shortcutPkgAt(idx);
+                if (host instanceof FullHost) ((FullHost) host).onShortcutLongClick(pkg);
+            } else if (data != null && idx >= 0 && idx < data.size()) {
+                host.onAppLongClick(data.get(idx));
+            }
+        };
+        item.postDelayed(pendingMenu, MENU_DELAY);
     }
 
     /** 桌面应用页在 setAdapter 之后调用一次；picker 弹窗不调（无拖动） */
@@ -373,6 +404,7 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
                 int sc = offset();
                 int from = a.getBindingAdapterPosition(), to = b.getBindingAdapterPosition();
                 if (from < 0 || to < 0 || from >= getItemCount() || to >= getItemCount()) return false;
+                cancelPendingMenu(a.itemView);   // 开始换位 = 用户要拖，别再弹菜单
                 if (from < sc && to < sc) {
                     // 快捷区内部换位（9 个功能图标之间）
                     if (shortcutOrder == null) return false;
@@ -410,10 +442,15 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
             @Override
             public void clearView(@NonNull RecyclerView rv, @NonNull RecyclerView.ViewHolder vh) {
                 super.clearView(rv, vh);
+                cancelPendingMenu(vh.itemView);
                 vh.itemView.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
                 vh.itemView.setElevation(0);
                 boolean moved = dragMoved;
                 dragMoved = false;
+                if (menuHandedOff) {          // 菜单已由停手计时器弹过
+                    menuHandedOff = false;
+                    return;
+                }
                 int pos = vh.getBindingAdapterPosition();
                 int idx = pos - offset();
                 if (moved) {

@@ -80,8 +80,8 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
     public int getItemCount() {
         int slots = Math.max(1, host.dockSlots());
         int used = host.dockPkgs().size();
-        // 未满：应用 + 一个加号；已满：正好 N 格
-        return Math.min(slots, used + 1);
+        // 不挂常驻「＋」：Dock 只画真实图标占的格子，添加入口 = 长按 Dock 空白处
+        return Math.min(slots, used);
     }
 
     @NonNull
@@ -180,11 +180,42 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
 
     // ------------------------------------------------------------ 长按拖动排序
 
-    /** 长按入口：进入拖动待命（手指没动就松手的话由 clearView 转成菜单） */
+    /** 长按后停住不动多久自动弹菜单；一动就取消、改为拖动 */
+    private static final long MENU_DELAY = 280;
+    private Runnable pendingMenu;
+    /** 菜单已经由计时器弹出：随后的 clearView 不要再弹第二次 */
+    private boolean menuHandedOff;
+
+    private void cancelPendingMenu(View any) {
+        if (pendingMenu != null) {
+            any.removeCallbacks(pendingMenu);
+            pendingMenu = null;
+        }
+    }
+
+    /**
+     * 长按入口：进入拖动待命，并起一个 280ms 的「停手计时器」——
+     * 停住不动就把菜单弹出来（不用等松手），手指一动就取消计时器、纯拖动。
+     */
     private void onLongPress(VH vh) {
         if (dragHelper == null) return;
         int pos = vh.getBindingAdapterPosition();
-        if (pos >= 0 && pos < host.dockPkgs().size()) dragHelper.startDrag(vh);
+        if (pos < 0 || pos >= host.dockPkgs().size()) return;
+        final View item = vh.itemView;
+        cancelPendingMenu(item);
+        menuHandedOff = false;
+        dragHelper.startDrag(vh);
+        pendingMenu = () -> {
+            pendingMenu = null;
+            menuHandedOff = true;
+            item.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
+            item.setElevation(0);
+            int p = vh.getBindingAdapterPosition();
+            if (p >= 0 && p < host.dockPkgs().size()) {
+                host.onDockLongClick(p, host.dockPkgs().get(p));
+            }
+        };
+        item.postDelayed(pendingMenu, MENU_DELAY);
     }
 
     /** MainActivity 在 rvDock.setAdapter 之后调用一次 */
@@ -204,6 +235,7 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
                 int from = a.getBindingAdapterPosition(), to = b.getBindingAdapterPosition();
                 int used = host.dockPkgs().size();
                 if (from < 0 || to < 0 || from >= used || to >= used) return false;
+                cancelPendingMenu(a.itemView);   // 开始换位 = 用户要拖，别再弹菜单
                 List<String> pkgs = host.dockPkgs();
                 pkgs.add(to, pkgs.remove(from));
                 notifyItemMoved(from, to);
@@ -232,15 +264,20 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
             @Override
             public void clearView(@NonNull RecyclerView rv, @NonNull RecyclerView.ViewHolder vh) {
                 super.clearView(rv, vh);
+                cancelPendingMenu(vh.itemView);
                 vh.itemView.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
                 vh.itemView.setElevation(0);
                 boolean moved = dragMoved;
                 dragMoved = false;
+                if (menuHandedOff) {          // 菜单已经弹过了（手指还按着时弹的）
+                    menuHandedOff = false;
+                    return;
+                }
                 if (moved) {
                     host.onDockOrderChanged();   // 拖动过 → 只存新顺序
                     return;
                 }
-                // 没拖动 = 长按原地松手 → 弹原来的长按菜单
+                // 没拖动也没弹过菜单（例如没到 280ms 就抬手）
                 int pos = vh.getBindingAdapterPosition();
                 if (pos >= 0 && pos < host.dockPkgs().size()) {
                     host.onDockLongClick(pos, host.dockPkgs().get(pos));
