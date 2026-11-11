@@ -31,27 +31,55 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 public class PipDeskHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "PipDeskHook";
-    /** Display.TYPE_VIRTUAL */
+    /**
+     * android.view.Display.TYPE_VIRTUAL = 5（TYPE_INTERNAL=1, TYPE_EXTERNAL=2,
+     * TYPE_WIFI=3, TYPE_OVERLAY=4, TYPE_VIRTUAL=5，已核对 AOSP 源码）。
+     */
     private static final int TYPE_VIRTUAL = 5;
     private static final String PAUSE_REASON = "pauseBackTasks";
+    /**
+     * 主补丁开关默认 **关**。
+     *
+     * 0.1 的教训：装上就生效，一旦判据在任何真实场景下误伤（虚拟屏上的**同屏**
+     * 正常切换也走 pauseBackTasks），就会把 ActivityRecord 状态机搞乱，
+     * system_server 崩溃 = 整机黑屏卡死。所以 0.2 起默认只观察不拦截，
+     * 确认日志里判得准之后再 setprop persist.pipdesk.hook.pause 1 打开。
+     */
+    private static final boolean PAUSE_DEFAULT = false;
 
     @Override
     public void handleLoadPackage(LoadPackageParam lp) {
         if (!"android".equals(lp.packageName)) return;   // 只进 system_server
-        XposedBridge.log(TAG + " 已加载到 system_server（版本 0.1）");
-        hookStartPausing(lp);
-        hookSetFocusedApp(lp);
+        try {
+            XposedBridge.log(TAG + " 已加载到 system_server（版本 0.2，默认观察模式）");
+            hookStartPausing(lp);
+            hookSetFocusedApp(lp);
+        } catch (Throwable t) {
+            // 任何初始化异常都不能冒出去：这里抛了就是 system_server 崩溃 = 整机黑屏
+            XposedBridge.log(TAG + " 初始化异常（模块停用，系统不受影响）：" + t);
+        }
     }
 
     // ------------------------------------------------------------ 主补丁
 
     /**
-     * 拦掉「跨屏的 pauseBackTasks」。
+     * 拦掉「跨屏的 pauseBackTasks」——只拦**真正的跨屏污染**。
      *
      * 目标方法（Android 12 / 本 ROM，已用 dexdump 核对过签名）：
-     *   com.android.server.wm.Task#startPausingLocked(boolean z, ActivityRecord resuming, String reason) : boolean
-     * pauseBackTasks 的 lambda 里就是用它，reason 固定是 "pauseBackTasks"。
-     * 返回 false = "没暂停任何 activity"，调用方只会少加一个计数，不影响其它逻辑。
+     *   com.android.server.wm.Task#startPausingLocked(boolean uiSleeping, ActivityRecord resuming, String reason) : boolean
+     *
+     * 0.1 的严重教训：pauseBackTasks 也是**同屏正常切换**的标准路径（在虚拟屏里
+     * 打开新应用时，系统用它暂停屏内旧应用）。0.1 一刀切把虚拟屏上所有
+     * pauseBackTasks 都拦了，屏内旧应用保持 resumed、新应用也 resumed，
+     * ActivityRecord 状态机错乱 → system_server 崩溃 → 整机黑屏。
+     *
+     * 0.2 的判据：startPausingLocked 的第二个参数 resuming 是"正在被恢复的那个
+     * activity"。跨屏污染时，调用方（别的屏的恢复链）传进来的 resuming 和
+     * 被暂停的 task **不在同一块屏**；正常的同屏 pauseBackTasks 里两者同屏。
+     * 所以：resuming 为 null → 放行；resuming 与 task 同屏 → 放行；
+     * 不同屏 + task 在虚拟屏 + 开关打开 → 才拦。
+     *
+     * 返回 false = "没暂停任何 activity"，调用方只会少加一个计数。
      */
     private void hookStartPausing(final LoadPackageParam lp) {
         try {
@@ -62,16 +90,23 @@ public class PipDeskHook implements IXposedHookLoadPackage {
                         protected void beforeHookedMethod(MethodHookParam p) {
                             try {
                                 if (!PAUSE_REASON.equals(p.args[2])) return;
-                                if (!enabled("persist.pipdesk.hook.pause", true)) return;
+                                Object resuming = p.args[1];
+                                if (resuming == null) return;   // 没有恢复方上下文，不敢判
+                                int taskDisp = displayId(p.thisObject);
+                                int resumingDisp = displayId(resuming);
+                                if (taskDisp < 0 || resumingDisp < 0) return;  // 判不了 → 放行
+                                boolean crossScreen = resumingDisp != taskDisp;
+                                if (!crossScreen) return;       // 同屏切换，正常流程，放行
+                                // 跨屏才看类型与开关
                                 int type = displayType(p.thisObject);
-                                int disp = displayId(p.thisObject);
-                                // 只拦虚拟屏：主屏（display 0 / TYPE_BUILT_IN）一律放行。
-                                // 取不到 type 时按 displayId 兜底判断，避免 SDK 差异导致整条补丁失效。
-                                boolean virtual = (type == TYPE_VIRTUAL) || (type == -1 && disp > 0);
-                                if (!virtual) return;
+                                boolean enabled = enabled("persist.pipdesk.hook.pause", PAUSE_DEFAULT);
+                                XposedBridge.log(TAG + " 跨屏 pauseBackTasks：task屏=" + taskDisp
+                                        + " resuming屏=" + resumingDisp + " type=" + type
+                                        + " 开关=" + enabled);
+                                if (!enabled) return;           // 观察模式：只记日志
+                                if (type != TYPE_VIRTUAL) return;  // 只拦虚拟屏，type 不明一律放行
                                 p.setResult(Boolean.FALSE);
-                                XposedBridge.log(TAG + " 已拦截跨屏 pauseBackTasks：display=" + disp
-                                        + " type=" + type + " task=" + p.thisObject);
+                                XposedBridge.log(TAG + " 已拦截跨屏 pauseBackTasks：display=" + taskDisp);
                             } catch (Throwable t) {
                                 XposedBridge.log(TAG + " 拦截异常（放行原逻辑）：" + t);
                             }
@@ -101,8 +136,9 @@ public class PipDeskHook implements IXposedHookLoadPackage {
                                 Object prev = XposedHelpers.getObjectField(p.thisObject, "mFocusedApp");
                                 XposedBridge.log(TAG + " focusedApp 将被清空 display=" + disp
                                         + " 原值=" + prev + " type=" + type);
-                                boolean virtual = (type == TYPE_VIRTUAL) || (type == -1 && disp > 0);
-                                if (enabled("persist.pipdesk.hook.focus", false) && virtual && prev != null) {
+                                // 类型必须确认为虚拟屏才动手，不再按 displayId 猜
+                                if (enabled("persist.pipdesk.hook.focus", false)
+                                        && type == TYPE_VIRTUAL && prev != null) {
                                     p.setResult(Boolean.FALSE);   // 保持原 focusedApp
                                     XposedBridge.log(TAG + " 已阻止清空 focusedApp display=" + disp);
                                 }
