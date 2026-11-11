@@ -843,24 +843,34 @@ public class PipPane {
         if (hadApp) restoreDesktop();
     }
 
-    /** 把桌面拉回前台。设置页在前台时不抢焦点 */
+    /**
+     * 把桌面拉回前台。设置页在前台时不抢焦点。
+     *
+     * ★ 只拉一次，且只在"桌面真的被盖住了"的时候拉。
+     *   每次 startActivity(MainActivity) 都会让系统把桌面 task 前置/reparent，
+     *   而 resume 一块屏上的 activity 会触发 `pauseBackTasks` ——
+     *   这台 ROM 上它是**全屏生效**的，会把两块虚拟屏上的 activity 一起 pause：
+     *     wm_set_resumed_activity [0,richdesk/.MainActivity,reparent]
+     *     wm_pause_activity [com.tw.bt/.ATBluetoothActivity,pauseBackTasks]
+     *     wm_pause_activity [cn.wenyu.bodian/.MainActivity,pauseBackTasks]
+     *   画中画随之停帧。原来这里 delay{180,600} 拉两次 = 连打两轮 pause。
+     */
     private void restoreDesktop() {
         // 注意：任务被搬到主屏的瞬间，系统会把桌面 pause 掉（MainActivity.mainResumed 变 false），
         // 所以这里必须在释放前就把"桌面当时是否在前台"记下来，不能等延迟任务里再判断。
         if (!AppState.mainResumed) return;
-        for (long delay : new long[]{180, 600}) {
-            main.postDelayed(() -> {
-                try {
-                    // 明确拉自己的桌面（singleTask，只会前置不会重建），
-                    // 用 CATEGORY_HOME 的话会被系统默认桌面接管
-                    Intent h = new Intent(app, MainActivity.class);
-                    h.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                    app.startActivity(h);
-                } catch (Throwable t) {
-                    Log.w(TAG, "拉回桌面失败", t);
-                }
-            }, delay);
-        }
+        main.postDelayed(() -> {
+            if (!AppState.mainResumed) return;
+            try {
+                // 明确拉自己的桌面（singleTask，只会前置不会重建），
+                // 用 CATEGORY_HOME 的话会被系统默认桌面接管
+                Intent h = new Intent(app, MainActivity.class);
+                h.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                app.startActivity(h);
+            } catch (Throwable t) {
+                Log.w(TAG, "拉回桌面失败", t);
+            }
+        }, 400);
     }
 
     private final Runnable recreateTask = this::recreateNow;
@@ -940,57 +950,92 @@ public class PipPane {
     }
 
     /**
-     * 把应用 task 弄回本面板的虚拟屏。两级策略：先搬，搬不活再重建。
+     * 把应用 task 弄回本面板的虚拟屏。
      *
-     * 为什么不是单一策略 —— 车机日志给了两个互相矛盾的实证：
+     * **规则：task 已在本屏 → 只补 resume，绝不动它的位置；
+     *          task 在别的屏 → 删掉重建到本屏，绝不用 move-stack。**
      *
-     * ① 搬能救活（18:15:16，v0.21.6）：
-     *      PipDesk: 自愈：任务跑到 display 0（本屏 56），搬回 com.tw.bt
-     *      PipDesk: moveTask(shell move-stack) 1779 -> display 56
-     *      18:15:16.648  LIFE focus=true  p0=com.tw.bt:f14  ← 帧数立刻恢复
-     *    这块屏此前已经停帧 23 秒，搬完立刻出帧。所以搬这条路不能删。
+     * 为什么彻底禁用跨屏搬 task（车机 UIS7862 全量日志实证）：
      *
-     * ② 搬也会把 activity 拆了重建（18:23:56，v0.21.7）：
-     *      moveTask(shell move-stack) 1779 -> display 58
-     *      wm_on_destroy_called / wm_on_create_called  com.tw.bt/.ATBluetoothActivity
-     *      Focused display #58 does not have a focused window
-     *    因为主屏 1920x1200 与虚拟屏 629x1045 尺寸/DPI 不同，跨屏 reparent 在
-     *    AMS 眼里是一次配置变更 → 销毁重建；重建那几百毫秒目标屏没有可聚焦窗口，
-     *    焦点可能被交还 display 0 的 home，activity 反而被 pause 掉。
-     *    这种情况下再搬几次都是白搬。
+     *   20:33:23.455  InputDispatcher: Found window Letterbox_right_ActivityRecord{...}
+     *                 in display 0, but it should belong to display 85
+     *   20:33:23.456  wm_pause_activity [cn.wenyu.bodian/.MainActivity, pauseBackTasks]
      *
-     * 所以：搬 → resume → **验证 1.5 秒内真的出新帧**；没新帧说明这条 task 已经
-     * 被系统判成"不该在这块屏"，才删 task 在目标屏重建（removeTask 只销毁 activity，
-     * 进程和常驻 service 不受影响，蓝牙放歌不会断）。
+     * 主屏是 1920x1200，虚拟屏是 629x1045 / 1259x1045。task 只要在 display 0 上
+     * 出现过一次，WindowManager 就会给它挂一对 Letterbox 子窗口（因为尺寸不合）。
+     * 用 move-stack 把它挪到虚拟屏时，**子窗口的输入通道仍然登记在 display 0**。
+     * 而 WMS 与 InputDispatcher 正是靠这个归属来仲裁「哪块屏持有输入焦点」：
+     *
+     *   InputDispatcher: Focused display #84 does not have a focused window.
+     *   InputDispatcher: But another display has a focused window
+     *   InputDispatcher:   FocusedWindows: displayId=0, name='...richdesk/MainActivity'
+     *
+     * 两边对不上 → WMS 放弃，把虚拟屏的 mFocusedApp 清成 null →
+     * 焦点回落主屏 home → home 被 reparent 成 resumed → `pauseBackTasks`
+     * 把**所有屏**上 resumed 的 activity 一起 pause → 画中画只剩最后一帧。
+     *
+     * 所以每搬一次，都是在给下一轮焦点仲裁埋雷。删了重建虽然会重建一次 activity
+     * （removeTask 只销毁 activity，进程和常驻 service 不动，蓝牙放歌不受影响），
+     * 但新 task 从出生就带着虚拟屏的尺寸，不会在主屏产生 letterbox。
      */
     private void forceToDisplay(final String targetPkg, final int display) {
         new Thread(() -> {
+            final int[] st = taskState(targetPkg);
             final int tid = findTaskId(targetPkg);
-            final boolean moved = tid >= 0 && moveTask(tid, display);
-            Log.i(TAG, "搬回本屏：" + targetPkg + " task=" + tid + " -> " + display + " move=" + moved);
-            main.postDelayed(() -> {
-                if (!targetPkg.equals(pkg) || displayId != display) return;
-                livePkg = targetPkg;
-                launchOn(targetPkg, display);          // task 搬过去不等于 activity resume
-                showContentAfter(450);
-                final long base = frames;
+            final int at = (st == null) ? -1 : st[0];
+            // ★ 关键：task 已经在本屏 → **绝对不能搬**。
+            //   搬（move-stack）是跨屏 reparent，会在这台 ROM 上留下输入窗口归属错乱
+            //   （InputDispatcher: Found window Letterbox_... in display 0, but it should
+            //   belong to display 85），而 WMS 正是靠这个归属仲裁「哪块屏持有焦点」。
+            //   归属一错，下一轮焦点重算就会把虚拟屏的 mFocusedApp 清成 null，
+            //   焦点回落主屏 home，home 被 resume 就 pauseBackTasks 把两块屏一起 pause。
+            //   这就是"越救越卡"的成因：我们的自愈本身在污染焦点系统。
+            final boolean needRebuild = at != display;
+            Log.i(TAG, "自愈动作：" + targetPkg + " task=" + tid + " 在屏" + at
+                    + "，目标 " + display + (needRebuild ? " → 重建到本屏" : " → 只补 resume"));
+            if (!needRebuild) {
+                // 就在本屏：只补一次 startActivity 让它 resume，不碰 task 位置
                 main.postDelayed(() -> {
                     if (!targetPkg.equals(pkg) || displayId != display) return;
-                    if (frames > base) return;         // 搬回来就活了，收工
-                    Log.w(TAG, "搬回后 1.5s 无新帧，改为删 task 重建：" + targetPkg);
-                    new Thread(() -> {
-                        final int t2 = findTaskId(targetPkg);
-                        if (t2 >= 0) removeTask(t2);
-                        main.postDelayed(() -> {
-                            if (!targetPkg.equals(pkg) || displayId != display) return;
-                            Log.i(TAG, "重建到本屏：display " + display + " 新建 task " + targetPkg);
-                            launchOn(targetPkg, display);
-                            showContentAfter(450);
-                        }, 260);
-                    }, "pipdesk-rebuild").start();
-                }, 1500);
-            }, 320);
+                    livePkg = targetPkg;
+                    launchOn(targetPkg, display);
+                    showContentAfter(450);
+                    final long base = frames;
+                    main.postDelayed(() -> {
+                        if (!targetPkg.equals(pkg) || displayId != display) return;
+                        if (frames > base) return;
+                        // resume 也救不回来（activity 被系统判成不该在这块屏）→ 重建
+                        Log.w(TAG, "resume 后 1.5s 无新帧，改为删 task 重建：" + targetPkg);
+                        rebuildOn(targetPkg, display);
+                    }, 1500);
+                }, 300);
+                return;
+            }
+            // task 真的跑在别的屏（大多是系统把它拉回主屏了）。
+            // 这里**不再 move-stack**：它会在 display 0 留下 letterbox 输入窗口残骸。
+            // 直接删掉旧 task，在目标虚拟屏上重新建 —— 新 task 从出生就带着虚拟屏的
+            // 尺寸/DPI，不会在主屏产生 letterbox，也就不会污染下一轮焦点仲裁。
+            // removeTask 只销毁 activity，进程与常驻 service 不动，蓝牙放歌不受影响。
+            rebuildOn(targetPkg, display);
         }, "pipdesk-forcedisp").start();
+    }
+
+    /** 删掉旧 task，在目标虚拟屏上重建（唯一允许的"换屏"手段，不用 move-stack） */
+    private void rebuildOn(final String targetPkg, final int display) {
+        new Thread(() -> {
+            final int t = findTaskId(targetPkg);
+            if (t >= 0) {
+                boolean ok = removeTask(t);
+                Log.i(TAG, "重建到本屏：移除旧 task " + t + "(" + targetPkg + ") ok=" + ok);
+            }
+            main.postDelayed(() -> {
+                if (!targetPkg.equals(pkg) || displayId != display) return;
+                Log.i(TAG, "重建到本屏：display " + display + " 新建 task " + targetPkg);
+                livePkg = targetPkg;
+                launchOn(targetPkg, display);
+                showContentAfter(450);
+            }, 260);
+        }, "pipdesk-rebuild").start();
     }
 
     /**
