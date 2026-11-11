@@ -904,6 +904,178 @@ public class PipPane {
         }, "pipdesk-reeensure").start();
     }
 
+    // ------------------------------------------------- 被系统 stop 后自愈
+
+    /** 两次自愈之间的最小间隔：别跟系统的 relaunch 撞车 */
+    private static final long REVIVE_GAP_MS = 3_000L;
+    private volatile long lastReviveAt;
+
+    /**
+     * 全局复活闸门：多块屏共用同一个名额。
+     *
+     * 每次 launchOn 都是一次新的 startActivity，会在 WindowManager 里再触发一次
+     * 焦点重算（现场就是 `setFocusedApp = null`）。几块屏各自复活 = 每几秒搅一次
+     * 全局焦点，刚被拉回来的屏很可能又被另一块屏的复活挤掉 —— 表现就是
+     * "越点越死、几块屏轮流黑"。同一时刻只救一块。
+     */
+    private static final long REVIVE_GLOBAL_GAP_MS = 2_500L;
+    private static volatile long lastReviveGlobal;
+
+    /**
+     * 搬回任务（move-stack）的节流与升级。
+     *
+     * 现场教训：系统把 task 丢回 display 0 之后，每搬一次都是一次全局焦点重算，
+     * 两块屏同时搬就同时重算 —— 刚搬回来的那块又被判掉。所以同一块屏 10 秒内
+     * 搬了两次还被打回来，说明这个 task 已经被系统判死（activity 被 stop 过，
+     * 搬回去也不会恢复），这时不再搬，直接杀进程重开 —— 唯一 100% 能恢复的路。
+     */
+    private static final long MOVE_RETRY_WINDOW_MS = 10_000L;
+    private static final int MOVE_TRIES_BEFORE_RESTART = 2;
+    private volatile long lastMoveAt;
+    private volatile int moveTries;
+
+    /** 「task 跑到另一块虚拟屏」的节流：这是重复桌面实例的特征，处理方式是回收实例而不是搬 task */
+    private static final long FOREIGN_GAP_MS = 3_000L;
+    private volatile long lastForeignAt;
+
+    /**
+     * 停帧自愈：task 在本屏，但里面所有 activity 都被系统 stop 了。
+     *
+     * 车机 UIS7862 / Android 12 实测时间轴（波点音乐播放→暂停→蓝牙播放，必现）：
+     *   焦点在「主屏桌面 / 两个虚拟屏应用」之间来回乒乓（topResumed 每 1.5s 易主）
+     *   → WindowManager: `setFocusedApp mFocusedApp = null`（两块虚拟屏，相隔 130ms）
+     *   → `adjustFocusToNextFocusableTask`：焦点回落到 display 0 的 home
+     *   → 两块屏的 activity 同时 wm_on_paused → wm_on_stop（STOP_ACTIVITY_ITEM）
+     *   → task 被系统归到 display 0，虚拟屏只剩 TextureView 上最后一帧 = 用户说的"卡死"
+     * 音频数据面（AudioFlinger）全程正常，所以歌还在放、画面不动、点击无反应。
+     *
+     * 判据用 task 的 numRunning 而不是帧率：静止页面本来就不出帧，看帧率会大量误杀；
+     * 而「activity 全被 stop」是系统给的确定状态（静止页面 numRunning=1）。
+     */
+    public void probeAndRevive() {
+        final String keep = pkg;
+        final int disp = displayId;
+        if (keep == null || disp < 0) return;
+        if (fullscreened) return;                                  // 应用在主屏全屏，本屏本该是空的
+        new Thread(() -> {
+            final int[] st = taskState(keep);
+            if (st == null) return;                                // 状态读不到：宁可不救，别乱拉
+            if (st[0] != disp) {                                   // 跑到别的屏
+                final long now = android.os.SystemClock.uptimeMillis();
+                // task 落在**另一块虚拟屏**上（既不是本屏也不是主屏）：进程里还有第二套
+                // 画中画在抢同一个应用 —— 车机上就是系统多起了一个桌面实例，两代虚拟屏
+                // 各自 launchOn 抢同一个包。这时候搬 task 是白搬：搬过去、对方再搬回来，
+                // 每搬一次就是一次 pause/stop，画面永远停在最后一帧。只能回收多余实例。
+                if (st[0] != 0) {
+                    if (now - lastForeignAt > FOREIGN_GAP_MS) {
+                        lastForeignAt = now;
+                        Log.w(TAG, "自愈：pane " + index + " " + keep + " 的 task 在另一块虚拟屏 "
+                                + st[0] + "（本屏 " + disp + "），判定为重复桌面实例，回收");
+                        FileLog.append("REVIVE-DUP pane=" + index + " pkg=" + keep
+                                + " taskDisp=" + st[0] + " paneDisplay=" + disp
+                                + " @ " + FileLog.nowStamp());
+                        MainActivity.reclaimDuplicateInstances();
+                    }
+                    return;
+                }
+                if (moveTries >= MOVE_TRIES_BEFORE_RESTART
+                        && now - lastMoveAt < MOVE_RETRY_WINDOW_MS) {
+                    Log.w(TAG, "自愈：pane " + index + " " + keep + " 搬回 " + moveTries
+                            + " 次仍被丢回 display " + st[0] + "，改杀进程重开");
+                    FileLog.append("REVIVE-ESCALATE pane=" + index + " pkg=" + keep
+                            + " 搬回 " + moveTries + " 次无效 -> 重启进程 @ " + FileLog.nowStamp());
+                    moveTries = 0;
+                    lastMoveAt = 0;
+                    main.post(() -> {
+                        if (keep.equals(pkg) && displayId >= 0 && !fullscreened) restartApp();
+                    });
+                    return;
+                }
+                if (now - lastMoveAt < REVIVE_GAP_MS) return;      // 刚搬过，等系统落定再看
+                moveTries++;
+                lastMoveAt = now;
+                Log.w(TAG, "自愈：任务跑到 display " + st[0] + "（本屏 " + disp + "），搬回 "
+                        + keep + "（第 " + moveTries + " 次）");
+                forceToDisplay(keep, disp);
+                return;
+            }
+            moveTries = 0;                                         // 回到本屏：清零
+            // 车机 UIS7862 实测：task 明明 mResumedActivity 在、进程是 pers-top-activity，
+            // getRunningTasks() 的 numRunning 却恒报 0（这 ROM 没填这个字段）。只信它的话
+            // 自愈会每 5 秒把好好的应用"拉回前台"一次，每拉一次就是一次 pause/stop ——
+            // 画面反而被自己搅成"卡死"。所以再拿进程 importance 复核一遍：
+            // 进程还是 visible/foreground，就说明 activity 活着，别碰。
+            if (st[1] > 0 || appVisible(keep)) return;
+            if (android.os.SystemClock.uptimeMillis() - lastReviveAt < REVIVE_GAP_MS) return;
+            main.post(() -> {
+                if (!keep.equals(pkg) || displayId < 0 || fullscreened) return;
+                long now = android.os.SystemClock.uptimeMillis();
+                if (now - lastReviveGlobal < REVIVE_GLOBAL_GAP_MS) return;   // 刚救过别的屏
+                lastReviveGlobal = now;
+                lastReviveAt = now;
+                Log.w(TAG, "自愈：pane " + index + " " + keep
+                        + " 在本屏但 numRunning=0（activity 被系统 stop），拉回前台");
+                FileLog.append("REVIVE pane=" + index + " pkg=" + keep + " numRunning=0"
+                        + " frames=" + frames + " @ " + FileLog.nowStamp());
+                livePkg = keep;
+                launchOn(keep, displayId);
+                ensureOnDisplay(keep, displayId);
+                showContentAfter(600);
+                // 复活必须验证：startActivity 打进去不等于画面动起来。
+                // 3 秒还没有新帧，说明这 task/进程已经被系统判死 → 杀进程重开，
+                // 别再无限"拉回前台"搅全局焦点（那正是把另一块屏也拖死的原因）。
+                final long baseFrames = frames;
+                main.postDelayed(() -> {
+                    if (!keep.equals(pkg) || displayId < 0 || fullscreened) return;
+                    if (frames > baseFrames) return;               // 真活了
+                    Log.w(TAG, "自愈未生效：pane " + index + " " + keep
+                            + " 3s 内没有新帧，改杀进程重开");
+                    FileLog.append("REVIVE-FAIL pane=" + index + " pkg=" + keep
+                            + " 3s 无新帧 -> 重启进程 @ " + FileLog.nowStamp());
+                    restartApp();
+                }, 3000);
+            });
+        }, "pipdesk-revive").start();
+    }
+
+    /**
+     * 目标应用进程现在是不是还"活着可见"（前台或可见）。
+     *
+     * 用来复核 getRunningTasks 的 numRunning —— 这台车机的 ROM 对停在虚拟屏上的 task
+     * 恒报 numRunning=0，光看它会把正常出图的应用判成"被 stop"，进而每几秒拉一次前台。
+     */
+    private boolean appVisible(String targetPkg) {
+        try {
+            ActivityManager am = (ActivityManager) app.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) return false;
+            for (ActivityManager.RunningAppProcessInfo pi : am.getRunningAppProcesses()) {
+                if (pi == null || pi.processName == null) continue;
+                if (!pi.processName.equals(targetPkg)
+                        && !pi.processName.startsWith(targetPkg + ":")) continue;
+                if (pi.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) { }
+        return false;
+    }
+
+    /**
+     * 查 task 的 [displayId, numRunning]；任一读不到返回 null。
+     * numRunning == 0 = task 在这块屏但里面的 activity 全被 stop 了。
+     *
+     * 为什么不用 visible 做判据：getRunningTasks() 在部分 ROM 上只填基础字段，
+     * visible 恒为 false，拿它判定会不停把静止页面拉一遍。
+     */
+    private int[] taskState(String targetPkg) {
+        Object t = findTaskInfo(targetPkg);
+        if (t == null) return null;
+        Integer disp = intField(t, "displayId");
+        Integer running = intField(t, "numRunning");
+        if (disp == null || running == null) return null;
+        return new int[]{disp, running};
+    }
+
     /**
      * 找应用当前所在 task 的 id；找不到返回 -1。
      *

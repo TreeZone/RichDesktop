@@ -183,6 +183,71 @@ public class MainActivity extends AppCompatActivity
     /** 调试入口用（DebugTapReceiver 直接驱动界面自测；无手指/无 adb input 时靠它） */
     static MainActivity instance;
 
+    /**
+     * 当前活着的桌面实例。正常只有一个；但车机上系统会再起一个（见 reapDuplicateInstances），
+     * 所以这里必须用列表而不是单个静态引用 —— 只看 instance 的话，被顶掉的旧实例
+     * 就彻底失联，它的虚拟屏和自愈线程会一直留在后台抢屏内应用。
+     */
+    private static final java.util.ArrayList<java.lang.ref.WeakReference<MainActivity>> liveInstances =
+            new java.util.ArrayList<>();
+
+    private static synchronized void trackInstance(MainActivity a) {
+        for (int i = liveInstances.size() - 1; i >= 0; i--) {
+            MainActivity o = liveInstances.get(i).get();
+            if (o == null || o.isDestroyed()) liveInstances.remove(i);
+        }
+        liveInstances.add(new java.lang.ref.WeakReference<>(a));
+    }
+
+    private static synchronized void untrackInstance(MainActivity a) {
+        for (int i = liveInstances.size() - 1; i >= 0; i--) {
+            MainActivity o = liveInstances.get(i).get();
+            if (o == null || o == a) liveInstances.remove(i);
+        }
+    }
+
+    /**
+     * 回收重复的桌面实例（**这就是"蓝牙一放歌，两块画中画一起卡死"的元凶**）。
+     *
+     * 车机现场抓到的状态：system_server 里同时存在两个 com.cz.richdesk/.MainActivity
+     * （task 1800 与 task 1806），各自建了 3 块虚拟屏（PipDesk-0/1/2 各两代，
+     * display 58/59/60 + 61/62/63 六块并存）。于是同一个屏内应用有两个"主人"：
+     * 旧实例的 pane0 隔几秒 launchOn(58)、新实例的 pane0 隔几秒 launchOn(61)，
+     * 谁后动手谁把 activity 搬过去 —— 每次搬家都是一次 pause/stop。
+     * 结果 task 在 58 ↔ 61 之间来回跳，两边虚拟屏都只剩最后一帧 = 用户说的"卡死"，
+     * 而且自愈越勤、抖得越厉害。
+     *
+     * 处理：只保留最后起来的那个实例，其余立刻 finish —— onDestroy 里的 pip.release()
+     * 会把它们的虚拟屏真正释放掉，屏内应用的 task 归到一层屏上，画面才能动起来。
+     */
+    private static void reapDuplicateInstances(final MainActivity keep) {
+        final java.util.ArrayList<MainActivity> dup = new java.util.ArrayList<>();
+        synchronized (MainActivity.class) {
+            for (int i = liveInstances.size() - 1; i >= 0; i--) {
+                MainActivity o = liveInstances.get(i).get();
+                if (o == null || o == keep || o.isDestroyed()) continue;
+                dup.add(o);
+            }
+        }
+        for (final MainActivity o : dup) {
+            Log.w("PipDesk", "发现第二个桌面实例，回收旧实例（它的虚拟屏会一并释放）");
+            FileLog.append("DUP-INSTANCE 回收旧桌面实例 task=" + (o.getTaskId())
+                    + " 保留=" + keep.getTaskId() + " @ " + FileLog.nowStamp());
+            o.runOnUiThread(() -> {
+                try { o.finish(); } catch (Throwable ignored) { }
+            });
+        }
+    }
+
+    /**
+     * 供 PipPane 调用：屏内应用的 task 落在**另一块虚拟屏**上（既不是本屏也不是主屏），
+     * 说明进程里还有第二套画中画在抢它 —— 立刻回收重复实例，别在这儿死搬 task。
+     */
+    static void reclaimDuplicateInstances() {
+        MainActivity cur = instance;
+        if (cur != null && !cur.isDestroyed()) reapDuplicateInstances(cur);
+    }
+
     void debugPage(int page) {
         if (pager != null) pager.setCurrentPageSmooth(page);
     }
@@ -317,6 +382,8 @@ public class MainActivity extends AppCompatActivity
         // 全局绘制开关必须早于任何 Ui.glass / Ui.clipRounded 调用
         Ui.syncPerfMode(this);
         instance = this;
+        trackInstance(this);
+        reapDuplicateInstances(this);   // 系统偶尔会把桌面再起一个实例（见方法注释）
         AppState.app = getApplicationContext();   // 语音链路要一个不依赖 Activity 的上下文
         FileLog.start(this);       // 日志落盘（排查车机问题用），越早启动越完整
         Watchdog.start();          // 主线程卡死自动 dump 堆栈，车机上不用连 adb 也能取到现场
@@ -3131,6 +3198,7 @@ public class MainActivity extends AppCompatActivity
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        untrackInstance(this);
         if (instance == this) instance = null;
         Voice.get().detach();
         Voice.get().stop();          // 内部丢后台线程收尾，不阻塞主线程

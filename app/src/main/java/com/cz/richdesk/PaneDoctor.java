@@ -33,7 +33,8 @@ public final class PaneDoctor {
 
     private static final String TAG = "PipDesk";
 
-    private static final long PERIOD_MS = 8000L;           // 巡检周期（4s → 8s：getProcessesInErrorState 是全校举的 binder 调用，没必要那么勤）
+    private static final long PERIOD_MS = 1000L;           // 停帧检测只读 volatile 帧数，按 1s 跑；ANR 全校举扫描仍每 8 拍一次
+    private static final int ANR_EVERY_N_TICKS = 8;
     private static final long SAME_STATE_GAP_MS = 60_000L; // 同一次 ANR 的不应期
     private static final long WINDOW_MS = 10 * 60_000L;    // 重启次数统计窗口
     private static final int MAX_AUTO_RESTART = 2;         // 窗口内最多自动重启几次
@@ -72,6 +73,9 @@ public final class PaneDoctor {
         synchronized (stall) {
             stall.clear();
         }
+        synchronized (lastProbeAt) {
+            lastProbeAt.clear();
+        }
     }
 
     private static void loop() {
@@ -79,10 +83,13 @@ public final class PaneDoctor {
         while (true) {
             try {
                 Thread.sleep(PERIOD_MS);
-                tick();
-                // 每 8 个周期（约 32s）打一条帧心跳：卡死时对照时间轴，
-                // 就能看出"三块屏是同一时刻一起停帧"，还是各自陆续停的。
-                if (++tick % 8 == 0) heartbeat();
+                int n = ++tick;
+                PipManager p = pip;
+                if (p != null && p.count() > 0) checkStall(p);     // 每秒：只读 volatile 帧数，便宜
+                if (n % ANR_EVERY_N_TICKS == 0) tick();            // 每 8s：ANR 全校举扫描
+                // 每 32 个周期（约 32s）打一条帧心跳：卡死时对照时间轴，
+                // 就能看出"多块屏是同一时刻一起停帧"，还是各自陆续停的。
+                if (n % 32 == 0) heartbeat();
             } catch (InterruptedException e) {
                 return;
             } catch (Throwable ignored) {
@@ -125,7 +132,6 @@ public final class PaneDoctor {
     private static void tick() {
         PipManager p = pip;
         if (p == null || p.count() == 0) return;
-        checkStall(p);
         List<ActivityManager.ProcessErrorStateInfo> list;
         try {
             ActivityManager am = (ActivityManager) app.getSystemService(Context.ACTIVITY_SERVICE);
@@ -193,8 +199,16 @@ public final class PaneDoctor {
 
     // ------------------------------------------------------------ 同时停帧检测
 
-    private static final long STALL_MS = 12_000L;      // 单块屏多久没新帧算"停住"
+    /*
+     * 单块屏多久没新帧算"停住"。12s → 2s。
+     * 判据不是帧率而是 task 的 numRunning（静止页面 numRunning=1，不会被误伤），
+     * 所以可以判得很快 —— 快一秒判出来，用户就少一秒盯着冻住的画面。
+     */
+    private static final long STALL_MS = 2_000L;
     private static final long STALL_LOG_GAP_MS = 60_000L;
+    /** 同一块屏两次探测（binder 读 task 状态）之间的最小间隔 */
+    private static final long PROBE_GAP_MS = 1_200L;
+    private static final Map<Integer, Long> lastProbeAt = new HashMap<>();
 
     /** pane index → [上次帧数, 帧数最后变化时刻, 进入停帧的时刻(0=未停)] */
     private static final Map<Integer, long[]> stall = new HashMap<>();
@@ -232,6 +246,15 @@ public final class PaneDoctor {
                 if (!"ON".equals(pane.displayState())) continue;        // 屏被系统关了，另一类问题
                 if (st[2] == 0L && now - st[1] > STALL_MS) st[2] = now;  // 刚停住
                 if (st[2] == 0L) continue;
+                // 停帧期间持续探（按 PROBE_GAP_MS 节流），而不是"刚停住"那一刻只探一次：
+                // 现场顺序是先静止（activity 还活着）→ 焦点被判掉才把它 stop，
+                // 只判一次就正好错过后面才发生的 stop。
+                // 真正"拉回前台 / 重启"的频率由 PipPane 自己的闸门与升级策略控制。
+                Long lp = lastProbeAt.get(i);
+                if (lp == null || now - lp >= PROBE_GAP_MS) {
+                    lastProbeAt.put(i, now);
+                    pane.probeAndRevive();
+                }
                 if (now - st[2] > 45_000L) continue;                    // 太久远的不算"一起"
                 recentlyStopped++;
                 detail.append(" p").append(i).append('=').append(pane.pkg())

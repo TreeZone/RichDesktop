@@ -715,6 +715,12 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
 
     public void release() {
         for (PipPane p : panes) p.release();
+        // 单画专用屏（PipDesk-2）也必须释放：build()/Activity 销毁都走这里，
+        // 漏掉它就等于每次重建都多泄漏一块虚拟屏（车机上实测 6 块并存）。
+        if (singlePane != null) {
+            singlePane.release();
+            singlePane = null;
+        }
     }
 
     /** 包外部启动的 Intent，供全屏兜底使用 */
