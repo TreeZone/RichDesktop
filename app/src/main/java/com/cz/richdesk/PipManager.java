@@ -23,6 +23,16 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     public interface Listener {
         void onOpened(int index, String pkg);
         void onClosed(int index);
+        /**
+         * 新建了一块面板视图。宿主必须在这里给它补绑手势监听。
+         *
+         * 为什么需要这个回调：主页那 N 块屏是 build() 里一次性建好的，宿主初始化
+         * （和改屏数重建）时逐个绑监听就够了。但**单画专用屏是运行时懒创建的**
+         * （见 ensureSinglePane），它不在 panes 里，宿主的遍历永远扫不到它 ——
+         * 漏绑的后果是这块屏**完全不吃触摸**：点按、滑动全落到宿主 PaneBox 上，
+         * 屏内应用一点反应都没有（用户报的"独立画中画点不动、怎么划都没效果"）。
+         */
+        default void onPaneCreated(PipPane pane) { }
     }
 
     private final Context app;
@@ -170,6 +180,16 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         if (singlePane != null) return singlePane;
         singlePane = new PipPane(app, panes.size(), dpi, cornerDp, this);
         container.addView(singlePane.root);
+        // 【关键】这块屏是运行时建的，宿主的 bindPaneGestures() 只遍历 panes，扫不到它。
+        // 不在这里补绑，单画屏就彻底不吃触摸（点按无反应、滑动被宿主当成翻页/拖拽），
+        // 表现就是"独立打开的画中画是个死画面"。绑完才算真正可用。
+        if (listener != null) {
+            try {
+                listener.onPaneCreated(singlePane);
+            } catch (Throwable t) {
+                Log.e(TAG, "单画屏绑手势失败", t);
+            }
+        }
         FileLog.append("单画：创建专用虚拟屏（主页画中画 " + panes.size() + " 块不动）");
         return singlePane;
     }
@@ -607,6 +627,15 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     public void close(int index) {
         PipPane p = pane(index);
         if (p != null) p.close();
+    }
+
+    /**
+     * 收掉单画：把屏内应用顶回后台，并退出单画布局（主页比例恢复）。
+     * 虚拟屏本身保留复用 —— 跟 {@link #close(int)} 一个取舍，下次单画仍是秒级。
+     */
+    public void closeSingle() {
+        if (singlePane != null) singlePane.close();
+        restoreSingle();
     }
 
     /** 当前是否处于「单画」临时布局 */

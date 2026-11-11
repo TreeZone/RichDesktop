@@ -34,6 +34,10 @@ public final class VoiceIntent {
         public String label;
         /** 归一化之后实际用于匹配的说法（写日志 / 教别名时用） */
         public String text = "";
+        /** 命中分数（0~100，只有 APP 有） */
+        public int score;
+        /** 命中的是哪一层：name / prefix / contains / edit / pinyin / alias:xxx */
+        public String via = "";
         public final List<AppInfo> candidates = new ArrayList<>();
     }
 
@@ -106,19 +110,27 @@ public final class VoiceIntent {
         if (q.isEmpty() || apps == null || apps.isEmpty()) return r;
 
         Map<AppInfo, Integer> scored = new HashMap<>();
+        Map<AppInfo, String> why = new HashMap<>();
         List<AppInfo> ordered = new ArrayList<>();
         for (AppInfo a : apps) {
             if (a == null || a.pkg == null) continue;
-            int s = scoreOne(q, a.label);
+            String[] src = new String[1];
+            int s = scoreOneEx(q, a.label, src);
+            String via = src[0];
             Set<String> al = aliases == null ? null : aliases.get(a.pkg);
             if (al != null) {
                 for (String x : al) {
-                    int s2 = scoreOne(q, x) + 4;   // 用户亲口教的说法，优先级略高于名字
-                    if (s2 > s) s = s2;
+                    String[] src2 = new String[1];
+                    int s2 = scoreOneEx(q, x, src2) + 4;   // 用户亲口教的说法，优先级略高于名字
+                    if (s2 > s) {
+                        s = s2;
+                        via = "alias:" + src2[0];
+                    }
                 }
             }
             if (s >= MIN_SCORE) {
                 scored.put(a, s);
+                why.put(a, via == null ? "?" : via);
                 ordered.add(a);
             }
         }
@@ -129,6 +141,8 @@ public final class VoiceIntent {
         int bestScore = scored.get(best);
         r.pkg = best.pkg;
         r.label = best.label;
+        r.score = bestScore;
+        r.via = why.get(best);
 
         if (ordered.size() > 1 && bestScore - scored.get(ordered.get(1)) < AMBIGUOUS_GAP) {
             // 差得太近 = 听不出是哪个：与其赌一个，不如让用户点（点完会记成别名）
@@ -170,15 +184,45 @@ public final class VoiceIntent {
      * ASR 的错字（小助 / 小住 / 小朱）一并当唤醒词处理。
      */
     private static final String[] WAKE_WORDS = {
+            "你好小瑞", "你好小锐", "你好小睿", "你好小蕊", "你好小芮",
             "你好小桌", "小桌小桌", "小桌同学", "你好晓桌", "你好小助",
-            "你好", "小桌", "小助", "小住", "小朱", "小竹",
+            "你好", "小瑞", "小锐", "小睿", "小蕊",
+            "小桌", "小助", "小住", "小朱", "小竹",
             "我在", "我在呢",           // 助手自己的 TTS 回复被回采进来的情况
     };
+
+    /**
+     * 用户在设置里配的唤醒词（由 Voice 加载语音时注入）。
+     *
+     * 为什么必须动态注进来：上面那张表是写死的，而唤醒词是可以改的 ——
+     * 默认就是「你好小瑞」，改过之后表里那些「小桌」全都对不上，
+     * 于是「你好小瑞，打开微信」识别成一整句去匹配应用名，永远匹配不上。
+     */
+    private static volatile String[] customWake = new String[0];
+
+    /** 设置当前唤醒词。会同时接受完整词和去前缀后的短词（「你好小瑞」→「小瑞」） */
+    static void setWakeWord(String word) {
+        if (word == null || word.trim().isEmpty()) {
+            customWake = new String[0];
+            return;
+        }
+        String w = word.trim();
+        String tail = w.length() > 2 ? w.substring(2) : "";
+        customWake = tail.length() >= 2 ? new String[]{w, tail} : new String[]{w};
+    }
 
     private static String stripWake(String t) {
         String s = t;
         for (int guard = 0; guard < 3; guard++) {
             boolean hit = false;
+            for (String w : customWake) {
+                if (s.startsWith(w) && s.length() > w.length()) {
+                    s = s.substring(w.length());
+                    hit = true;
+                    break;
+                }
+            }
+            if (hit) continue;
             for (String w : WAKE_WORDS) {
                 if (s.startsWith(w) && s.length() > w.length()) {
                     s = s.substring(w.length());
@@ -215,22 +259,92 @@ public final class VoiceIntent {
 
     /** 单个候选名打分（0 = 不沾边） */
     static int scoreOne(String q, String name) {
+        return scoreOneEx(q, name, null);
+    }
+
+    /**
+     * 打分，并告诉调用方是**哪一层**命中的。
+     *
+     * 层次按可信度从高到低：完全相同 → 前缀 → 包含 → 编辑距离 → 拼音。
+     * 把来源带出来是为了排障：日志里看到「70分 pinyin」就知道这句是靠读音硬凑的，
+     * 真要是匹配错了，一眼能看出该往哪儿调。
+     *
+     * @param src 长度 ≥1 的数组，用来接收来源；可传 null
+     */
+    static int scoreOneEx(String q, String name, String[] src) {
         if (name == null) return 0;
         String s = normalize(name);
         if (s.isEmpty() || q.isEmpty()) return 0;
-        if (s.equals(q)) return 100;
+        if (s.equals(q)) {
+            set(src, "name");
+            return 100;
+        }
         if (q.length() >= 2) {
-            if (s.startsWith(q)) return clamp(94 - (s.length() - q.length()) * 2, 62, 94);
-            if (s.contains(q)) return clamp(90 - (s.length() - q.length()) * 2, 62, 90);
-            if (s.length() >= 2 && q.contains(s)) return clamp(88 - (q.length() - s.length()), 62, 88);
+            if (s.startsWith(q)) {
+                set(src, "prefix");
+                return clamp(94 - (s.length() - q.length()) * 2, 62, 94);
+            }
+            if (s.contains(q)) {
+                set(src, "contains");
+                return clamp(90 - (s.length() - q.length()) * 2, 62, 90);
+            }
+            if (s.length() >= 2 && q.contains(s)) {
+                set(src, "contains");
+                return clamp(88 - (q.length() - s.length()), 62, 88);
+            }
         }
         // 编辑距离：只在不长不短的说法上启用，太短（1 个字）会到处乱命中
         int maxLen = Math.max(s.length(), q.length());
         if (q.length() >= 3 && Math.abs(s.length() - q.length()) <= Math.max(1, maxLen / 2)) {
             int d = distance(s, q, 3);
             double ratio = 1 - (double) d / maxLen;
-            if (ratio >= 0.5) return (int) Math.round(40 + ratio * 40);   // 0.5→60, 1.0→80
+            if (ratio >= 0.5) {
+                set(src, "edit");
+                return (int) Math.round(40 + ratio * 40);   // 0.5→60, 1.0→80
+            }
         }
+        // 最后一道网：按**读音**再比一次。
+        // 说话产生的错字多半是同音/近音（网易云 → 网亦云、酷狗 → 酷够、爱奇艺 → 爱奇异），
+        // 这些在字形上差得很远，编辑距离救不回来，读音却几乎一样。
+        int py = pinyinScore(q, s);
+        if (py > 0) set(src, "pinyin");
+        return py;
+    }
+
+    private static void set(String[] src, String v) {
+        if (src != null && src.length > 0) src[0] = v;
+    }
+
+    /**
+     * 按拼音比较，返回 0 表示不沾边。
+     *
+     * 分数刻意压在字形匹配之下（最高 78）：字形能对上说明更可能是它，
+     * 不能被一个"听着像"的候选抢走。只有字形完全对不上时才靠这一档兜底。
+     */
+    private static int pinyinScore(String q, String s) {
+        if (q.length() < 2 || s.length() < 2) return 0;
+        String pq = Pinyin.of(q);
+        String ps = Pinyin.of(s);
+        if (pq.isEmpty() || ps.isEmpty()) return 0;
+        // 拼音没被改写（纯英文/数字，ICU 不动它们）→ 等于把字形又比一遍，没意义
+        if (pq.equals(q) && ps.equals(s)) return 0;
+
+        // 说法往往只是应用名的一部分（「网易云」⊂「网易云音乐」），拼音串自然也是前缀。
+        // 这一档必须先判：否则会被后面的长度差检查直接否掉 ——
+        // 「网亦云」→ wangyiyun，而「网易云音乐」是 wangyiyunyinle，差 5 个字母，
+        // 按整串编辑距离算是"完全不沾边"，可它明明就是同一个应用。
+        if (pq.length() >= 3) {
+            if (ps.startsWith(pq)) return 76;
+            if (ps.contains(pq)) return 72;
+        }
+
+        int maxLen = Math.max(pq.length(), ps.length());
+        if (maxLen < 3) return 0;
+        if (Math.abs(pq.length() - ps.length()) * 2 > maxLen) return 0;   // 长度差太多，别硬凑
+        int d = distance(pq, ps, 4);
+        if (d > 4) return 0;
+        double ratio = 1 - (double) d / maxLen;
+        if (ratio >= 0.72) return (int) Math.round(50 + ratio * 28);      // 0.72→70, 1.0→78
         return 0;
     }
 
@@ -306,10 +420,12 @@ public final class VoiceIntent {
     static String describe(Result r) {
         switch (r.kind) {
             case CMD: return "指令 " + r.label + " → " + r.pkg;
-            case APP: return "应用 " + r.label + " → " + r.pkg;
+            case APP: return "应用 " + r.label + " → " + r.pkg
+                    + "（" + r.score + "分 " + r.via + "）";
             case AMBIGUOUS: {
                 StringBuilder b = new StringBuilder("候选");
                 for (AppInfo a : r.candidates) b.append(' ').append(a.label);
+                b.append("（最高 ").append(r.score).append("分 ").append(r.via).append("）");
                 return b.toString();
             }
             default: return "未识别";
@@ -318,8 +434,11 @@ public final class VoiceIntent {
 
     /** 供测试：把一组说法跑一遍，返回每条的判定（诊断页用） */
     static String selfTest(List<AppInfo> apps, Map<String, Set<String>> aliases) {
+        // 后四条专门测"听错字"：网亦云/酷够/比里比里 都该靠拼音那一层命中，
+        // 优图布 该靠 YouTube 的谐音别名命中（模型吐不出英文字母）
         String[] cases = {"打开高德地图", "高德", "导航", "来点音乐", "网易云", "qq",
-                "打开应用列表", "返回", "息屏", "切换到百度地图"};
+                "打开应用列表", "返回", "息屏", "切换到百度地图",
+                "网亦云", "打开酷够", "比里比里", "优图布"};
         StringBuilder b = new StringBuilder();
         for (String c : cases) {
             Result r = parse(c, apps, aliases);
@@ -328,37 +447,69 @@ public final class VoiceIntent {
         return b.toString();
     }
 
-    /** 常用应用的默认别名（按名字里的关键字挂，换安装包也不影响） */
+    /**
+     * 常用应用的默认别名（按名字里的关键字挂，换安装包也不影响）。
+     *
+     * 【英文名为什么必须列谐音】我们用的识别模型词表是 5508 个单汉字，
+     * **一个英文字母都没有** —— 用户说「YouTube」，模型只会吐出最接近的汉字串
+     * （优图布 / 油管 / 有土伯…），永远不可能吐出 "youtube"。
+     * 所以英文应用必须把"中国人会怎么说、模型会怎么听岔"的中文写法一起登记，
+     * 否则那类名字在语音里等于不存在。字母写法也留着：用户教过别名、或者换了
+     * 双语模型之后还能直接命中。
+     */
     static Map<String, Set<String>> builtinAliases(List<AppInfo> apps) {
         Map<String, Set<String>> m = new HashMap<>();
         if (apps == null) return m;
         String[][] rules = {
-                {"高德地图", "高德|导航|地图|amap"},
-                {"百度地图", "百度|小度|bdmap"},
+                {"高德地图", "高德|导航|地图|amap|高德导航"},
+                {"百度地图", "百度|小度|bdmap|百度导航"},
                 {"腾讯地图", "腾讯地图|tmap"},
-                {"网易云音乐", "网易云|云音乐|网易"},
-                {"QQ音乐", "qq音乐|qq|q音"},
-                {"酷狗音乐", "酷狗|kugou"},
-                {"酷我音乐", "酷我|kuwo"},
-                {"喜马拉雅", "喜马|听书|播客"},
-                {"哔哩哔哩", "b站|bilibili|哔哩"},
-                {"抖音", "抖音|tiktok|抖"},
-                {"快手", "快手"},
-                {"微信", "微信|wechat"},
-                {"QQ", "qq"},
-                {"爱奇艺", "爱奇艺|iqiyi"},
-                {"腾讯视频", "腾讯视频|企鹅"},
-                {"优酷", "优酷|youku"},
-                {"收音机", "收音机|电台|fm"},
-                {"电话", "电话|拨号|打电话"},
-                {"蓝牙音乐", "蓝牙音乐|蓝牙"},
-                {"文件管理", "文件|文件夹|文件管理"},
-                {"浏览器", "浏览器|上网|网页"},
+                {"网易云音乐", "网易云|云音乐|网易|网抑云"},
+                {"QQ音乐", "qq音乐|qq|q音|扣扣音乐"},
+                {"酷狗音乐", "酷狗|kugou|酷够|哭狗"},
+                {"酷我音乐", "酷我|kuwo|酷窝"},
+                {"喜马拉雅", "喜马|听书|播客|ximalaya"},
+                {"哔哩哔哩", "b站|bilibili|哔哩|哔哩哔哩|比利比利|比里比里|bili|小破站"},
+                {"抖音", "抖音|tiktok|抖|嘀嗒"},
+                {"快手", "快手|kuaishou"},
+                {"微信", "微信|wechat|威信|vx"},
+                {"QQ", "qq|扣扣"},
+                {"爱奇艺", "爱奇艺|iqiyi|爱奇异|奇艺"},
+                {"腾讯视频", "腾讯视频|企鹅|腾讯"},
+                {"优酷", "优酷|youku|优库"},
+                {"收音机", "收音机|电台|fm|广播"},
+                {"电话", "电话|拨号|打电话|通讯录"},
+                {"蓝牙音乐", "蓝牙音乐|蓝牙|bt音乐"},
+                {"文件管理", "文件|文件夹|文件管理|文档"},
+                {"浏览器", "浏览器|上网|网页|browser"},
+                // ---- 下面这些主要是给"英文名被听成中文"准备的 ----
+                {"YouTube", "youtube|油管|优兔|尤图布|优图布|有土伯|油土鳖|ytb"},
+                {"Telegram", "telegram|电报|特拉|纸飞机|tg"},
+                {"WhatsApp", "whatsapp|瓦次|瓦茨|沃茨|whats"},
+                {"Spotify", "spotify|斯波提|声田|斯波蒂菲|斯波提飞"},
+                {"Instagram", "instagram|因斯|照片墙|ins|ig"},
+                {"Twitter", "twitter|推特|小蓝鸟|x平台"},
+                {"Facebook", "facebook|脸书|非死不可|fb"},
+                {"Netflix", "netflix|奈飞|网飞"},
+                {"Chrome", "chrome|谷歌浏览器|克罗姆"},
+                {"谷歌地图", "谷歌地图|googlemaps|狗哥地图"},
+                {"谷歌商店", "play商店|谷歌商店|googleplay|应用商店"},
+                {"Gmail", "gmail|谷歌邮箱|寄邮件"},
+                {"Disney", "disney|迪士尼|迪斯尼"},
+                {"Amazon", "amazon|亚马逊"},
+                {"Uber", "uber|优步|乌伯"},
+                {"Reddit", "reddit|红迪"},
+                {"LinkedIn", "linkedin|领英"},
+                {"Steam", "steam|蒸汽|斯缇姆"},
+                {"Discord", "discord|迪斯科德|dc"},
+                {"Zoom", "zoom|租姆|祖姆"},
         };
         for (AppInfo a : apps) {
             if (a == null || a.label == null) continue;
+            String low = a.label.toLowerCase(java.util.Locale.US);
             for (String[] rule : rules) {
-                if (a.label.contains(rule[0])) {
+                // 忽略大小写：YouTube / youtube / YOUTUBE 都要能挂上
+                if (low.contains(rule[0].toLowerCase(java.util.Locale.US))) {
                     Set<String> set = m.get(a.pkg);
                     if (set == null) {
                         set = new LinkedHashSet<>();

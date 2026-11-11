@@ -36,6 +36,16 @@ public final class Voice {
     private static final String TAG = "PipDesk";
     /** 唤醒词的参考底噪门限：低于它不喂 KWS，省 CPU（KWS 自己也会判静音） */
     private static final int MIN_RMS = 60;
+    /**
+     * 连续这么久采样全为死寂（峰值 ≈ 0）就认定麦克风被别的应用占了，重开一次。
+     *
+     * 1.2 秒的依据：这是"用户喊唤醒词"的时间尺度。独占发生时越早恢复越好，
+     * 而正常说话不可能连续 1.2 秒一个非零采样都没有（真实麦克风有底噪）。
+     */
+    private static final long SILENT_RECOVER_MS = 1_200L;
+    /** 重开麦克风的退避起点 / 上限：连续失败时翻倍，封顶后一直以这个节奏后台重试 */
+    private static final long MIC_RETRY_MIN_MS = 1_200L;
+    private static final long MIC_RETRY_MAX_MS = 15_000L;
     /** 唤醒后单句聆听上限 */
     private static final long LISTEN_MAX_MS = 12_000L;
     /**
@@ -123,6 +133,12 @@ public final class Voice {
     private volatile long kwsRetryAt;
     /** 最后一次收到 PCM 的时刻：用来发现"麦克风开着但没有数据" */
     private volatile long lastPcmAt;
+    /** 下一次允许重开麦克风的时刻（退避用） */
+    private long micRetryAt;
+    /** 当前重开间隔：成功一次就回到起点，连续失败翻倍 */
+    private long micRetryGap = MIC_RETRY_MIN_MS;
+    /** 本轮总共重开了几次（每两次换一个 audio source 试） */
+    private int micTries;
     private volatile long cooldownUntil;
     private volatile long idleSince;
     private volatile long lastUiPush;
@@ -166,6 +182,9 @@ public final class Voice {
         this.ctx = context.getApplicationContext();
         this.host = h;
         if (ctx == null) return;
+        // 把当前唤醒词交给匹配层：否则「你好小瑞，打开微信」里那半句唤醒词
+        // 会被当成应用名的一部分去匹配，永远命中不了（PTT 模式也走这里）
+        VoiceIntent.setWakeWord(VoiceWords.wakeWord(ctx));
         boolean want = Prefs.voiceWake(ctx);
         if (want) startWake();
     }
@@ -280,6 +299,8 @@ public final class Voice {
             new File(ctx.getFilesDir(), "voice/kws.load").delete();
         } catch (Throwable ignored) {
         }
+        // 唤醒词可能刚被改过，同步给匹配层（否则新词在识别结果里剥不掉）
+        if (ctx != null) VoiceIntent.setWakeWord(VoiceWords.wakeWord(ctx));
         synchronized (lock) {
             if (kws != null) {
                 kws.release();
@@ -292,6 +313,10 @@ public final class Voice {
 
     private void controlLoop() {
         try {
+            // 每次起控制线程都从"没重试过"开始，别把上一轮的退避带过来
+            micTries = 0;
+            micRetryGap = MIC_RETRY_MIN_MS;
+            micRetryAt = 0;
             // 权限先解决：AppOps / pm grant 都不行时，MainActivity 会补一次系统权限框
             if (!VoicePerm.has(ctx)) {
                 VoicePerm.tryGrant(ctx);
@@ -334,6 +359,23 @@ public final class Voice {
                     });
                     try { Thread.sleep(80); } catch (InterruptedException ie) { break; }
                     continue;
+                }
+
+                // 被独占的另一种形态：read **照常返回**，但内容全是死寂 ——
+                // 上面那条"2.5 秒没收到 PCM"永远等不到。典型现场：百度地图的
+                // 「小度小度」唤醒后占住 input，之后我们的「你好小瑞」怎么喊都不应，
+                // 点语音图标也只听到死寂。这时唯一的自救是重开麦克风重新选路。
+                if (mic != null && now >= micRetryAt
+                        && (state == S_WAKE || state == S_LISTEN || state == S_LOADING)) {
+                    long dead = mic.silentMs();
+                    if (dead > SILENT_RECOVER_MS) {
+                        recycleMic("连续 " + dead + "ms 采样全为死寂（疑似被其他应用占用）");
+                        try { Thread.sleep(80); } catch (InterruptedException ie) { break; }
+                        continue;
+                    } else if (micTries != 0) {
+                        micTries = 0;                    // 已经重新听到声音，计数清零
+                        micRetryGap = MIC_RETRY_MIN_MS;
+                    }
                 }
 
                 // 聆听期间 KWS 被释放了（见 beginListen 注释）：回到待唤醒就重建，
@@ -499,6 +541,91 @@ public final class Voice {
         return true;
     }
 
+    /**
+     * 建识别器，并把"本机能启动的应用名"灌进去当热词。
+     *
+     * 必须在 load() 之前设好 —— sherpa 是在构造 OnlineRecognizer 时读热词表的，
+     * 加载完再改不会生效（要 release 重建）。
+     */
+    private VoiceAsr ensureAsr() {
+        if (asr == null) {
+            asr = new VoiceAsr(ctx);
+            asr.setHotwordNames(appLabels());
+        }
+        return asr;
+    }
+
+    /** 语音能认的全部名字 —— 热词表的数据源（和识别后匹配用的名单是同一份） */
+    private List<String> appLabels() {
+        Host h = host;
+        if (h == null) return null;
+        List<AppInfo> as;
+        try {
+            as = h.apps();
+        } catch (Throwable t) {
+            FileLog.append("VOICE 取应用列表失败（热词跳过）：" + t);
+            return null;
+        }
+        if (as == null || as.isEmpty()) return null;
+        List<String> out = new java.util.ArrayList<>(as.size());
+        for (AppInfo a : as) {
+            if (a != null && a.label != null && !a.label.isEmpty()) out.add(a.label);
+        }
+        return out;
+    }
+
+    /**
+     * 重开麦克风。车机上「小度小度」唤醒后，百度地图的语音占着 input，我们这边
+     * read 照常返回但内容全是死寂 —— KWS 永不命中、ASR 一个字也出不来，
+     * 用户看到的就是「你好小瑞再也唤不醒、点语音图标也收不到声音」。
+     *
+     * 这种状态**等不回来**：必须 release 再重新 open，让 AudioFlinger 重新选路、
+     * 重新分配 input。这是那条路里唯一能自己恢复的动作。
+     *
+     * 换 source 重试：VOICE_RECOGNITION 与 MIC 在 audio policy 里是两条不同的
+     * input 路由，一条被独占时另一条常常还能开。每两次换一次。
+     *
+     * @return 是否成功重新开起来
+     */
+    private boolean recycleMic(String why) {
+        micTries++;
+        int src = ((micTries / 2) % 2 == 0)
+                ? android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION
+                : android.media.MediaRecorder.AudioSource.MIC;
+        boolean ok;
+        synchronized (lock) {
+            if (mic != null) {
+                try {
+                    mic.stop();
+                } catch (Throwable ignored) {
+                }
+                mic = null;
+            }
+            VoiceMic nm = new VoiceMic(this::onPcm);
+            nm.setSource(src);
+            ok = nm.start();
+            if (ok) {
+                mic = nm;
+                long now = SystemClock.elapsedRealtime();
+                lastPcmAt = now;      // 别让"2.5 秒没 PCM"把这次重开误判成断流
+                idleSince = now;
+                micRetryGap = MIC_RETRY_MIN_MS;
+            } else {
+                lastError = nm.error();
+                micRetryGap = Math.min(micRetryGap * 2, MIC_RETRY_MAX_MS);
+            }
+        }
+        micRetryAt = SystemClock.elapsedRealtime() + micRetryGap;
+        if (ok) {
+            FileLog.append("VOICE 重开麦克风成功（" + why + "）→ "
+                    + VoiceMic.sourceName(src) + "，第 " + micTries + " 次");
+        } else {
+            FileLog.append("VOICE 重开麦克风失败（" + why + "）→ " + lastError
+                    + "，下次 " + micRetryGap + "ms 后再试");
+        }
+        return ok;
+    }
+
     /** 开始一次聆听：先把模型和麦克风准备好，再切状态（否则会漏掉开头） */
     private void beginListen() {
         // 一进来就计时：准备阶段（加载模型/开麦）也要算在硬闸里，
@@ -509,10 +636,16 @@ public final class Voice {
         pushState("准备聆听…", null);
         partial = "";
 
+        // 上一轮收工时麦克风可能正被别人占着（读到的是死寂数据）。不先处理，
+        // 这一轮从头到尾都是白听 —— 用户看到的就是"点了语音图标却没反应"。
+        if (mic != null && mic.silentMs() > 600) {
+            recycleMic("聆听前发现麦克风已 " + mic.silentMs() + "ms 无信号");
+        }
+
         if (!wakeMode) {
             // PTT：先加载模型（1~2s，界面上能看到"准备中"），再开麦
             synchronized (lock) {
-                if (asr == null) asr = new VoiceAsr(ctx);
+                ensureAsr();
                 if (!asr.isReady() && !asr.load()) {
                     state = S_ERROR;
                     lastError = asr.loadError();
@@ -538,7 +671,7 @@ public final class Voice {
                     kws = null;
                     FileLog.append("VOICE 聆听开始：KWS 已释放（避免与 ASR 抢资源）");
                 }
-                if (asr == null) asr = new VoiceAsr(ctx);
+                ensureAsr();
                 if (!asr.isReady() && !asr.load()) {
                     state = S_WAKE;      // 唤醒词还能用，只是这次听不了
                     lastError = asr.loadError();

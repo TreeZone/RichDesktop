@@ -35,6 +35,16 @@ public final class VoiceMic {
     /** 每次读 100ms：KWS 的 chunk 是 16 帧（约 320ms），100ms 喂一次足够实时，又不至于太碎 */
     private static final int CHUNK = SR / 10;
 
+    /**
+     * 判定"麦克风被独占"的采样门限：**连续采样里峰值不超过它**。
+     *
+     * 为什么用峰值而不是 RMS/音量：安静环境和"被独占"在音量上是同一件事，
+     * 分不开。但被独占时 HAL 给的是**精确的 0**（或只差一个 LSB），而真实麦克风
+     * 即使在深夜车库也有量化底噪（几十个 LSB 起）。用"峰值 ≤ 1"当判据，
+     * 才不会把"用户没说话"当成"麦克风被占"而反复重开。
+     */
+    private static final int SILENCE_PEAK = 1;
+
     public interface Sink {
         /** @param buf  16bit PCM，直接就是 -32768..32767 的原始值
          *  @param n    有效样本数
@@ -48,6 +58,16 @@ public final class VoiceMic {
     private volatile boolean running;
     private volatile String error;
     private volatile int sampleRate = SR;
+    /**
+     * 连续"没有信号"的起点（0 = 当前有信号）。
+     *
+     * 这条线是为「被别人占着麦克风」准备的：那种情况下 read 照常返回、lastPcmAt 照常刷新，
+     * 只是内容全是 0 —— 用"有没有数据"判断永远发现不了，只能用"数据是不是死寂"判断。
+     * 详见 {@link #silentMs()}。
+     */
+    private volatile long silentSince;
+    /** 采集音源。独占时换一路重试（见 Voice.recycleMic），不同 source 走不同 input */
+    private volatile int source = MediaRecorder.AudioSource.VOICE_RECOGNITION;
 
     public VoiceMic(Sink sink) {
         this.sink = sink;
@@ -59,6 +79,29 @@ public final class VoiceMic {
 
     public int sampleRate() {
         return sampleRate;
+    }
+
+    /** 已经连续多久没有信号（ms）。0 = 当前在正常收到声音 */
+    public long silentMs() {
+        long s = silentSince;
+        return s == 0 ? 0 : android.os.SystemClock.elapsedRealtime() - s;
+    }
+
+    public void setSource(int src) {
+        source = src;
+    }
+
+    public int source() {
+        return source;
+    }
+
+    public static String sourceName(int src) {
+        switch (src) {
+            case MediaRecorder.AudioSource.VOICE_RECOGNITION: return "VOICE_RECOGNITION";
+            case MediaRecorder.AudioSource.MIC: return "MIC";
+            case MediaRecorder.AudioSource.VOICE_COMMUNICATION: return "VOICE_COMMUNICATION";
+            default: return "src" + src;
+        }
     }
 
     public boolean isRunning() {
@@ -84,7 +127,7 @@ public final class VoiceMic {
             int bufBytes = Math.max(minBuf, CHUNK * 2 * 2);
 
             AudioRecord r = new AudioRecord.Builder()
-                    .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+                    .setAudioSource(source)
                     .setAudioFormat(new AudioFormat.Builder()
                             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                             .setSampleRate(SR)
@@ -107,11 +150,14 @@ public final class VoiceMic {
             }
             sampleRate = r.getSampleRate();          // ROM 可能改写采样率，记真实值
             rec = r;
+            // 保守起见先当"没有信号"：第一个真正有声的 chunk 会把它清掉。
+            // 这样 HAL 开了却一直不回数据（read 阻塞）也能被 silentMs() 发现。
+            silentSince = android.os.SystemClock.elapsedRealtime();
             running = true;
             th = new Thread(this::loop, "pipdesk-voice-mic");
             th.setDaemon(true);
             th.start();
-            FileLog.append("VOICE 麦克风已开 source=VOICE_RECOGNITION"
+            FileLog.append("VOICE 麦克风已开 source=" + sourceName(source)
                     + " 请求=" + SR + " 实际=" + sampleRate + "Hz");
             return true;
         } catch (Throwable t) {
@@ -127,7 +173,7 @@ public final class VoiceMic {
         // 出现丢帧式断音；踩到 AUDIO 又会反过来抢渲染的 CPU，这台机器两者都要让。
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO + 4);
         short[] buf = new short[CHUNK];
-        long silentChunks = 0;
+        boolean wasSilent = true;
         while (running) {
             int n;
             try {
@@ -144,10 +190,29 @@ public final class VoiceMic {
                 continue;
             }
             long sum = 0;
-            for (int i = 0; i < n; i++) sum += (long) buf[i] * buf[i];
+            int peak = 0;
+            for (int i = 0; i < n; i++) {
+                short v = buf[i];
+                sum += (long) v * v;
+                int a = v < 0 ? -v : v;
+                if (a > peak) peak = a;
+            }
             int rms = (int) Math.sqrt((double) sum / n);
-            if (rms < 60) silentChunks++;
-            else if (silentChunks > 0) silentChunks = 0;
+            // 只记"死寂段从什么时候开始"，恢复时清掉。判断独占看的是这个时长，
+            // 不看有没有回调（被独占时回调全是 0，照样有回调）。
+            if (peak <= SILENCE_PEAK) {
+                if (silentSince == 0) silentSince = android.os.SystemClock.elapsedRealtime();
+                wasSilent = true;
+            } else {
+                if (silentSince != 0) {
+                    if (wasSilent) {
+                        FileLog.append("VOICE 麦克风恢复信号（静音 "
+                                + (android.os.SystemClock.elapsedRealtime() - silentSince) + "ms 后）");
+                    }
+                    silentSince = 0;
+                }
+                wasSilent = false;
+            }
             try {
                 sink.onPcm(buf, n, rms);
             } catch (Throwable t) {
@@ -170,6 +235,7 @@ public final class VoiceMic {
     /** 停采。<b>必须在后台线程调用</b>（内部 join 采集线程）。 */
     public void stop() {
         running = false;
+        silentSince = 0;
         Thread t = th;
         th = null;
         if (t != null) {

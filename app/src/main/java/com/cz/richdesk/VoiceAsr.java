@@ -10,29 +10,47 @@ import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig;
 import com.k2fsa.sherpa.onnx.OnlineRecognizerResult;
 import com.k2fsa.sherpa.onnx.OnlineStream;
 
+import java.util.List;
+
 /**
  * 离线中文识别（只在"已经开始听"之后才工作）。
  *
  * 模型：sherpa-onnx-streaming-zipformer-zh-14M（int8 共 24MB）。
- * 选它而不是几十 MB 的通用大模型的理由：我们的命令空间是封闭的
- * （打开某个应用 / 十来个内置指令），识别错一两个字由 {@link VoiceIntent}
- * 的模糊匹配兜住，不需要通用识别的高精度。要换更强的模型，
- * 把 assets/asr/ 下四个文件替换成同名文件即可，代码不用动。
+ * 它的词表是 5539 个 token、其中 5508 个**单汉字** —— 一个英文字母都没有，
+ * 所以它先天性念不了「YouTube」「Spotify」这种名字（这个限制改不了，
+ * 只能靠 VoiceAliases 的谐音别名在匹配层兜住）。
  *
- * 用例是"整句说完 → 端点 → 出最终文本"，所以流式部分只用来做实时字幕。
+ * 针对"识别率差"做了三件事：
+ *  1) 解码从 greedy_search 换成 modified_beam_search（beam=4）：噪声里 greedy 会跳字，
+ *     「打开酷狗」掉成「打开酷」这种错，匹配层再宽容也救不回来。
+ *  2) 把本机应用名做成热词表做上下文偏置（VoiceHotwords），专有名词识别率提升最明显。
+ *  3) 热词加载失败自动退回无热词配置 —— 热词校验很严，不能因为一个生僻字
+ *     把整条语音链路带死。
+ *
+ * 要换更强的模型（比如中英双语的 stream-zipformer-bilingual-zh-en），
+ * 把 assets/asr/ 下四个文件替换成同名文件即可，代码不用动。
  */
 final class VoiceAsr {
 
     private static final String TAG = "PipDesk";
+    /** 束搜索宽度：4 是 sherpa 示例里精度/延迟的常用折中 */
+    private static final int BEAM_SIZE = 4;
 
     private final Context ctx;
     private OnlineRecognizer rec;
     private OnlineStream stream;
     private String loadError;
     private long loadedAt;
+    /** 热词候选（本机应用名），由 Voice 在加载前灌进来；null = 不加偏置 */
+    private List<String> hotwordNames;
 
     VoiceAsr(Context ctx) {
         this.ctx = ctx.getApplicationContext();
+    }
+
+    /** 热词候选。必须在 load() 之前调用，加载后再改不会生效（要重建识别器） */
+    void setHotwordNames(List<String> names) {
+        this.hotwordNames = names;
     }
 
     boolean isReady() {
@@ -50,9 +68,19 @@ final class VoiceAsr {
     /** 加载模型（1~2 秒，必须在后台线程，且别放在开机首帧路径上） */
     boolean load() {
         if (rec != null) return true;
-        if (tryLoad(VoiceAssets.assetPrefix("asr"))) return true;
+        String prefix = VoiceAssets.assetPrefix("asr");
+        boolean wantHotwords = Prefs.voiceHotwords(ctx);
+
+        if (tryLoad(prefix, wantHotwords)) return true;
+        // 带热词失败就退回无热词。sherpa 对热词校验很严（词里的字不在词表、
+        // 或者格式不规范都会让加载整个失败），而语音是整条链路 ——
+        // 宁可不偏置，也不能让识别器起不来。
+        if (wantHotwords) {
+            FileLog.append("VOICE 带热词加载失败，退回无热词配置（原因见上一条日志）");
+            if (tryLoad(prefix, false)) return true;
+        }
         String alt = VoiceAssets.extract(ctx, "asr");
-        if (alt != null && tryLoad(alt)) {
+        if (alt != null && tryLoad(alt, false)) {
             FileLog.append("VOICE 识别模型改从 filesDir 加载：" + alt);
             return true;
         }
@@ -62,7 +90,7 @@ final class VoiceAsr {
         return false;
     }
 
-    private boolean tryLoad(String prefix) {
+    private boolean tryLoad(String prefix, boolean withHotwords) {
         long t0 = System.currentTimeMillis();
         try {
             OnlineRecognizerConfig c = new OnlineRecognizerConfig();
@@ -79,24 +107,51 @@ final class VoiceAsr {
             m.setNumThreads(2);
             m.setProvider("cpu");
             m.setDebug(false);
-            c.setDecodingMethod("greedy_search");
+
+            // 解码方式：beam 抗跳字，代价约 2 倍 CPU（14M 模型 2 线程仍然实时）
+            if (Prefs.voiceBeam(ctx)) {
+                c.setDecodingMethod("modified_beam_search");
+                c.setMaxActivePaths(BEAM_SIZE);
+            } else {
+                c.setDecodingMethod("greedy_search");
+            }
+
             c.setEnableEndpoint(true);
             // 端点规则用默认值：说完 ~1.2s 静音就断句，单句上限 20s。
             // 车机噪声大时"说完不等"比"等太久"更讨人厌，所以不把静音阈值调长。
+
+            // 上下文偏置（应用名热词）
+            String hwDesc = "hotwords=off";
+            if (withHotwords) {
+                String hw = VoiceHotwords.ensure(ctx, hotwordNames);
+                if (hw != null) {
+                    // cjkchar 必须配：它告诉解码器"热词按单字切"，与 tokens.txt 的结构对应
+                    m.setModelingUnit("cjkchar");
+                    c.setHotwordsFile(hw);
+                    c.setHotwordsScore(Prefs.voiceHotwordScore(ctx));
+                    hwDesc = VoiceHotwords.summary(ctx);
+                } else {
+                    hwDesc = "hotwords=(无可用词)";
+                }
+            }
 
             OnlineRecognizer r = new OnlineRecognizer(ctx.getAssets(), c);
             rec = r;
             stream = null;
             loadedAt = System.currentTimeMillis();
             loadError = null;
-            String msg = "VOICE 识别模型加载完成 " + (loadedAt - t0) + "ms prefix=" + prefix;
+            String msg = "VOICE 识别模型加载完成 " + (loadedAt - t0) + "ms prefix=" + prefix
+                    + (Prefs.voiceBeam(ctx) ? " beam=" + BEAM_SIZE : " greedy")
+                    + " " + hwDesc;
             Log.i(TAG, msg);
             FileLog.append(msg);
             return true;
         } catch (Throwable t) {
-            Log.w(TAG, "asr load 失败 prefix=" + prefix, t);
-            FileLog.append("VOICE 识别模型加载失败(" + prefix + ") " + t);
+            Log.w(TAG, "asr load 失败 prefix=" + prefix + " hotwords=" + withHotwords, t);
+            FileLog.append("VOICE 识别模型加载失败(" + prefix + " hotwords=" + withHotwords
+                    + ") " + t);
             release();
+            loadError = "识别模型加载失败：" + t;
             return false;
         }
     }

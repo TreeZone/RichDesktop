@@ -42,6 +42,10 @@ public class Prefs {
         return v < lo ? lo : (v > hi ? hi : v);
     }
 
+    private static float clampF(float v, float lo, float hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
     // ------------------------------------------------------------ 性能模式
 
     /**
@@ -887,6 +891,46 @@ public class Prefs {
 
     public static void setVoiceTtsEngine(Context c, String pkg) {
         sp(c).edit().putString("voice_tts_engine", pkg == null ? "" : pkg).apply();
+    }
+
+    /**
+     * 识别解码用束搜索（默认开）。
+     *
+     * greedy_search 在噪声里容易跳字：一句话掉一个关键字，「打开酷狗」就变成「打开酷」，
+     * 匹配层再宽容也救不回来。modified_beam_search（beam=4）明显更稳，
+     * 代价是解码 CPU 约 2 倍 —— 14M 的小模型开 2 线程仍然实时，所以默认开。
+     * 真遇到很老的车机嫌卡，可以在设置里关掉回到 greedy。
+     */
+    public static boolean voiceBeam(Context c) {
+        return sp(c).getBoolean("voice_beam", true);
+    }
+
+    public static void setVoiceBeam(Context c, boolean on) {
+        sp(c).edit().putBoolean("voice_beam", on).apply();
+    }
+
+    /**
+     * 给识别加「应用名热词」（默认开）。
+     *
+     * 把本机装的应用名做成热词表喂给识别器，模型解码时会偏向这些词 ——
+     * 「酷狗音乐」「哔哩哔哩」这类专有名词的识别率提升最明显。
+     * 加载失败会自动退回不带热词的配置，不会让语音整个不可用。
+     */
+    public static boolean voiceHotwords(Context c) {
+        return sp(c).getBoolean("voice_hw", true);
+    }
+
+    public static void setVoiceHotwords(Context c, boolean on) {
+        sp(c).edit().putBoolean("voice_hw", on).apply();
+    }
+
+    /** 热词偏置强度。太高会把普通句子往应用名上带，1.5 是 sherpa 官方示例的量级 */
+    public static float voiceHotwordScore(Context c) {
+        return clampF(sp(c).getFloat("voice_hw_score", 1.5f), 0.1f, 5f);
+    }
+
+    public static void setVoiceHotwordScore(Context c, float v) {
+        sp(c).edit().putFloat("voice_hw_score", clampF(v, 0.1f, 5f)).apply();
     }
 
     /**

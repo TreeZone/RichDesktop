@@ -607,6 +607,13 @@ public class MainActivity extends AppCompatActivity
         pip.setListener(new PipManager.Listener() {
             @Override public void onOpened(int index, String pkg) { }
             @Override public void onClosed(int index) { }
+            /**
+             * 运行时新建的面板（目前只有单画专用屏）必须在这里补绑手势。
+             * 漏掉的话那块屏就点不动 —— 详见 bindPaneGesture 的注释。
+             */
+            @Override public void onPaneCreated(PipPane pane) {
+                bindPaneGesture(pane);
+            }
         });
         pip.build(appliedPaneCount);   // 首帧要看到画中画玻璃框，这一步必须同步
         bindPaneGestures();
@@ -1973,115 +1980,124 @@ public class MainActivity extends AppCompatActivity
     // ------------------------------------------------------------ 触摸 / 长按
 
     private void bindPaneGestures() {
-        for (int i = 0; i < pip.count(); i++) {
-            final PipPane pane = pip.pane(i);
-            if (pane == null) continue;
-            // 长按已接管：这次手势剩下的 MOVE/UP 一律不转发（否则松手会在屏内应用里点一下）
-            final boolean[] consumed = new boolean[1];
-            final GestureDetector gd = new GestureDetector(this,
-                    new GestureDetector.SimpleOnGestureListener() {
-                        @Override
-                        public void onLongPress(MotionEvent e) {
-                            consumed[0] = true;
-                            pip.cancelTouch();     // 给屏内应用补 CANCEL，掐断它的按压
-                            showPaneMenu(pane);
-                        }
+        for (int i = 0; i < pip.count(); i++) bindPaneGesture(pip.pane(i));
+    }
 
-                        /** 空白的画中画：单击直接弹应用列表（需求 2） */
-                        @Override
-                        public boolean onSingleTapUp(MotionEvent e) {
-                            if (pane.pkg() != null) return false;
-                            consumed[0] = true;
-                            openPickerForPane(pane);
-                            return true;
-                        }
-                    });
-            final float[] gst = new float[5];   // 0,1=起手坐标 2=最大位移 3=帧数 4=按下时刻
-            pane.root.setOnTouchListener((v, e) -> {
-                if (!pane.isInteractive()) {
-                    return false;   // 被折叠隐藏的屏：不吃触摸，免得挡住旁边那块屏
-                }
-                final boolean empty = pane.pkg() == null;
-                if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                    consumed[0] = false;      // 新手势：重新开始判定
-                    // 有应用的屏被按下的瞬间它就是"返回键的目标"：
-                    // 之后用户点 Dock 返回，键要回到这块屏（哪怕焦点已被桌面抢走）
-                    if (!empty && pane.isInteractive()) lastActivePane = pane;
-                    gst[0] = e.getX();
-                    gst[1] = e.getY();
-                    gst[2] = 0;
-                    gst[3] = 0;
-                    gst[4] = android.os.SystemClock.uptimeMillis();
-                    // 轨迹日志只在排查模式（/sdcard/pipdesk_verbose）下输出：
-                    // 每次按下都要拼长字符串 + getLocationOnScreen，再加上
-                    // Watchdog.touch 里的时间戳格式化，正常使用纯属白烧 CPU/IO。
-                    if (PipDebug.VERBOSE) {
-                        int[] loc = new int[2];
-                        v.getLocationOnScreen(loc);
-                        PipDebug.log("pane " + pane.index + " down local="
-                                + (int) e.getX() + "," + (int) e.getY()
-                                + " raw=" + (int) e.getRawX() + "," + (int) e.getRawY()
-                                + " at=" + loc[0] + "," + loc[1]
-                                + " size=" + v.getWidth() + "x" + v.getHeight()
-                                + " empty=" + empty
-                                + " dispPixel=" + pip.displaySize(pane.index));
-                        Watchdog.touch("pane " + pane.index + " DOWN local="
-                                + (int) e.getX() + "," + (int) e.getY()
-                                + " size=" + v.getWidth() + "x" + v.getHeight());
+    /**
+     * 给一块面板绑手势。
+     *
+     * 单独抽出来是因为**单画专用屏是运行时才创建的**（PipManager.ensureSinglePane），
+     * 它不在 panes 里 —— 只靠 bindPaneGestures() 的遍历永远轮不到它，那块屏就成了
+     * "只看不摸"的死画面：点按没反应、滑动被宿主当成翻页/拖拽。
+     * 现在由 PipManager.Listener.onPaneCreated 回调进来补绑。
+     */
+    private void bindPaneGesture(final PipPane pane) {
+        if (pane == null || pane.root == null) return;
+        // 长按已接管：这次手势剩下的 MOVE/UP 一律不转发（否则松手会在屏内应用里点一下）
+        final boolean[] consumed = new boolean[1];
+        final GestureDetector gd = new GestureDetector(this,
+                new GestureDetector.SimpleOnGestureListener() {
+                    @Override
+                    public void onLongPress(MotionEvent e) {
+                        consumed[0] = true;
+                        pip.cancelTouch();     // 给屏内应用补 CANCEL，掐断它的按压
+                        showPaneMenu(pane);
                     }
-                } else if (e.getActionMasked() == MotionEvent.ACTION_MOVE) {
-                    float d = (float) Math.hypot(e.getX() - gst[0], e.getY() - gst[1]);
-                    if (d > gst[2]) gst[2] = d;
-                    gst[3]++;
-                } else if (e.getActionMasked() == MotionEvent.ACTION_UP
-                        || e.getActionMasked() == MotionEvent.ACTION_CANCEL) {
-                    // 宿主手指的真实轨迹：与注入侧日志对照，能区分是手指漂移还是转发丢失
-                    if (PipDebug.VERBOSE) {
-                        PipDebug.log("pane " + pane.index
-                                + (e.getActionMasked() == MotionEvent.ACTION_UP ? " up" : " cancel")
-                                + " local=" + (int) e.getX() + "," + (int) e.getY()
-                                + " moves=" + (int) gst[3]
-                                + " maxDrift=" + (int) gst[2] + "px"
-                                + " dur=" + (android.os.SystemClock.uptimeMillis() - (long) gst[4]) + "ms");
-                        Watchdog.touch("pane " + pane.index
-                                + (e.getActionMasked() == MotionEvent.ACTION_UP ? " UP" : " CANCEL")
-                                + " local=" + (int) e.getX() + "," + (int) e.getY()
-                                + " moves=" + (int) gst[3]
-                                + " drift=" + (int) gst[2]
-                                + " dur=" + (android.os.SystemClock.uptimeMillis() - (long) gst[4]) + "ms");
+
+                    /** 空白的画中画：单击直接弹应用列表（需求 2） */
+                    @Override
+                    public boolean onSingleTapUp(MotionEvent e) {
+                        if (pane.pkg() != null) return false;
+                        consumed[0] = true;
+                        openPickerForPane(pane);
+                        return true;
                     }
+                });
+        final float[] gst = new float[5];   // 0,1=起手坐标 2=最大位移 3=帧数 4=按下时刻
+        pane.root.setOnTouchListener((v, e) -> {
+            if (!pane.isInteractive()) {
+                return false;   // 被折叠隐藏的屏：不吃触摸，免得挡住旁边那块屏
+            }
+            final boolean empty = pane.pkg() == null;
+            if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                consumed[0] = false;      // 新手势：重新开始判定
+                // 有应用的屏被按下的瞬间它就是"返回键的目标"：
+                // 之后用户点 Dock 返回，键要回到这块屏（哪怕焦点已被桌面抢走）
+                if (!empty && pane.isInteractive()) lastActivePane = pane;
+                gst[0] = e.getX();
+                gst[1] = e.getY();
+                gst[2] = 0;
+                gst[3] = 0;
+                gst[4] = android.os.SystemClock.uptimeMillis();
+                // 轨迹日志只在排查模式（/sdcard/pipdesk_verbose）下输出：
+                // 每次按下都要拼长字符串 + getLocationOnScreen，再加上
+                // Watchdog.touch 里的时间戳格式化，正常使用纯属白烧 CPU/IO。
+                if (PipDebug.VERBOSE) {
+                    int[] loc = new int[2];
+                    v.getLocationOnScreen(loc);
+                    PipDebug.log("pane " + pane.index + " down local="
+                            + (int) e.getX() + "," + (int) e.getY()
+                            + " raw=" + (int) e.getRawX() + "," + (int) e.getRawY()
+                            + " at=" + loc[0] + "," + loc[1]
+                            + " size=" + v.getWidth() + "x" + v.getHeight()
+                            + " empty=" + empty
+                            + " dispPixel=" + pip.displaySize(pane.index));
+                    Watchdog.touch("pane " + pane.index + " DOWN local="
+                            + (int) e.getX() + "," + (int) e.getY()
+                            + " size=" + v.getWidth() + "x" + v.getHeight());
                 }
-                gd.onTouchEvent(e);
-                if (empty) {
-                    // 空白屏后面没有虚拟屏可转发：手势全归宿主（单击＝选应用，长按＝菜单）。
-                    // 翻页不受影响 —— 主页的翻页闸门只放行从 Dock 区域起手的左滑。
-                    if (consumed[0] && (e.getActionMasked() == MotionEvent.ACTION_UP
-                            || e.getActionMasked() == MotionEvent.ACTION_CANCEL)) {
-                        consumed[0] = false;
-                    }
-                    return true;
+            } else if (e.getActionMasked() == MotionEvent.ACTION_MOVE) {
+                float d = (float) Math.hypot(e.getX() - gst[0], e.getY() - gst[1]);
+                if (d > gst[2]) gst[2] = d;
+                gst[3]++;
+            } else if (e.getActionMasked() == MotionEvent.ACTION_UP
+                    || e.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+                // 宿主手指的真实轨迹：与注入侧日志对照，能区分是手指漂移还是转发丢失
+                if (PipDebug.VERBOSE) {
+                    PipDebug.log("pane " + pane.index
+                            + (e.getActionMasked() == MotionEvent.ACTION_UP ? " up" : " cancel")
+                            + " local=" + (int) e.getX() + "," + (int) e.getY()
+                            + " moves=" + (int) gst[3]
+                            + " maxDrift=" + (int) gst[2] + "px"
+                            + " dur=" + (android.os.SystemClock.uptimeMillis() - (long) gst[4]) + "ms");
+                    Watchdog.touch("pane " + pane.index
+                            + (e.getActionMasked() == MotionEvent.ACTION_UP ? " UP" : " CANCEL")
+                            + " local=" + (int) e.getX() + "," + (int) e.getY()
+                            + " moves=" + (int) gst[3]
+                            + " drift=" + (int) gst[2]
+                            + " dur=" + (android.os.SystemClock.uptimeMillis() - (long) gst[4]) + "ms");
                 }
-                if (consumed[0]) {
-                    // 长按已经弹了宿主菜单：这一下算宿主的，别再往屏内应用送，
-                    // 否则松手会被当成一次点击（用户反馈"长按后应用里也点了一下"）
-                    int am = e.getActionMasked();
-                    if (am == MotionEvent.ACTION_UP || am == MotionEvent.ACTION_CANCEL) {
-                        consumed[0] = false;
-                    }
-                    return true;
-                }
-                // 按面板对象转发（不按位置）：调换顺序后监听器跟着 view 走，不用重绑
-                long tDispatch = android.os.SystemClock.uptimeMillis();
-                pip.dispatch(pane, e);
-                long cost = android.os.SystemClock.uptimeMillis() - tDispatch;
-                if (cost > 40) {
-                    // 卡死前几天往往先出现"触摸转发越来越慢"，留下证据
-                    android.util.Log.w("PipDesk", "触摸转发耗时 " + cost + "ms pane="
-                            + pane.index + " action=" + e.getActionMasked());
+            }
+            gd.onTouchEvent(e);
+            if (empty) {
+                // 空白屏后面没有虚拟屏可转发：手势全归宿主（单击＝选应用，长按＝菜单）。
+                // 翻页不受影响 —— 主页的翻页闸门只放行从 Dock 区域起手的左滑。
+                if (consumed[0] && (e.getActionMasked() == MotionEvent.ACTION_UP
+                        || e.getActionMasked() == MotionEvent.ACTION_CANCEL)) {
+                    consumed[0] = false;
                 }
                 return true;
-            });
-        }
+            }
+            if (consumed[0]) {
+                // 长按已经弹了宿主菜单：这一下算宿主的，别再往屏内应用送，
+                // 否则松手会被当成一次点击（用户反馈"长按后应用里也点了一下"）
+                int am = e.getActionMasked();
+                if (am == MotionEvent.ACTION_UP || am == MotionEvent.ACTION_CANCEL) {
+                    consumed[0] = false;
+                }
+                return true;
+            }
+            // 按面板对象转发（不按位置）：调换顺序后监听器跟着 view 走，不用重绑
+            long tDispatch = android.os.SystemClock.uptimeMillis();
+            pip.dispatch(pane, e);
+            long cost = android.os.SystemClock.uptimeMillis() - tDispatch;
+            if (cost > 40) {
+                // 卡死前几天往往先出现"触摸转发越来越慢"，留下证据
+                android.util.Log.w("PipDesk", "触摸转发耗时 " + cost + "ms pane="
+                        + pane.index + " action=" + e.getActionMasked());
+            }
+            return true;
+        });
     }
 
     /** 空白画中画单击：直接弹应用列表，选中的应用会记为这块屏的默认应用 */
@@ -2097,6 +2113,9 @@ public class MainActivity extends AppCompatActivity
     private void showPaneMenu(final PipPane pane) {
         if (pane == null) return;
         final int index = pip.positionOf(pane);
+        // 单画专用屏不在 panes 里，positionOf 返回 -1：左右移/按位置关闭这类
+        // "兄弟之间"的操作对它没有意义，直接收起来；关闭走退出单画那条路。
+        final boolean single = (pane == pip.singlePane());
         final String pkg = pane.pkg();
         boolean horizontal = paneBox != null && paneBox.isHorizontal();
         String movePrev = horizontal ? "左移" : "上移";
@@ -2107,7 +2126,7 @@ public class MainActivity extends AppCompatActivity
             items.add("重启这个应用");
             items.add("关闭这个画中画");
         }
-        if (pip.count() > 1) {
+        if (!single && pip.count() > 1) {
             items.add(movePrev);
             items.add(moveNext);
         }
@@ -2131,7 +2150,8 @@ public class MainActivity extends AppCompatActivity
                         // 杀进程 → 在同一个虚拟屏上重新拉起，1~2 秒恢复
                         pane.restartApp();
                     } else if (sel.equals("关闭这个画中画")) {
-                        pip.close(index);
+                        if (single) pip.closeSingle();   // 单画屏：收掉应用并退回原布局
+                        else pip.close(index);
                     } else if (sel.equals(movePrev)) {
                         pip.swap(index, -1);   // 到边界循环到另一端
                     } else if (sel.equals(moveNext)) {
