@@ -721,6 +721,9 @@ public class PipPane {
                 PipDisplays.bind(reuse, st, displayW, displayH);
                 Log.i(TAG, "pane " + index + " 复用 display=" + displayId + " "
                         + displayW + "x" + displayH + " dpi=" + reuse.dpi + "（只换 surface，不动 task）");
+                // 焦点锚：屏内应用重建窗口时，这块屏也得有个可聚焦窗口顶着，
+                // 否则焦点会整块塌回主屏（→ pauseBackTasks 全屏 pause，见 FocusAnchor 注释）
+                syncAnchor();
                 showContentAfter(200);
                 return;
             }
@@ -775,12 +778,25 @@ public class PipPane {
             s.dpi = dpi;
             PipDisplays.put(key(), s);
             ignoreOrientationRequest(displayId);
+            syncAnchor();
         }
     }
 
     /** 本 pane 对应的槽位名（进程级虚拟屏按它复用） */
     private String key() {
         return "PipDesk-" + index;
+    }
+
+    /**
+     * 让本屏的「焦点锚」跟随屏内应用（详见 {@link FocusAnchor}）。
+     *
+     * 只给系统蓝牙 / 系统音乐挂：它们会在音频焦点切换时重建自己的窗口，
+     * 是这台车机上唯一能把两块屏一起卡死的源头。其它应用不挂 —— 锚是屏上最顶层的
+     * 可聚焦窗口，挂着会让屏内应用收不到按键和输入法（实测波点搜索框打不进字）。
+     */
+    private void syncAnchor() {
+        if (displayId < 0) return;
+        FocusAnchor.setWanted(app, displayId, index, FocusAnchor.needsAnchor(pkg));
     }
 
     /**
@@ -1110,6 +1126,22 @@ public class PipPane {
     private static final long FOREIGN_GAP_MS = 3_000L;
     private volatile long lastForeignAt;
 
+    /** 现场观察开关：/data/local/tmp/pipdesk_observe 存在时自愈只记录不动作 */
+    private static volatile long observeCheckedAt;
+    private static volatile boolean observeFlag;
+    private volatile long lastObserveLogAt;
+
+    static boolean observeOnly() {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - observeCheckedAt > 1500) {
+            observeCheckedAt = now;
+            try {
+                observeFlag = new java.io.File("/data/local/tmp/pipdesk_observe").exists();
+            } catch (Throwable ignored) { }
+        }
+        return observeFlag;
+    }
+
     /**
      * 停帧自愈：task 在本屏，但里面所有 activity 都被系统 stop 了。
      *
@@ -1129,6 +1161,22 @@ public class PipPane {
         final int disp = displayId;
         if (keep == null || disp < 0) return;
         if (fullscreened) return;                                  // 应用在主屏全屏，本屏本该是空的
+        // 现场观察开关（/data/local/tmp/pipdesk_observe 存在即生效）：
+        // 只记录不动作，用来区分「画面真的停了」和「我们误判后自己把它杀了重建」。
+        if (observeOnly()) {
+            final long n = android.os.SystemClock.uptimeMillis();
+            if (n - lastObserveLogAt > 2000) {
+                lastObserveLogAt = n;
+                new Thread(() -> {
+                    final int[] s = taskState(keep);
+                    Log.w(TAG, "OBS pane=" + index + " " + keep + " task=" + findTaskId(keep)
+                            + " frames=" + frames
+                            + " paneDisp=" + disp
+                            + " taskState=" + (s == null ? "null" : (s[0] + "/run" + s[1])));
+                }, "pipdesk-obs").start();
+            }
+            return;
+        }
         new Thread(() -> {
             final int[] st = taskState(keep);
             if (st == null) return;                                // 状态读不到：宁可不救，别乱拉

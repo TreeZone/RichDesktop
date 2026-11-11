@@ -107,6 +107,12 @@ final class PipDisplays {
     static synchronized void release(String key) {
         Slot s = SLOTS.remove(key);
         if (s == null) return;
+        int dispId = -1;
+        try {
+            if (s.vd != null && s.vd.getDisplay() != null) dispId = s.vd.getDisplay().getDisplayId();
+        } catch (Throwable ignored) { }
+        // 锚是挂在这块屏上的窗口，屏没了要一起摘，否则会留一个孤儿窗口
+        if (dispId >= 0) FocusAnchor.release(dispId);
         if (s.vd != null) {
             try { s.vd.setSurface(null); } catch (Throwable ignored) { }
             try { s.vd.release(); } catch (Throwable ignored) { }

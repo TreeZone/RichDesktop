@@ -92,15 +92,16 @@ public final class PerfMon {
         String line = b.toString();
         Log.i(TAG, line);
 
-        // Display 数 = 1（主屏）+ 每块画中画 1 块虚拟屏。多出来的就是**没释放干净的虚拟屏**，
-        // 它们会一直占用合成通道/显存，是"跑一阵子越来越卡"最典型的元凶，必须显式报出来。
-        // 期望 = 1（主屏）+ 主页画中画 + 单画专用屏（用过单画就一直留着，下次秒开）
+        // 期望 = 主页画中画 + 单画专用屏（用过单画就一直留着，下次秒开）
+        // 注意只数**我们自己的**虚拟屏：别的应用也会建虚拟屏（实测应用宝就常驻一块 1x1 的
+        // install_display_yyb），按 DisplayManager 的总数判断会天天误报"泄漏"。
         PipManager m = pip;
         if (m != null) {
-            int expect = m.count() + 1 + (m.singlePane() != null ? 1 : 0);
-            if (displays > expect) {
-                Log.w(TAG, "PERF 虚拟屏数量异常 displays=" + displays
-                        + " 期望=" + expect + "（有多余的虚拟屏没释放）");
+            int expect = m.count() + (m.singlePane() != null ? 1 : 0);
+            int mine = PipDisplays.size();
+            if (mine > expect) {
+                Log.w(TAG, "PERF 虚拟屏泄漏 我方=" + mine + " 期望=" + expect
+                        + "（全系统 displays=" + displays + "）");
             }
         }
 

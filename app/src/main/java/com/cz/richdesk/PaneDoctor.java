@@ -61,6 +61,7 @@ public final class PaneDoctor {
         t.setDaemon(true);
         t.start();
         Log.i(TAG, "听诊器已启动：屏内应用 ANR 自动记录，必要时重启恢复");
+        FocusAnchor.logMode();
         watchPlayback();   // 事件驱动：播放状态一变就进快巡检（见 kick 的注释）
     }
 
@@ -146,6 +147,7 @@ public final class PaneDoctor {
                 int n = ++tick;
                 PipManager p = pip;
                 if (p != null && p.count() > 0) checkStall(p);     // 每轮：只读 volatile 帧数，便宜
+                FocusAnchor.keepAlive(app);                        // 锚掉了就补回来（内部转主线程）
                 if (n % ANR_EVERY_N_TICKS == 0) tick();            // 每 8 拍：ANR 全校举扫描
                 // 每 32 个周期打一条帧心跳：卡死时对照时间轴，
                 // 就能看出"多块屏是同一时刻一起停帧"，还是各自陆续停的。
@@ -180,6 +182,7 @@ public final class PaneDoctor {
         }
         hbFrames = total;
         hbAt = now;
+        b.append(" anchors=").append(FocusAnchor.count()).append(FocusAnchor.summary());
         Log.i(TAG, b.toString());
     }
 

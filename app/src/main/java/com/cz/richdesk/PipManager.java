@@ -751,6 +751,13 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         if (p == null) return;
         int display = p.displayId();
         if (display < 0) return;
+        // 手指按下就先给这块屏备好"焦点锚"脉冲：屏内系统蓝牙/音乐点一下就会 relaunch
+        // 自己（切播放主题），那一瞬间窗口真空 → 焦点塌回主屏 → 全局 pause → 全部卡死。
+        // 脉冲提前顶住焦点，900ms 后自动放开把焦点还给应用（否则蓝牙不切音源 = 没声音）。
+        if (ev.getActionMasked() == android.view.MotionEvent.ACTION_DOWN
+                && FocusAnchor.needsAnchor(p.pkg())) {
+            FocusAnchor.pulse(app, display, p.index, FocusAnchor.PULSE_MS);
+        }
         // 统一走矩阵映射（视图本地 → 虚拟屏像素），并按屏尺寸钳制越界点
         touch.send(ev, display, p.viewToDisplayMatrix(),
                 p.displayWidth(), p.displayHeight());

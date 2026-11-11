@@ -366,6 +366,19 @@ public class MainActivity extends AppCompatActivity
         Keys.send(this, keyCode);
     }
 
+    /**
+     * 桌面窗口要不要"放弃输入焦点"。默认**保持可聚焦**（0.22.8 实测：放弃焦点并不能
+     * 阻止那次全局 pause，反而让桌面自己的按键/输入法链路更绕）。
+     * 现场对照用：/data/local/tmp/pipdesk_desk_nofocus 存在 → 桌面窗口设 FLAG_NOT_FOCUSABLE。
+     */
+    private static boolean deskGivesUpFocus() {
+        try {
+            return new java.io.File("/data/local/tmp/pipdesk_desk_nofocus").exists();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -379,6 +392,11 @@ public class MainActivity extends AppCompatActivity
         // 反复重建就变成「深色 ↔ 透明」来回切 —— 用户看到的持续闪烁。
         getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(
                 android.graphics.Color.TRANSPARENT));
+        // 桌面窗口要不要放弃输入焦点。默认不放弃 —— 0.22.8 实测过：放弃焦点并不能
+        // 阻止那次全局 pause（放手后照样冻），所以只留作现场对照开关。
+        if (deskGivesUpFocus()) {
+            getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+        }
         // 全局绘制开关必须早于任何 Ui.glass / Ui.clipRounded 调用
         Ui.syncPerfMode(this);
         instance = this;
