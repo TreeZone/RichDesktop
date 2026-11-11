@@ -75,9 +75,25 @@ android {
     }
 }
 
+/*
+ * 产物文件名显式定死（AGP 默认是「模块名-构建类型.apk」= app-debug.apk）。
+ * 不写这段时，不同机器上出现过的名字五花八门：app-debug.apk / PipDesk-0.13.0-sysuid-debug.apk
+ * —— 后者来自 rootProject.name 参与命名 + 自定义 rename 规则，跟包名无关，但很容易看错。
+ * 统一成：RichDesktop-<versionName>-vc<versionCode>[-sysuid].apk
+ */
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        variant.outputs.forEach { out ->
+            def vn = out.versionName.orNull ?: android.defaultConfig.versionName
+            def vc = out.versionCode.orNull ?: android.defaultConfig.versionCode
+            def suffix = sysUid ? '-sysuid' : ''
+            out.outputFileName.set("RichDesktop-${vn}-vc${vc}${suffix}.apk")
+        }
+    }
+}
+
 // 离线构建：把传递依赖统一对齐到本机已有缓存的版本
-configurations.all {
-    resolutionStrategy.force(
+configurations.all {    resolutionStrategy.force(
             'androidx.activity:activity:1.8.2',
             'androidx.savedstate:savedstate:1.2.1',
             'androidx.core:core-ktx:1.13.1',
