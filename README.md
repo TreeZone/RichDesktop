@@ -4,8 +4,9 @@ Android 多虚拟屏桌面（launcher）：把多块「画中画」铺在桌面�
 由桌面统一负责启动、触摸转发与按键注入。
 
 - 包名：`com.cz.richdesk`
-- 当前版本：`0.13.0`（versionCode 50）
+- 当前版本：`0.21.4`（versionCode 128）
 - 运行身份：`sharedUserId=android.uid.system`（uid 1000），需系统签名 / priv-app 部署
+- 语音：完全离线（sherpa-onnx 唤醒词 + 流式识别），不联网、不上传音频
 
 ## 功能
 
@@ -18,6 +19,10 @@ Android 多虚拟屏桌面（launcher）：把多块「画中画」铺在桌面�
   时间配置仅在「跟随时间」模式显示、切换外观后保持滚动位置
 - **诊断**：`PerfMon` 每 60 秒记录一行资源心跳（heap / pss / threads / fds / 虚拟屏数量 / 各屏帧率），
   `PaneDoctor` 检测屏内应用 ANR，`AudioProbe` 记录 AudioService 卡顿
+- **语音助手**（`Voice*.java`）：常驻唤醒词（默认「你好小瑞」，可自定义 2~6 个汉字）→ TTS 应答
+  → 流式识别 → 关键词匹配，能打开应用或执行内置指令（返回、主页、应用列表、息屏、最近任务、
+  深浅色、桌面设置、重启桌面、音量±）。唤醒词汉字→拼音→音素在本地换算（`VoiceWords` +
+  `assets/kws/pinyin.txt`）；听不清时给候选列表并保持聆听，可直接说「第一个/第二个」
 
 ## 目录结构
 
