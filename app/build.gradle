@@ -40,8 +40,8 @@ android {
         applicationId "com.cz.richdesk"
         minSdk 28
         targetSdk 30
-        versionCode 138
-        versionName "0.22.4"
+        versionCode 139
+        versionName "0.22.5"
 
         // 语音链路只带 arm64：sherpa-onnx 的 onnxruntime.so 占 21MB，
         // 四个 ABI 全打进去 APK 会直接翻倍。车机是 arm64，够用。

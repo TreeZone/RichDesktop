@@ -940,43 +940,57 @@ public class PipPane {
     }
 
     /**
-     * 把应用 task 弄到本面板的虚拟屏。
+     * 把应用 task 弄回本面板的虚拟屏。两级策略：先搬，搬不活再重建。
      *
-     * ★ 这里**绝对不允许**跨屏搬 task（move-stack / moveTaskToDisplay）。
+     * 为什么不是单一策略 —— 车机日志给了两个互相矛盾的实证：
      *
-     * 车机日志实证（18:23:55~56，同一块屏连续 4 次）：
-     *   PipDesk: moveTask(shell move-stack) 1779 -> display 58
-     *   wm_on_destroy_called  com.tw.bt/.ATBluetoothActivity performDestroy
-     *   wm_on_create_called   com.tw.bt/.ATBluetoothActivity performCreate
-     *   Focused display #58 does not have a focused window
-     *   wm_pause_activity / wm_add_to_stopping ... makeInvisible
+     * ① 搬能救活（18:15:16，v0.21.6）：
+     *      PipDesk: 自愈：任务跑到 display 0（本屏 56），搬回 com.tw.bt
+     *      PipDesk: moveTask(shell move-stack) 1779 -> display 56
+     *      18:15:16.648  LIFE focus=true  p0=com.tw.bt:f14  ← 帧数立刻恢复
+     *    这块屏此前已经停帧 23 秒，搬完立刻出帧。所以搬这条路不能删。
      *
-     * 因为主屏（1920x1200）和虚拟屏（629x1045 / 1259x1045）的尺寸与 DPI 不同，
-     * 跨屏 reparent 在 AMS 眼里就是一次配置变更 → **activity 销毁重建**。
-     * 重建期间目标屏上一个可聚焦窗口都没有，DisplayContent 的
-     * adjustFocusToNextFocusableTask 会把焦点交还 display 0 的 home，
-     * 顺手把刚搬过去那个 activity pause 掉、makeInvisible —— 虚拟屏只剩最后一帧。
-     * 巡检看到"停帧"再搬一次，就是用户看到的"卡死 → 自己重启 → 又卡死"死循环。
+     * ② 搬也会把 activity 拆了重建（18:23:56，v0.21.7）：
+     *      moveTask(shell move-stack) 1779 -> display 58
+     *      wm_on_destroy_called / wm_on_create_called  com.tw.bt/.ATBluetoothActivity
+     *      Focused display #58 does not have a focused window
+     *    因为主屏 1920x1200 与虚拟屏 629x1045 尺寸/DPI 不同，跨屏 reparent 在
+     *    AMS 眼里是一次配置变更 → 销毁重建；重建那几百毫秒目标屏没有可聚焦窗口，
+     *    焦点可能被交还 display 0 的 home，activity 反而被 pause 掉。
+     *    这种情况下再搬几次都是白搬。
      *
-     * 所以改成：**删掉老 task，让新 task 直接长在目标屏上**。
-     * removeTask 只销毁 activity，进程和常驻 service 都还在（蓝牙放歌不受影响），
-     * 之后 launchOn 带 launchDisplayId 会把 task 建在本屏，全程没有 reparent。
+     * 所以：搬 → resume → **验证 1.5 秒内真的出新帧**；没新帧说明这条 task 已经
+     * 被系统判成"不该在这块屏"，才删 task 在目标屏重建（removeTask 只销毁 activity，
+     * 进程和常驻 service 不受影响，蓝牙放歌不会断）。
      */
     private void forceToDisplay(final String targetPkg, final int display) {
         new Thread(() -> {
             final int tid = findTaskId(targetPkg);
-            if (tid >= 0) {
-                boolean ok = removeTask(tid);
-                Log.i(TAG, "重建到本屏：移除旧 task " + tid + "(" + targetPkg + ") ok=" + ok);
-            }
+            final boolean moved = tid >= 0 && moveTask(tid, display);
+            Log.i(TAG, "搬回本屏：" + targetPkg + " task=" + tid + " -> " + display + " move=" + moved);
             main.postDelayed(() -> {
                 if (!targetPkg.equals(pkg) || displayId != display) return;
-                Log.i(TAG, "重建到本屏：在 display " + display + " 新建 task " + targetPkg);
                 livePkg = targetPkg;
-                launchOn(targetPkg, display);
+                launchOn(targetPkg, display);          // task 搬过去不等于 activity resume
                 showContentAfter(450);
-            }, 260);
-        }, "pipdesk-rebuild").start();
+                final long base = frames;
+                main.postDelayed(() -> {
+                    if (!targetPkg.equals(pkg) || displayId != display) return;
+                    if (frames > base) return;         // 搬回来就活了，收工
+                    Log.w(TAG, "搬回后 1.5s 无新帧，改为删 task 重建：" + targetPkg);
+                    new Thread(() -> {
+                        final int t2 = findTaskId(targetPkg);
+                        if (t2 >= 0) removeTask(t2);
+                        main.postDelayed(() -> {
+                            if (!targetPkg.equals(pkg) || displayId != display) return;
+                            Log.i(TAG, "重建到本屏：display " + display + " 新建 task " + targetPkg);
+                            launchOn(targetPkg, display);
+                            showContentAfter(450);
+                        }, 260);
+                    }, "pipdesk-rebuild").start();
+                }, 1500);
+            }, 320);
+        }, "pipdesk-forcedisp").start();
     }
 
     /**
