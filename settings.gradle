@@ -18,3 +18,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "PipDesk"
 include ':app'
+// LSPosed 模块：卡死补丁（hook system_server 的 Task.startPausingLocked）
+include ':hook'

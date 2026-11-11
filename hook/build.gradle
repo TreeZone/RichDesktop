@@ -1,0 +1,65 @@
+plugins {
+    id 'com.android.application'
+}
+
+/*
+ * LSPosed 模块（卡死补丁）。
+ *
+ * 这里刻意做成**独立 APK**，不并进主应用：
+ *   - 它要被 LSPosed 注入进 system_server，勾选作用域是「系统框架」，
+ *     跟主应用的 uid 1000 / priv-app 身份完全无关；
+ *   - 主应用以后换签名/改包名都不影响它，反过来也一样。
+ *
+ * 用法：gradle :hook:assembleDebug → 装进车机 → LSPosed 管理器里勾选模块、作用域选「系统框架」→ 软重启。
+ * 想临时关掉某一条 hook，不用重装，改系统属性即可：
+ *   setprop persist.pipdesk.hook.pause 0     # 关掉主补丁
+ *   setprop persist.pipdesk.hook.focus 1     # 打开"拒绝清空 focusedApp"的实验分支
+ */
+android {
+    namespace 'com.cz.richdesk.hook'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.cz.richdesk.hook"
+        minSdk 28
+        targetSdk 30
+        versionCode 1
+        versionName "0.1"
+    }
+
+    signingConfigs {
+        // 跟主应用同一张证书，方便车机上统一管理；模块本身不需要 platform 签名
+        pipdesk {
+            storeFile file('../pipdesk.jks')
+            storePassword 'pipdesk123'
+            keyAlias 'pipdesk'
+            keyPassword 'pipdesk123'
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.pipdesk
+        }
+        release {
+            signingConfig signingConfigs.pipdesk
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // Xposed 的 API 只在编译期用到：运行时由 LSPosed 自己注入，绝不能打进 APK
+    dependencies {
+        compileOnly files('libs/xposed-api-82.jar')
+    }
+
+    packaging {
+        resources {
+            excludes += ['META-INF/LICENSE*', 'META-INF/NOTICE*']
+        }
+    }
+}

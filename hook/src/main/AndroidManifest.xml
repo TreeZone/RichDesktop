@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      LSPosed 模块：没有 Activity、没有界面，装上后在 LSPosed 管理器的「模块」里勾选，
+      作用域只勾「系统框架」。模块自身逻辑见 PipDeskHook。
+    -->
+    <application
+        android:label="PipDesk 卡死补丁"
+        android:allowBackup="false"
+        android:hasCode="true">
+
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="拦掉车机 ROM 里跨虚拟屏的 pauseBackTasks：点蓝牙播放时不再把其它画中画一起暂停（焦点与音频原样不动）" />
+        <meta-data android:name="xposedminversion" android:value="93" />
+        <meta-data android:name="xposedscope" android:value="android" />
+    </application>
+</manifest>
