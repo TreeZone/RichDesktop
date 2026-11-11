@@ -29,6 +29,12 @@ public class AppInfo {
     public static final String VOL_UP_PKG = "pipdesk://vol-up";
     /** 伪包名：音量减 */
     public static final String VOL_DOWN_PKG = "pipdesk://vol-down";
+    /**
+     * 伪包名：语音助手（点一下开始听，说完自动收工；常驻唤醒词在设置里开）。
+     * 它单独占一格快捷方式，是因为语音最需要「一眼能看到、一下能按到」，
+     * 而不是藏进设置页。
+     */
+    public static final String VOICE_PKG = "pipdesk://voice";
 
     /** 所有伪包名共用的前缀：凭它区分"桌面内置快捷方式"和真实应用 */
     public static final String SCHEME = "pipdesk://";

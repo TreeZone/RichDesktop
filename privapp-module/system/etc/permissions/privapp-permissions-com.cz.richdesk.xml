@@ -9,5 +9,8 @@
         <permission name="android.permission.MANAGE_ACTIVITY_TASKS"/>
         <permission name="android.permission.WRITE_SECURE_SETTINGS"/>
         <permission name="android.permission.INTERNAL_SYSTEM_WINDOW"/>
+        <!-- 语音助手采音。dangerous 级，白名单本身不授权，但写在这里便于刷机脚本统一处理；
+             真正的授权走 VoicePerm（AppOps → pm grant → 系统弹框） -->
+        <permission name="android.permission.RECORD_AUDIO"/>
     </privapp-permissions>
 </permissions>

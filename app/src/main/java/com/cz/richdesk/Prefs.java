@@ -804,4 +804,147 @@ public class Prefs {
         else e.putString("pane_default_" + pane, pkg);
         e.apply();
     }
+
+    // ------------------------------------------------------------ 语音助手
+
+    /**
+     * 常驻唤醒开关（默认关）。
+     *
+     * 关着的时候麦克风完全不打开 —— 点 Dock 上的「语音」图标才录一次，属于按住说话的变体。
+     * 打开后常驻跑 KWS（3.3M 模型，约 1% 单核），说「你好小桌」进入聆听。
+     * 默认关的理由：车机上麦克风可能和百度地图的「小度小度」抢，先让用户主动开。
+     */
+    public static boolean voiceWake(Context c) {
+        return sp(c).getBoolean("voice_wake", false);
+    }
+
+    public static void setVoiceWake(Context c, boolean on) {
+        sp(c).edit().putBoolean("voice_wake", on).apply();
+    }
+
+    /**
+     * 唤醒词（中文，默认「你好小瑞」）。
+     *
+     * 模型认的是拼音音素，所以设置里改的这句中文会在启动 KWS 前被
+     * {@link VoiceWords} 转成 keywords 文件（汉字 → 带声调拼音 → 音素 token）；
+     * 转不出来的字自动退回默认词，不会让语音整个起不来。
+     */
+    public static String voiceWakeWord(Context c) {
+        String s = sp(c).getString("voice_wake_word", "");
+        return (s == null || s.trim().isEmpty()) ? VoiceWords.DEFAULT : s.trim();
+    }
+
+    public static void setVoiceWakeWord(Context c, String w) {
+        String s = w == null ? "" : w.trim();
+        sp(c).edit().putString("voice_wake_word",
+                s.isEmpty() ? VoiceWords.DEFAULT : s).apply();
+    }
+
+    /** 唤醒/开始聆听时是否给一声提示音（默认开）。车机没有振动马达，只能靠声音确认。 */
+    public static boolean voiceBeep(Context c) {
+        return sp(c).getBoolean("voice_beep", true);
+    }
+
+    public static void setVoiceBeep(Context c, boolean on) {
+        sp(c).edit().putBoolean("voice_beep", on).apply();
+    }
+
+    /**
+     * 唤醒词命中阈值（百分数，默认 25 = 0.25）。
+     * 调低更容易唤醒也更爱误唤醒，车机放歌时噪声大，用户可以自己往上推。
+     */
+    public static int voiceThreshold(Context c) {
+        return clamp(sp(c).getInt("voice_thr", 25), 10, 90);
+    }
+
+    public static void setVoiceThreshold(Context c, int v) {
+        sp(c).edit().putInt("voice_thr", clamp(v, 10, 90)).apply();
+    }
+
+    /** 唤醒/识别时是否顺便把桌面拉到前台（默认关：车机上抢前台可能把导航挤掉） */
+    public static boolean voiceBringFront(Context c) {
+        return sp(c).getBoolean("voice_front", false);
+    }
+
+    public static void setVoiceBringFront(Context c, boolean on) {
+        sp(c).edit().putBoolean("voice_front", on).apply();
+    }
+
+    /** 执行完指令后用系统 TTS 回一句「好的 / 没听清」（默认开；没 TTS 引擎自动静默） */
+    public static boolean voiceReply(Context c) {
+        return sp(c).getBoolean("voice_reply", true);
+    }
+
+    public static void setVoiceReply(Context c, boolean on) {
+        sp(c).edit().putBoolean("voice_reply", on).apply();
+    }
+
+    /** TTS 引擎包名（"" = 跟随系统默认）。用户装了第三方 TTS 可以在这里指定音色 */
+    public static String voiceTtsEngine(Context c) {
+        String s = sp(c).getString("voice_tts_engine", "");
+        return s == null ? "" : s;
+    }
+
+    public static void setVoiceTtsEngine(Context c, String pkg) {
+        sp(c).edit().putString("voice_tts_engine", pkg == null ? "" : pkg).apply();
+    }
+
+    /**
+     * 用户教给语音的别名：「包名=别名1|别名2;包名=别名3」。
+     * 识别结果匹配不到应用时会弹候选卡片，用户点一下就把当时的说法记进来，
+     * 下次同样的说法直接命中 —— 关键词匹配靠这个越用越准，不需要任何模型。
+     */
+    public static String voiceAliasRaw(Context c) {
+        String s = sp(c).getString("voice_alias", "");
+        return s == null ? "" : s;
+    }
+
+    /** 追加一条「说法 → 包名」的记忆，同名说法的旧记录会被顶掉 */
+    public static void addVoiceAlias(Context c, String pkg, String phrase) {
+        if (pkg == null || pkg.isEmpty()) return;
+        if (phrase == null || phrase.trim().isEmpty()) return;
+        String p = phrase.trim();
+        java.util.Map<String, java.util.Set<String>> map = parseAlias(voiceAliasRaw(c));
+        for (java.util.Iterator<java.util.Map.Entry<String, java.util.Set<String>>> it =
+             map.entrySet().iterator(); it.hasNext(); ) {
+            java.util.Map.Entry<String, java.util.Set<String>> e = it.next();
+            e.getValue().remove(p);
+            if (e.getValue().isEmpty()) it.remove();
+        }
+        java.util.Set<String> set = map.get(pkg);
+        if (set == null) {
+            set = new java.util.LinkedHashSet<>();
+            map.put(pkg, set);
+        }
+        set.add(p);
+        StringBuilder sb = new StringBuilder();
+        for (java.util.Map.Entry<String, java.util.Set<String>> e : map.entrySet()) {
+            if (sb.length() > 0) sb.append(';');
+            sb.append(e.getKey()).append('=');
+            boolean first = true;
+            for (String a : e.getValue()) {
+                if (!first) sb.append('|');
+                sb.append(a);
+                first = false;
+            }
+        }
+        sp(c).edit().putString("voice_alias", sb.toString()).apply();
+    }
+
+    /** 包名 → 别名集合 */
+    public static java.util.Map<String, java.util.Set<String>> parseAlias(String raw) {
+        java.util.Map<String, java.util.Set<String>> out = new java.util.HashMap<>();
+        if (raw == null || raw.isEmpty()) return out;
+        for (String one : raw.split(";")) {
+            int eq = one.indexOf('=');
+            if (eq <= 0) continue;
+            String pkg = one.substring(0, eq).trim();
+            java.util.Set<String> set = new java.util.LinkedHashSet<>();
+            for (String a : one.substring(eq + 1).split("\\|")) {
+                if (!a.trim().isEmpty()) set.add(a.trim());
+            }
+            if (!pkg.isEmpty() && !set.isEmpty()) out.put(pkg, set);
+        }
+        return out;
+    }
 }

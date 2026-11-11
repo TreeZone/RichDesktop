@@ -305,6 +305,44 @@ public class SettingsActivity extends AppCompatActivity {
         seek("每行列数", 3, 8, 1, Prefs.getListColumns(this),
                 v -> Prefs.setListColumns(this, v), v -> v + " 列");
 
+        // 语音助手：唤醒词常驻默认关（车机上可能和厂商语音抢麦克风），
+        // 麦克风自检放同一块 ——「到底有没有采到音」是这套功能能不能用的唯一前提。
+        section("语音助手");
+        toggle("唤醒词「" + VoiceWords.wakeWord(this) + "」（常驻监听）", Prefs.voiceWake(this), b -> {
+            Prefs.setVoiceWake(this, b);
+            if (b) Voice.get().startWake();
+            else Voice.get().stop();
+        });
+        action("唤醒词：" + VoiceWords.wakeWord(this) + "（点按修改）", this::pickWakeWord);
+        seek("唤醒灵敏度", 10, 90, 5, Prefs.voiceThreshold(this), v -> {
+            Prefs.setVoiceThreshold(this, v);
+            Voice.get().reloadWake();     // 阈值变了：丢掉旧模型，下次起麦按新值加载
+        }, v -> v + "%（越小越容易唤醒）");
+        toggle("提示音", Prefs.voiceBeep(this), b -> Prefs.setVoiceBeep(this, b));
+        toggle("语音回复（执行后说「好的」等，用系统 TTS）", Prefs.voiceReply(this),
+                b -> Prefs.setVoiceReply(this, b));
+        action("TTS 引擎：当前「" + ttsEngineLabel(Prefs.voiceTtsEngine(this)) + "」（点按更换）",
+                this::pickTtsEngine);
+        toggle("唤醒后把桌面拉到前台", Prefs.voiceBringFront(this),
+                b -> Prefs.setVoiceBringFront(this, b));
+        action("麦克风自检（录 5 秒，正常说话）", this::runMicProbe);
+        micResult = new TextView(this);
+        micResult.setTextSize(12);
+        micResult.setLineSpacing(Ui.dp(this, 3), 1f);
+        micResult.setTextColor(Ui.tintHint());
+        micResult.setShadowLayer(3, 0, 1, Ui.shadow());
+        micResult.setPadding(Ui.dp(this, 4), Ui.dp(this, 8), 0, 0);
+        micResult.setText("自检结果会显示在这里，录音同时存到日志目录 mic-selftest.wav。");
+        content.addView(micResult);
+        note("· 语音只认「应用列表里真实存在的应用」，外加返回 / 主页 / 应用列表 / 息屏这几个内置指令。\n"
+                + "· 「打开高德」「导航」都能命中：靠名字模糊匹配 + 常用别名；\n"
+                + "  听不准时弹候选，点一次就记成别名，下次同样的说法直接命中。\n"
+                + "· 唤醒词完全跑在本地（3.3MB 模型），不联网；常驻约 1% 单核。\n"
+                + "· 唤醒词可以改成任意 2~6 个汉字：设置里改完立刻生效（汉字→拼音音素是本地换算的）。\n"
+                + "· 报候选列表时会**继续听**：直接说「第一个 / 第二个」就能选，不用伸手点。\n"
+                + "· 和百度地图「小度小度」共用麦克风：若发现小度失灵，先关掉这个开关复测，\n"
+                + "  说明车机 HAL 只肯放一路采集，那就只能改成点图标说话。");
+
         // 画中画路由：活动画中画 + 每屏默认应用（替代原来的「多屏分配」：
         // 单应用固定屏位在长按图标里设置）
         section("画中画路由");
@@ -686,6 +724,128 @@ public class SettingsActivity extends AppCompatActivity {
     }
 
     /** 未指定屏位的应用默认怎么打开：活动画中画 / 全屏 / 单画中画 */
+    /**
+     * TTS 引擎选择：列出本机声明了 TTS_SERVICE 的应用。
+     * 「跟随系统默认」和系统当前默认引擎是一回事，所以默认引擎不重复列出；
+     * 其余引擎逐个显示，装了第三方 TTS（讯飞语记等）后重新打开本页即可看到。
+     * 车机 ROM 往往没有系统 TTS 设置页，这里就是换音色的口子。选完立刻试听。
+     */
+    /**
+     * TTS 引擎选择：列出本机声明了 TTS_SERVICE 的应用。
+     *
+     * **不再单列「跟随系统默认」** —— 它和"系统当前默认引擎"本来就是同一个东西，
+     * 并排两行会让人以为是两个不同的引擎。现在把系统默认那个标成「（系统默认）」，
+     * 选中它存的仍是空串 = 跟随系统默认（系统设置里换了引擎，这里自动跟着变）。
+     *
+     * 判断哪个是默认：优先 ResolveInfo.isDefault（PackageManager 直接算好的），
+     * 再兜底读一次 tts_default_synth。之前只读 Secure 设置，在 MIUI 上取不到值，
+     * 于是默认引擎被当成普通引擎又列了一行 —— 用户看到的就是「跟随系统默认」+
+     * 「系统语音引擎」两项，其实是同一个引擎。
+     */
+    /**
+     * 自定义唤醒词。
+     *
+     * 为什么是个输入框而不是预置列表：KWS 模型认的是拼音音素，任意中文都能现场
+     * 转（{@link VoiceWords}：汉字 → 带声调拼音 → tokens.txt 音素切分），所以
+     * 用户想叫它什么都行。转不出来的生僻字会退回默认词并在下面提示。
+     */
+    private void pickWakeWord() {
+        // 与 GlassMenu 的菜单**同一套**玻璃底/标题/分隔线/按钮行 —— 之前用 AlertDialog
+        // 直接继承应用的透明窗口主题，弹出来连底色都没有，字全糊在壁纸上。
+        GlassMenu.input(this, "唤醒词（2~6 个汉字最好识别）",
+                Prefs.voiceWakeWord(this), "例如：你好小瑞",
+                "改完立刻生效。读不出的生僻字会自动退回默认词「" + VoiceWords.DEFAULT + "」。",
+                v -> {
+                    String word = (v == null || v.isEmpty()) ? VoiceWords.DEFAULT : v;
+                    Prefs.setVoiceWakeWord(this, word);
+                    String kw = VoiceWords.keywordsFile(this, Prefs.voiceWakeWord(this));
+                    // 立刻按新词重载 KWS：先丢掉旧模型，再按设置决定是否重新起麦
+                    Voice.get().reloadWake();
+                    boolean want = Prefs.voiceWake(this);
+                    Voice.get().stop();
+                    if (want) Voice.get().startWake();
+                    toast(kw == null
+                            ? "已保存「" + Prefs.voiceWakeWord(this) + "」（这句模型读不出，实际用的是默认词）"
+                            : "唤醒词已改为「" + Prefs.voiceWakeWord(this) + "」");
+                    recreate();
+                });
+    }
+
+
+    private String ttsEngineLabel(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return "跟随系统默认";
+        try {
+            android.content.pm.ApplicationInfo ai = getPackageManager().getApplicationInfo(pkg, 0);
+            CharSequence lb = getPackageManager().getApplicationLabel(ai);
+            return lb == null ? pkg : lb.toString();
+        } catch (Throwable t) {
+            return pkg + "（已卸载）";
+        }
+    }
+
+    private void pickTtsEngine() {
+        PackageManager pm = getPackageManager();
+        String sysDefault = null;
+        try {
+            sysDefault = android.provider.Settings.Secure.getString(
+                    getContentResolver(), "tts_default_synth");
+        } catch (Throwable ignored) {
+        }
+        List<CharSequence> labels = new ArrayList<>();
+        final List<String> pkgs = new ArrayList<>();
+        final List<String> seen = new ArrayList<>();     // 本机所有引擎包名（判断"已卸载"用）
+        boolean hasDefaultRow = false;
+        try {
+            List<ResolveInfo> ris = pm.queryIntentServices(
+                    new Intent("android.intent.action.TTS_SERVICE"), 0);
+            for (ResolveInfo ri : ris) {
+                if (ri == null || ri.serviceInfo == null) continue;
+                String p = ri.serviceInfo.packageName;
+                boolean isDefault = ri.isDefault || p.equals(sysDefault);
+                CharSequence lb = ri.loadLabel(pm);
+                String name = lb == null ? p : lb.toString();
+                seen.add(p);
+                if (isDefault && !hasDefaultRow) {
+                    labels.add(name + "（系统默认）");
+                    pkgs.add("");                    // 空串 = 跟随系统默认
+                    hasDefaultRow = true;
+                } else {
+                    labels.add(name);
+                    pkgs.add(p);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        if (!hasDefaultRow) {
+            labels.add(0, "跟随系统默认（本机没有默认引擎）");
+            pkgs.add(0, "");
+        }
+        String cur = Prefs.voiceTtsEngine(this);
+        // 标出当前选中的那个：之前菜单里没有任何标记，用户选完再打开根本看不出选的是谁
+        for (int i = 0; i < pkgs.size(); i++) {
+            if (pkgs.get(i).equals(cur)) {
+                labels.set(i, "✓ " + labels.get(i));
+                break;
+            }
+        }
+        if (!cur.isEmpty() && !seen.contains(cur) && !pkgs.contains(cur)) {
+            labels.add("当前所选引擎已卸载（点这里回退默认）");
+            pkgs.add("");
+        }
+        GlassMenu.show(this, "TTS 引擎（回复的音色）",
+                labels.toArray(new CharSequence[0]),
+                "只列出本机已安装的 TTS 引擎。「系统默认」就是系统设置里当前选中的那个；"
+                        + "想换音色，装一个新的 TTS 引擎（如讯飞语记）后回到本页重新打开即可看到。",
+                which -> {
+                    if (which < 0 || which >= pkgs.size()) return;
+                    String p = pkgs.get(which);
+                    Prefs.setVoiceTtsEngine(this, p);
+                    Voice.get().onTtsEngineChanged();
+                    toast("已选 " + labels.get(which));
+                    Voice.get().previewReply();
+                });
+    }
+
     private void pickOpenMode() {
         GlassMenu.show(this, "未指定屏位的应用打开方式",
                 new CharSequence[]{"活动画中画（原行为）", "全屏打开", "单画中画（临时单屏布局）"},
@@ -795,8 +955,28 @@ public class SettingsActivity extends AppCompatActivity {
         content.addView(tv);
     }
 
-    private void note(String text) {
-        TextView tv = new TextView(this);
+    /** 麦克风自检结果（录一段存 wav + 统计能量，见 VoiceMic.probe） */
+    private TextView micResult;
+
+    /**
+     * 麦克风自检：阻塞 5 秒，必须丢后台线程。
+     * 结果只有三种有意义：全 0 静音（被独占 / ROM 不放行）、能量极低、正常。
+     * 这一步不做任何模型推理，却能一次性判定整套语音功能到底能不能落地。
+     */
+    private void runMicProbe() {
+        if (micResult != null) {
+            micResult.setText("录制中… 5 秒，请用平常的音量说句话。");
+        }
+        final android.content.Context app = getApplicationContext();
+        new Thread(() -> {
+            VoiceMic.Probe p = VoiceMic.probe(app, 5, "selftest");
+            runOnUiThread(() -> {
+                if (micResult != null) micResult.setText(p.summary);
+            });
+        }, "pipdesk-mic-probe").start();
+    }
+
+    private void note(String text) {        TextView tv = new TextView(this);
         tv.setText(text);
         tv.setTextSize(12);
         tv.setLineSpacing(Ui.dp(this, 3), 1f);

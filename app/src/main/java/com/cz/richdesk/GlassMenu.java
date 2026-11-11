@@ -40,6 +40,15 @@ public final class GlassMenu {
     }
 
     public static Dialog show(Context ctx, String title, CharSequence[] items, OnPick cb) {
+        return show(ctx, title, items, null, cb);
+    }
+
+    /**
+     * 带底部说明文字的版本：footer 是不可点的小字（12sp 提示色），挂在菜单列表下面。
+     * 用来放"这里显示的是什么 / 怎么让列表里出现更多项"这类一行说明。
+     */
+    public static Dialog show(Context ctx, String title, CharSequence[] items,
+                              CharSequence footer, OnPick cb) {
         // 菜单项打日志：没有手指（或屏幕被锁屏盖住）时也能确认弹的是哪几项
         StringBuilder sb = new StringBuilder();
         for (int k = 0; k < items.length; k++) {
@@ -118,6 +127,22 @@ public final class GlassMenu {
         root.addView(sv, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
+        // ---- 底部说明：不可点的小字，与菜单行之间留条分隔线 ----
+        if (footer != null && footer.length() > 0) {
+            View line2 = new View(ctx);
+            line2.setBackgroundColor(Ui.dark ? 0x26FFFFFF : 0x1A000000);
+            root.addView(line2, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, Ui.dp(ctx, 1))));
+            TextView hint = new TextView(ctx);
+            hint.setText(footer);
+            hint.setTextSize(12);
+            hint.setTextColor(Ui.tintHint());
+            int fp = Ui.dp(ctx, 16);
+            hint.setPadding(fp, Ui.dp(ctx, 10), fp, Ui.dp(ctx, 4));
+            root.addView(hint, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        }
+
         d.setContentView(root);
         d.setCanceledOnTouchOutside(true);
         d.show();
@@ -145,8 +170,120 @@ public final class GlassMenu {
         return d;
     }
 
+    /**
+     * 玻璃样式的「输入框」弹框 —— 和菜单同一套外观。
+     *
+     * 存在的原因：桌面是透明窗口主题，AlertDialog 继承过去就**没有底色**，
+     * 黑底黑字/白字全看不清（用户原话「连底色都没有」）。所以输入框也走
+     * Ui.dialogContext + glassWindow + tint 这一套，跟菜单天然一致。
+     */
+    public static Dialog input(Context ctx, String title, String value, String editHint,
+                               CharSequence footer, java.util.function.Consumer<String> onOk) {
+        final Dialog d = new Dialog(Ui.dialogContext(ctx));
+        d.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+
+        LinearLayout root = new LinearLayout(ctx);
+        root.setOrientation(LinearLayout.VERTICAL);
+        int side = Ui.dp(ctx, 4);
+        root.setPadding(side, Ui.dp(ctx, 12), side, side);
+
+        if (title != null && title.length() > 0) {
+            TextView t = new TextView(ctx);
+            t.setText(title);
+            t.setTextSize(20);
+            t.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+            t.setTextColor(Ui.tint());
+            t.setAlpha(0.82f);
+            t.setMaxLines(1);
+            t.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            t.setIncludeFontPadding(false);
+            t.setPadding(Ui.dp(ctx, 16), 0, Ui.dp(ctx, 16), Ui.dp(ctx, 10));
+            root.addView(t, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+            View line = new View(ctx);
+            line.setBackgroundColor(Ui.dark ? 0x26FFFFFF : 0x1A000000);
+            root.addView(line, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, Ui.dp(ctx, 1))));
+        }
+
+        final android.widget.EditText et = new android.widget.EditText(ctx);
+        et.setSingleLine(true);
+        et.setText(value == null ? "" : value);
+        et.setSelection(et.getText().length());
+        et.setHint(editHint == null ? "" : editHint);
+        et.setTextSize(16);
+        et.setTextColor(Ui.tint());
+        et.setHintTextColor(Ui.tintHint());
+        GradientDrawable box = new GradientDrawable();
+        box.setColor(Ui.dark ? 0x33FFFFFF : 0x14000000);
+        box.setCornerRadius(Ui.dp(ctx, 12));
+        et.setBackground(box);
+        int hp = Ui.dp(ctx, 16);
+        LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        elp.setMargins(side, Ui.dp(ctx, 12), side, Ui.dp(ctx, 4));
+        et.setPadding(hp, Ui.dp(ctx, 12), hp, Ui.dp(ctx, 12));
+        root.addView(et, elp);
+
+        if (footer != null && footer.length() > 0) {
+            TextView hint = new TextView(ctx);
+            hint.setText(footer);
+            hint.setTextSize(12);
+            hint.setTextColor(Ui.tintHint());
+            int fp = Ui.dp(ctx, 16);
+            hint.setPadding(fp, Ui.dp(ctx, 6), fp, Ui.dp(ctx, 4));
+            root.addView(hint, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        }
+
+        // 按钮行：和菜单行同一个 rowBg，左右各一个
+        LinearLayout bar = new LinearLayout(ctx);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        blp.topMargin = Ui.dp(ctx, 6);
+        String[] names = {"取消", "保存"};
+        for (int i = 0; i < names.length; i++) {
+            final boolean ok = i == 1;
+            TextView b = new TextView(ctx);
+            b.setText(names[i]);
+            b.setTextSize(15);
+            b.setTextColor(Ui.tint());
+            b.setGravity(Gravity.CENTER);
+            b.setPadding(hp, Ui.dp(ctx, 13), hp, Ui.dp(ctx, 13));
+            b.setBackground(rowBg(ctx));
+            b.setOnClickListener(v -> {
+                d.dismiss();
+                if (ok && onOk != null) {
+                    onOk.accept(et.getText() == null ? "" : et.getText().toString().trim());
+                }
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            lp.setMargins(side, 0, side, 0);
+            bar.addView(b, lp);
+        }
+        root.addView(bar, blp);
+
+        d.setContentView(root);
+        d.setCanceledOnTouchOutside(true);
+        d.show();
+        Ui.glassWindow(d, ctx, true);
+        et.postDelayed(() -> {
+            try {
+                et.requestFocus();
+                android.view.inputmethod.InputMethodManager imm =
+                        (android.view.inputmethod.InputMethodManager)
+                                ctx.getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (imm != null) imm.showSoftInput(et, 0);
+            } catch (Throwable ignored) { }
+        }, 300);
+        return d;
+    }
+
     /** 菜单行：水波纹反馈，圆角小一点，别顶到面板圆角上 */
-    private static RippleDrawable rowBg(Context ctx) {
+    static RippleDrawable rowBg(Context ctx) {
         int c = Ui.dark ? 0x33FFFFFF : 0x1F000000;
         GradientDrawable mask = new GradientDrawable();
         mask.setColor(0xFFFFFFFF);

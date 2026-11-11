@@ -40,8 +40,14 @@ android {
         applicationId "com.cz.richdesk"
         minSdk 28
         targetSdk 30
-        versionCode 109
-        versionName "0.17.23"
+        versionCode 128
+        versionName "0.21.4"
+
+        // 语音链路只带 arm64：sherpa-onnx 的 onnxruntime.so 占 21MB，
+        // 四个 ABI 全打进去 APK 会直接翻倍。车机是 arm64，够用。
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
     }
 
     /*
@@ -72,6 +78,21 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
+    }
+
+    /*
+     * 原生库改成「压缩存储」（= 老式 extractNativeLibs=true）。
+     *
+     * 从 AGP 3.6 起默认不压缩（.so 按页对齐直接塞进 APK，安装快、启动快），
+     * 代价是 30MB 的 4 个 .so 一个字节都压不掉。实测 deflate 后
+     *   29.98MB → 11.2MB（onnxruntime.so 21.2→7.6，两个 sherpa 库 8.5→3.5）
+     * 安装时解压到 /data/app/.../lib，只慢一次首次启动，运行期没有区别。
+     * 65MB 的包传到手机上太费劲，这 19MB 值得省。
+     */
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 }
 
@@ -112,4 +133,11 @@ configurations.all {    resolutionStrategy.force(
 dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'androidx.recyclerview:recyclerview:1.3.0'
+
+    // sherpa-onnx 不走 maven（Maven Central 上没有它），用官方 release 里的
+    // classes.jar + jniLibs/arm64-v8a/*.so 直接接进来，符合本项目的离线构建前提。
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+    // 它的 Java API 是 Kotlin 写的：jar 里只有 sherpa 自己的类，
+    // 运行期需要 kotlin-stdlib（本机 gradle 缓存里已有 2.2.10）
+    implementation 'org.jetbrains.kotlin:kotlin-stdlib:2.2.10'
 }

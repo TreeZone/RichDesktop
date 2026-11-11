@@ -50,10 +50,10 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
     /** 快捷方式格子的伪包名（下标 0 = 「桌面设置」，它没有伪包名，单独处理） */
     private static final String[] SHORTCUT_PKGS = {
             AppInfo.THEME_PKG, AppInfo.RESTART_PKG, AppInfo.BACK_PKG, AppInfo.HOME_PKG,
-            AppInfo.APP_LIST_PKG, AppInfo.SLEEP_PKG, AppInfo.RECENTS_PKG,
+            AppInfo.APP_LIST_PKG, AppInfo.VOICE_PKG, AppInfo.SLEEP_PKG, AppInfo.RECENTS_PKG,
             AppInfo.VOL_UP_PKG, AppInfo.VOL_DOWN_PKG};
     private static final String[] SHORTCUT_LABELS = {
-            "深浅模式", "重启桌面", "返回", "主页", "应用列表", "息屏", "最近任务",
+            "深浅模式", "重启桌面", "返回", "主页", "应用列表", "语音", "息屏", "最近任务",
             "音量 +", "音量 -"};
     /**
      * 实际展示的快捷方式（去掉 {@link AppInfo#isHidden} 标记的）。
@@ -222,6 +222,7 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         if (AppInfo.BACK_PKG.equals(pkg)) return new BackIcon();
         if (AppInfo.HOME_PKG.equals(pkg)) return new HomeIcon();
         if (AppInfo.APP_LIST_PKG.equals(pkg)) return new AppListIcon();
+        if (AppInfo.VOICE_PKG.equals(pkg)) return new VoiceIcon();
         if (AppInfo.SLEEP_PKG.equals(pkg)) return new SleepIcon();
         if (AppInfo.RECENTS_PKG.equals(pkg)) return new RecentsIcon();
         if (AppInfo.VOL_UP_PKG.equals(pkg)) return new VolUpIcon();
@@ -1028,6 +1029,37 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
                     cv.drawRoundRect(x, y, x + s, y + s, r, r, p);
                 }
             }
+        }
+    }
+
+    /** 「语音」：墨绿底板 + 麦克风（胶囊 + 托架 + 底座） */
+    static class VoiceIcon extends ShortcutIcon {
+        @Override int[] plate() {
+            return Ui.dark ? new int[]{0xFF2E7D74, 0xFF12302C}
+                    : new int[]{0xFFCEF0E9, 0xFF7FB8AC};
+        }
+
+        @Override void glyph(Canvas cv, float l, float t, float side, Paint p) {
+            int ink = Ui.dark ? 0xFFE6FBF5 : 0xFF10453C;
+            p.setColor(ink);
+            p.setStyle(Paint.Style.FILL);
+            float cx = l + side * 0.5f;
+            float w = side * 0.17f, h = side * 0.30f;
+            float top = t + side * 0.18f;
+            cv.drawRoundRect(cx - w / 2, top, cx + w / 2, top + h, w / 2, w / 2, p);
+
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(side * 0.05f);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            android.graphics.RectF arc = new android.graphics.RectF(
+                    cx - side * 0.20f, top + h * 0.30f,
+                    cx + side * 0.20f, top + h + side * 0.18f);
+            cv.drawArc(arc, 0, 180, false, p);
+            float baseY = top + h + side * 0.18f;
+            cv.drawLine(cx, baseY, cx, baseY + side * 0.09f, p);
+            cv.drawLine(cx - side * 0.10f, baseY + side * 0.09f,
+                    cx + side * 0.10f, baseY + side * 0.09f, p);
+            p.setStrokeCap(Paint.Cap.BUTT);
         }
     }
 

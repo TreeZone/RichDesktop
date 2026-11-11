@@ -515,6 +515,41 @@ public class TouchBridge {
         }
     }
 
+    /**
+     * 「点一下这块屏」——只为了让这块虚拟屏拿到**输入焦点**。
+     *
+     * 为什么返回键需要它：这台 ROM（HyperOS，mPerDisplayFocusEnabled=false 的行为）
+     * 只有「顶层焦点屏」上的窗口是可聚焦的，其余屏的窗口一律 inputConfig=NOT_FOCUSABLE。
+     * 用户点 Dock 上那个返回按钮时，手指已经把焦点抢回了主屏，于是注入到画中画屏的
+     * BACK 找不到可投递的窗口，被 InputDispatcher 直接丢弃 —— 表现就是"返回键没反应"。
+     *
+     * 实测：向目标屏注入一次触摸 DOWN，WMS 立刻把该屏设为顶层焦点屏
+     * （dumpsys input 里 FocusedWindows 从 display 0 变成该屏，FocusRequests result=OK），
+     * 之后的按键就能投递进去了。这里用 DOWN + CANCEL：应用收到 ACTION_CANCEL，
+     * 不会真的触发一次点击。
+     *
+     * **同步**执行（调用方本来就在后台线程）：返回时焦点已经落位。
+     */
+    public void pokeFocus(int displayId) {
+        if (displayId < 0) return;
+        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+        try {
+            injector.execute(() -> {
+                try {
+                    dispatch(Snap.raw(displayId, MotionEvent.ACTION_DOWN, 2f, 2f));
+                    SystemClock.sleep(24);
+                    dispatch(Snap.raw(displayId, MotionEvent.ACTION_CANCEL, 2f, 2f));
+                } catch (Throwable t) {
+                    Log.w(TAG, "焦点探针失败 d=" + displayId, t);
+                } finally {
+                    done.countDown();
+                }
+            });
+            done.await(600, TimeUnit.MILLISECONDS);
+        } catch (Throwable ignored) {
+        }
+    }
+
     /** 事件是否属于当前进行中的手势（有 DOWN 在先、同一块屏） */
     private boolean sameGesture(Snap s) {
         if (activePointers.isEmpty() || s.displayId != gestureDisplay) {

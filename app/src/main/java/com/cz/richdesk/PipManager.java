@@ -37,8 +37,20 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     /** 「单画」临时布局：未指定屏位的应用按单画打开时置位，恢复原布局后清掉 */
     private boolean singleMode;
     private float[] savedWeights;   // 进入单画前的比例（恢复用）
-    private int singleIdx = -1;     // 单画时显示哪块屏
-    private String singlePrevPkg;   // 单画前这块屏跑的应用（恢复时开回去）
+    private String singleAppPkg;    // 单画此刻显示的应用（判断"临时应用退出了没"用）
+    /**
+     * 单画**专用**面板：不复用主页画中画的任何一块虚拟屏。
+     *
+     * 为什么不复用（血泪）：借用活动画中画时，单画期间那块屏的应用被换成了临时应用，
+     * 恢复布局要么"把原应用重新拉起来"（多一次冷启动，观感是全屏闪一下），
+     * 要么"什么都不做"（那块屏就停在临时应用/它退到后台后露出的别的东西上）。
+     * 两者都不对，而且借用 pane 0 时还会因为 z 序把另一块屏悬浮到全屏之上。
+     *
+     * 独立一块屏之后：主页那 N 块屏**全程不被替换**，单画进出只是"只显示它/显示全部"，
+     * 虚拟屏一个都不用动 —— 恢复是零成本的，也不存在闪烁。
+     * 代价是多一块虚拟屏（只有真的用过单画才会创建，见 ensureSinglePane）。
+     */
+    private PipPane singlePane;
 
     public PipManager(Context ctx, PaneBox container) {
         this.app = ctx.getApplicationContext();
@@ -124,8 +136,11 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         panes.clear();
         singleMode = false;
         savedWeights = null;
-        singleIdx = -1;
-        singlePrevPkg = null;
+        singleAppPkg = null;
+        if (singlePane != null) {
+            singlePane.release();
+            singlePane = null;
+        }
         container.removeAllViews();
         dpi = Prefs.getDpi(app);
         cornerDp = Prefs.getPipCorner(app);
@@ -145,19 +160,35 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     }
 
     /**
+     * 单画专用屏：第一次真要用时创建（不预建，没开单画模式的用户不付这份开销）。
+     * 之后一直复用 —— PipPane.close() 只把应用顶回后台、保留虚拟屏，所以再开是秒级。
+     */
+    private PipPane ensureSinglePane() {
+        if (singlePane != null) return singlePane;
+        singlePane = new PipPane(app, panes.size(), dpi, cornerDp, this);
+        container.addView(singlePane.root);
+        FileLog.append("单画：创建专用虚拟屏（主页画中画 " + panes.size() + " 块不动）");
+        return singlePane;
+    }
+
+    /** 单画面板（没进入过单画时是 null）——返回键 / 存活检测要用 */
+    public PipPane singlePane() {
+        return singlePane;
+    }
+
+    /**
      * 按容器方向重排版：横向 = 从左到右，纵向 = 从上到下。
      * 只在「逻辑顺序」上排，不摘挂视图（摘挂会销毁 TextureView 的 Surface，
      * 虚拟屏跟着重建 —— 调换顺序就成了一次整屏重启）。
      */
     public void applyOrientation() {
         container.setGapPx(Ui.dp(app, Ui.PANE_GAP_DP));
-        // 单画临时布局：重排版时仍然只显示那块屏（否则旋转会瞬间露出全部画中画）
-        if (singleMode && singleIdx >= 0 && singleIdx < panes.size()) {
+        // 单画临时布局：重排版时仍然只显示那一块（否则旋转会瞬间露出全部画中画）
+        if (singleMode && singlePane != null) {
             List<View> only = new ArrayList<>(1);
-            only.add(panes.get(singleIdx).root);
+            only.add(singlePane.root);
             container.setOrder(only);
             container.setWeights(new float[]{1f});
-            weights = new float[]{1f};
             return;
         }
         List<View> order = new ArrayList<>(panes.size());
@@ -207,11 +238,13 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     public void setCorner(int dp) {
         cornerDp = dp;
         for (PipPane p : panes) p.setCorner(dp);
+        if (singlePane != null) singlePane.setCorner(dp);
     }
 
     /** 深浅色外观变化：所有面板一起刷 */
     public void refreshAppearance() {
         for (PipPane p : panes) p.refreshAppearance();
+        if (singlePane != null) singlePane.refreshAppearance();
         refreshHandles();
     }
 
@@ -223,16 +256,19 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     public void setDpi(int value) {
         dpi = value;
         for (PipPane p : panes) p.setDpi(value);
+        if (singlePane != null) singlePane.setDpi(value);
     }
 
     /** 屏内渲染分辨率比例（1.0 标准 / 0.75 / 0.5）：所有面板一起调 */
     public void setRenderScale(float v) {
         for (PipPane p : panes) p.setRenderScale(v);
+        if (singlePane != null) singlePane.setRenderScale(v);
     }
 
     /** 旋转等尺寸大变化后：所有有内容的屏重建虚拟屏（重新排版、重算 letterbox） */
     public void postRebuildAll(long delayMs) {
         for (PipPane p : panes) p.postRebuild(delayMs);
+        if (singlePane != null) singlePane.postRebuild(delayMs);
     }
 
     // ------------------------------------------------------------ 分屏比例
@@ -430,6 +466,11 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         return paneOf(pkg) >= 0;
     }
 
+    /** 绑定屏位（0 起，-1 = 未绑定）。仅供日志/调试用。 */
+    public int paneOfPkg(String pkg) {
+        return paneOf(pkg);
+    }
+
     /**
      * 应用归属的屏位（0 起），没归属返回 -1：
      *   1) 长按菜单「指定画中画位置」（pane_map）；
@@ -462,16 +503,26 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     /** preferred：0 = 自动；1..n = 指定第几屏 */
     public boolean open(String pkg, int preferred) {
         if (panes.isEmpty()) return false;
-        // 「单画」临时布局下打开了指定屏位的应用 → 先恢复原布局（单/双/三画）
-        if (singleMode && ((preferred >= 1 && preferred <= panes.size()) || isAssigned(pkg))) {
-            restoreSingle();
+        // 单画布局下的两种走向：
+        //   已绑定（指定屏位 / 每屏默认）→ 恢复原布局，回它自己那块屏打开；
+        //   未绑定 → 继续留在单画里，只换单画屏上的应用（主页那几块屏完全不动）。
+        if (singleMode) {
+            if ((preferred >= 1 && preferred <= panes.size()) || isAssigned(pkg)) {
+                restoreSingle();
+            } else {
+                PipPane sp = ensureSinglePane();
+                // 同一个应用别开两份：主页画中画里那份先收掉
+                int dup = indexOfPkg(pkg);
+                if (dup >= 0) panes.get(dup).close();
+                sp.open(pkg);
+                singleAppPkg = pkg;
+                return true;
+            }
         }
         int idx = (preferred >= 1 && preferred <= panes.size()) ? preferred - 1 : pickPane(pkg);
-        if (singleMode) {
-            // 还在单画布局里：后续打开的应用都进当前这块屏（换着看，不破坏原布局）
-            idx = Math.max(0, Math.min(singleIdx, panes.size() - 1));
-        }
         PipPane p = panes.get(idx);
+        // 单画屏里还留着同一个应用（单画刚退出、应用还没被收掉）→ 收掉，别开两份
+        if (singlePane != null && pkg.equals(singlePane.pkg())) singlePane.close();
         // 同一应用已开在别的屏：先把它收掉，避免两份
         int other = indexOfPkg(pkg);
         if (other >= 0 && other != idx) panes.get(other).close();
@@ -481,47 +532,57 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     }
 
     /**
-     * 「单画中画」打开：只显示一块屏，布局和「画中画数量 = 1」完全一样。
+     * 「单画中画」打开：**用单画专用屏**铺满整个画中画区域。
      *
-     * 复用现有画中画（性能要求）：不新建虚拟屏、不销毁任何一块屏 —— 其他屏只是
-     * 暂时不显示（视图留在容器里，虚拟屏照常跑），恢复布局时原样回来、不用重启。
-     * 单画前这块屏跑的应用记下来，恢复时在原屏上开回去（同一块屏换应用，秒回）。
+     * 关键点：不碰主页那 N 块画中画（不换应用、不重建虚拟屏）。所以恢复布局时
+     * 什么都不用重开 —— 屏幕上那两块屏从头到尾就是原来那两个应用，不存在
+     * "先露出被顶掉的应用再切回来"的闪烁，也不可能出现 z 序错位。
+     *
+     * @return 单画屏不在 panes 里，统一返回 -1（调用方不必据此更新 lastActivePane）
      */
     public int openSingle(String pkg) {
         if (panes.isEmpty()) return -1;
-        int idx = singleMode ? singleIdx : pickPane(pkg);
-        if (idx < 0 || idx >= panes.size()) idx = 0;
-        PipPane p = panes.get(idx);
+        // 已绑定的应用不该走单画（openPip 会先恢复布局）；兜底回它自己的屏
+        int own = paneOf(pkg);
+        if (own >= 0) {
+            open(pkg, own + 1);
+            return own;
+        }
+        PipPane sp = ensureSinglePane();
         if (!singleMode) {
             savedWeights = weights.clone();
-            singlePrevPkg = p.pkg();
             singleMode = true;
-            Log.i(TAG, "进入单画布局：pane " + idx + "，保存比例 "
+            Log.i(TAG, "进入单画布局（专用屏 " + sp.index + "），主页比例 "
                     + java.util.Arrays.toString(savedWeights));
-            FileLog.append("单画：pane=" + idx + " 比例=" + java.util.Arrays.toString(savedWeights)
-                    + " 原应用=" + singlePrevPkg);
+            FileLog.append("单画：专用屏 display=" + sp.displayId()
+                    + " 主页比例=" + java.util.Arrays.toString(savedWeights));
         }
-        singleIdx = idx;
-        restoreIfCollapsed(idx);
-        int other = indexOfPkg(pkg);
-        if (other >= 0 && other != idx) panes.get(other).close();
-        p.open(pkg);
-        // 视觉：只显示这一块屏（order 只放一个 → 没有分隔条、铺满整个画中画区域）
+        // 主页画中画里跑着同一个应用 → 收掉，避免两份
+        int dup = indexOfPkg(pkg);
+        if (dup >= 0) panes.get(dup).close();
+        sp.open(pkg);
+        singleAppPkg = pkg;
+        // 视觉：只显示这一块屏（order 只放一个 → 没有分隔条、铺满；其余屏由 PaneBox 设为 INVISIBLE）
         List<View> only = new ArrayList<>(1);
-        only.add(p.root);
+        only.add(sp.root);
         container.setOrder(only);
         container.setWeights(new float[]{1f});
-        weights = new float[]{1f};
-        return idx;
+        return -1;
     }
 
-    /** 恢复单画前的布局（比例 + 原应用），单画期间开进去的应用随之收掉 */
+    /**
+     * 恢复单画前的布局：把主页那 N 块屏重新摆回来（内容一直没动过，所以是瞬时的）。
+     *
+     * 【单画屏从此常驻】以前这里会在 1.2 秒后把单画屏里的应用收掉（close），
+     * 下次再单画就要重新冷启动一个应用，三秒起步。现在**什么都不做**：
+     * 虚拟屏留着、应用的任务也留在后台（最低资源：只是屏不显示，没有渲染），
+     * 再点同一个/另一个未绑定应用时直接 launchOn 带到前台，基本是即时的。
+     * 换应用由 openSingle 里的 trimTasks 负责把旧任务清掉，不会越积越多。
+     */
     private void restoreSingle() {
+        if (!singleMode) return;
         singleMode = false;
-        int idx = singleIdx;
-        String prev = singlePrevPkg;
-        singleIdx = -1;
-        singlePrevPkg = null;
+        singleAppPkg = null;
         float[] saved = savedWeights;
         savedWeights = null;
         List<View> all = new ArrayList<>(panes.size());
@@ -533,12 +594,7 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         syncCollapsed();
         Log.i(TAG, "退出单画布局：恢复比例 " + java.util.Arrays.toString(weights));
         FileLog.append("恢复布局：比例=" + java.util.Arrays.toString(weights)
-                + " 借用屏pane=" + idx + " 开回=" + prev);
-        // 单画借用的那块屏开回原应用：同一块虚拟屏换应用，不重建、秒回
-        if (idx >= 0 && idx < panes.size() && prev != null
-                && !prev.equals(panes.get(idx).pkg())) {
-            panes.get(idx).open(prev);
-        }
+                + "（主页屏未被动过，单画屏保留待复用）");
     }
 
     public void openAuto(String pkg) {
@@ -546,8 +602,6 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     }
 
     public void close(int index) {
-        // 单画布局里关掉正在显示的那块屏：布局一起恢复（否则停在只剩一块空屏的状态）
-        if (singleMode && index == singleIdx) restoreSingle();
         PipPane p = pane(index);
         if (p != null) p.close();
     }
@@ -557,24 +611,86 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         return singleMode;
     }
 
-    /** 恢复单画前的布局（不在单画布局时什么都不做）。供外部在打开指定屏位应用前调用。 */
+    /** 单画临时布局此刻显示的应用（不在单画返回 null）——用于判断"这个临时应用退出了没" */
+    public String singleAppPkg() {
+        if (!singleMode || singlePane == null) return null;
+        return singlePane.pkg();
+    }
+
+    /** 这块屏的段落根本不在 dumpsys 里（displayId 过期 / 读不到） */
+    private static final String TOP_UNKNOWN = "##UNKNOWN##";
+    /** 这块屏的段落存在，但没有任何前台应用（屏是空的） */
+    private static final String TOP_EMPTY = "##EMPTY##";
+
+    /**
+     * 这块虚拟屏上当前的前台应用包名。
+     *   返回 null      = 读不到（命令失败 / 段落不存在），调用方**不要**据此改布局
+     *   返回 ""        = 段落存在但没有 topResumedActivity（这屏上是空的）
+     *   返回 "<pkg>"   = 前台就是这个应用
+     *
+     * 【为什么不用 getRunningTasks】这台机器（HyperOS 13）返回的 RunningTaskInfo
+     * 里 displayId 一律是 null（实测 16 条任务全为 null），没法把 task 归到某块虚拟屏，
+     * 也分不清"退到后台"和"已退出" —— 而用户要的恰恰是"应用不在前面了就把单画收掉"。
+     * dumpsys 的每块 Display 段落里有 topResumedActivity，一次约 60ms，比 task 查询准得多。
+     *
+     * **子进程 + 反射，必须在后台线程。**
+     */
+    public String topPkgOnDisplay(int displayId) {
+        if (displayId < 0) return null;
+        String cmd = "dumpsys activity activities 2>/dev/null | awk -v h='Display #" + displayId
+                + " (activities' 'index($0,h)==1{inb=1;found=1;next}"
+                + " inb&&substr($0,1,9)==\"Display #\"{inb=0}"
+                + " inb&&/topResumedActivity/{print;printed=1;exit}"
+                + " END{if(!found)print \"" + TOP_UNKNOWN + "\";"
+                + " else if(!printed)print \"" + TOP_EMPTY + "\"}'";
+        String out;
+        try {
+            out = Shell.capture(cmd);
+        } catch (Throwable t) {
+            return null;
+        }
+        if (out == null) return null;
+        out = out.trim();
+        int nl = out.indexOf('\n');
+        if (nl > 0) out = out.substring(0, nl).trim();
+        if (out.equals(TOP_UNKNOWN)) return null;      // 段落没有 → displayId 可能过期，别动
+        if (out.equals(TOP_EMPTY)) return "";          // 有段落、没前台应用 = 这屏空着
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("\\su\\d+\\s([A-Za-z0-9_.]+)/").matcher(out);
+        if (m.find()) return m.group(1);
+        return null;                                   // 命令失败/格式不认识 → 别动布局
+    }
+
+    /** 恢复单画前的布局（不在单画布局时什么都不做）。 */
     public void restoreSingleLayout() {
         if (!singleMode) return;
-        Log.i(TAG, "restoreSingleLayout：指定屏位应用打开前恢复布局");
+        Log.i(TAG, "restoreSingleLayout：恢复原布局");
         restoreSingle();
     }
 
-    /** 单画布局显示的是第几屏（0 起；不在单画布局返回 -1） */
+    /**
+     * 单画的临时应用自己走了（按返回退出 / 只是退到后台 / 崩了）：恢复原布局。
+     *
+     * 现在单画用的是**专用虚拟屏**，主页那几块屏从头到尾没被替换过，
+     * 所以这里不需要"把原应用开回去"这种补救 —— 布局一恢复，画面上就是原来的双画，
+     * 零延迟、零闪烁。只剩"把单画屏里的应用收掉"这件事，由 restoreSingle 内部延时做。
+     */
+    public void restoreSingleAfterExit() {
+        if (!singleMode) return;
+        restoreSingle();
+    }
+
+    /** 单画布局显示的是第几屏（不再借用主页画中画，恒为 -1，仅为兼容保留） */
     public int singleIndex() {
-        return singleMode ? singleIdx : -1;
+        return -1;
     }
 
     public void closeAll() {
         singleMode = false;
         savedWeights = null;
-        singleIdx = -1;
-        singlePrevPkg = null;
+        singleAppPkg = null;
         for (PipPane p : panes) p.close();
+        if (singlePane != null) singlePane.close();
     }
 
     /**

@@ -310,6 +310,24 @@ public class PaneBox extends FrameLayout {
             if (horizontal) child.layout(start[i], 0, end[i], h);
             else child.layout(0, start[i], w, end[i]);
         }
+
+        // 不在 order 里的视图：挪到画布外，别让它停在上一次的位置继续显示/吃触摸。
+        // 单画布局只放一块屏，其余屏（以及"单画专用屏"在恢复布局后）的 root 还挂在容器里，
+        // onLayout 不管它们的话它们会停在原地 —— 用户看到的就是
+        // "第一个画中画全屏、第二个悬浮在它上面"。
+        //
+        // 为什么不用 setVisibility(INVISIBLE/GONE)：visibility 变化在部分 ROM 上会让
+        // TextureView 释放 SurfaceTexture，虚拟屏跟着回收、屏内应用掉到手机主屏上。
+        // 只改 layout 位置：surface、尺寸、虚拟屏全都不动，恢复时秒回。
+        for (int i = 0; i < getChildCount(); i++) {
+            View c = getChildAt(i);
+            if (c instanceof Handle || order.contains(c)) continue;
+            int cw = Math.max(1, c.getMeasuredWidth());
+            int ch = Math.max(1, c.getMeasuredHeight());
+            if (horizontal) c.layout(w, 0, w + cw, ch);
+            else c.layout(0, h, cw, h + ch);
+        }
+
         StringBuilder sig = new StringBuilder();
         sig.append(horizontal ? "H " : "V ").append(w).append('x').append(h).append(" n=").append(n).append(" w=[");
         for (int i = 0; i < n; i++) {

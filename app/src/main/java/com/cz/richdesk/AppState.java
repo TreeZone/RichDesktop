@@ -12,5 +12,11 @@ public class AppState {
     /** MainActivity 是否 resumed */
     public static volatile boolean mainResumed = false;
 
+    /**
+     * 进程级 Application Context。语音链路（采集线程 / 后台服务式的常驻监听）
+     * 拿不到 Activity，需要一个稳定的上下文入口；只在 MainActivity.onCreate 里赋值一次。
+     */
+    public static volatile android.content.Context app = null;
+
     private AppState() { }
 }

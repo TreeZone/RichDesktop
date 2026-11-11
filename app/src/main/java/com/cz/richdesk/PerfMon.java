@@ -94,10 +94,14 @@ public final class PerfMon {
 
         // Display 数 = 1（主屏）+ 每块画中画 1 块虚拟屏。多出来的就是**没释放干净的虚拟屏**，
         // 它们会一直占用合成通道/显存，是"跑一阵子越来越卡"最典型的元凶，必须显式报出来。
+        // 期望 = 1（主屏）+ 主页画中画 + 单画专用屏（用过单画就一直留着，下次秒开）
         PipManager m = pip;
-        if (m != null && displays > m.count() + 1) {
-            Log.w(TAG, "PERF 虚拟屏数量异常 displays=" + displays
-                    + " 面板=" + m.count() + "（有多余的虚拟屏没释放）");
+        if (m != null) {
+            int expect = m.count() + 1 + (m.singlePane() != null ? 1 : 0);
+            if (displays > expect) {
+                Log.w(TAG, "PERF 虚拟屏数量异常 displays=" + displays
+                        + " 期望=" + expect + "（有多余的虚拟屏没释放）");
+            }
         }
 
         long now = android.os.SystemClock.uptimeMillis();

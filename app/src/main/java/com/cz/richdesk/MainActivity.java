@@ -8,6 +8,7 @@ import android.content.res.Configuration;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.GestureDetector;
 import android.view.Gravity;
@@ -36,12 +37,15 @@ import java.util.List;
  * 第 1 页 = 应用页：全部应用（前 5 项是「桌面设置」「深浅模式」「重启桌面」「返回」「主页」快捷图标）。
  * 翻页规则：主页只能在 Dock 上左滑进应用页；应用页整页右滑回主页。
  */
-public class MainActivity extends AppCompatActivity implements DockAdapter.Host, AppListAdapter.FullHost {
+public class MainActivity extends AppCompatActivity
+        implements DockAdapter.Host, AppListAdapter.FullHost, Voice.Host {
 
     private static final String TAG = "PipDesk";
 
     /** onCreate → 首帧的耗时（写进落盘日志）：车机不连 adb 也能看到开机到底慢在哪 */
     private long bootT0;
+    /** 录音权限只主动申请一次，用户拒绝后不再反复弹框 */
+    private boolean voicePermAsked;
     /** 首帧后的重活只跑一次；recreate() 时重置 */
     private boolean bootHeavyDone;
     /** onCreate 代号：recreate() 后旧的首帧回调必须作废，别提前把重活跑了 */
@@ -101,6 +105,52 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
      * 存面板对象引用而不是 index：调换顺序/重建后引用仍然指向同一块屏。
      */
     private PipPane lastActivePane;
+
+    // ---------------------------------------------------------------- 语音卡片兜底
+    /**
+     * 卡片自己的心跳。
+     *
+     * 语音那套状态机跑在 Voice 的控制线程里，它一旦卡死/抛异常，卡片就会永远挂在
+     * 屏幕上 —— 用户已经连着踩了三次「识别不到字也不退出」。所以在这里再放一道
+     * 纯 UI 侧的保险：
+     *   1) 每 150ms 刷一次电平条（不再依赖 Voice 的 pushState，采集那边有声音就能动）；
+     *   2) 卡片挂超过 6.5 秒，无条件收掉（Voice 那边有 5 秒硬闸，这里是它也没跑时的兜底）。
+     */
+    private final android.os.Handler voiceUi = new android.os.Handler(android.os.Looper.getMainLooper());
+    private long voiceRoundAt;
+    private boolean voiceTicking;
+
+    private final Runnable voiceTick = new Runnable() {
+        @Override
+        public void run() {
+            if (isFinishing()) { voiceTicking = false; return; }
+            int st = Voice.get().state();
+            long age = SystemClock.elapsedRealtime() - voiceRoundAt;
+            if (st == Voice.S_LOADING || st == Voice.S_LISTEN || st == Voice.S_THINK) {
+                if (age > 6_500L) {
+                    FileLog.append("UI 兜底：语音卡片已挂 " + age + "ms（state=" + st + "）→ 强制收工");
+                    Voice.get().cancelListening();
+                    VoiceCard.hide(MainActivity.this);
+                    voiceTicking = false;
+                    return;
+                }
+                if (st == Voice.S_LISTEN) VoiceCard.updateLevel(Voice.get().level());
+                voiceUi.postDelayed(this, 150);
+            } else {
+                voiceTicking = false;
+            }
+        }
+    };
+
+    private void kickVoiceTick() {
+        voiceRoundAt = SystemClock.elapsedRealtime();
+        if (!voiceTicking) {
+            voiceTicking = true;
+            voiceUi.post(voiceTick);
+        }
+    }
+    /** 语音候选列表的弹窗（说「第一个」时要能收掉它） */
+    private android.app.Dialog voiceCandMenu;
 
     // 上次应用的配置，用于从设置页返回时做增量刷新
     private int appliedPaneCount = -1, appliedDpi = -1, appliedPipCorner = -1;
@@ -267,6 +317,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         // 全局绘制开关必须早于任何 Ui.glass / Ui.clipRounded 调用
         Ui.syncPerfMode(this);
         instance = this;
+        AppState.app = getApplicationContext();   // 语音链路要一个不依赖 Activity 的上下文
         FileLog.start(this);       // 日志落盘（排查车机问题用），越早启动越完整
         Watchdog.start();          // 主线程卡死自动 dump 堆栈，车机上不用连 adb 也能取到现场
         // 数据目录自愈（可能要跑递归 chcon，秒级）：丢后台线程，别挡启动首帧
@@ -396,6 +447,12 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         }
 
         // 调试钩子：无手指时直接在画中画里开一个应用，验证虚拟屏链路
+        //   --es debug_voice 1 → 直接触发一次聆听（自测超时用）
+        if (dbgIntent != null && dbgIntent.hasExtra("debug_voice")) {
+            dbgIntent.removeExtra("debug_voice");
+            new android.os.Handler(android.os.Looper.getMainLooper())
+                    .postDelayed(() -> Voice.get().listenOnce(), 900);
+        }
         //   --es debug_open <包名> [--ei debug_open_pane 0]
         if (dbgIntent != null && dbgIntent.hasExtra("debug_open")) {
             final String pkg = dbgIntent.getStringExtra("debug_open");
@@ -406,6 +463,35 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 Log.i("PipDesk", "debug_open " + pkg + " pane=" + pane);
                 openPip(pkg, pane);
             }, 1600);
+        }
+
+        // 调试钩子：先开一个应用，等一下再模拟点一次「返回」（验证单画收尾）
+        //   --es debug_voice 1 → 直接触发一次聆听（自测超时用）
+        if (dbgIntent != null && dbgIntent.hasExtra("debug_voice")) {
+            dbgIntent.removeExtra("debug_voice");
+            new android.os.Handler(android.os.Looper.getMainLooper())
+                    .postDelayed(() -> Voice.get().listenOnce(), 900);
+        }
+        //   --es debug_open <包名> [--ei debug_open_pane 0] --ei debug_back_at 4000
+        if (dbgIntent != null && dbgIntent.getIntExtra("debug_back_at", 0) > 0) {
+            final int at = dbgIntent.getIntExtra("debug_back_at", 0);
+            dbgIntent.removeExtra("debug_back_at");
+            root.postDelayed(() -> {
+                Log.i("PipDesk", "debug_back");
+                sendBack();
+            }, at);
+        }
+
+        // 调试钩子：把系统任务表 dump 进日志（判断"应用退出/到后台"要靠它，先确认本机拿得到什么）
+        //   --es debug_task <包名>
+        if (dbgIntent != null && dbgIntent.hasExtra("debug_task")) {
+            final String pkg = dbgIntent.getStringExtra("debug_task");
+            dbgIntent.removeExtra("debug_task");
+            new Thread(() -> {
+                String dump = PipPane.debugDumpTasks(MainActivity.this, pkg);
+                Log.i("PipDesk", "DBG " + dump);
+                FileLog.append("DBG " + dump);
+            }, "pipdesk-dbgtask").start();
         }
 
         if (!DataDirFix.ok()) {
@@ -2045,8 +2131,12 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             for (AppInfo a : slottedInfos) allF.put(a.pkg, a);
             runOnUiThread(() -> {
                 appList = resF;
-                allApps.clear();
-                allApps.putAll(allF);
+                // allApps 会被语音线程读（apps()），换数据必须整体加锁，
+                // 否则并发 clear()/putAll() 期间读到的是半张表
+                synchronized (allApps) {
+                    allApps.clear();
+                    allApps.putAll(allF);
+                }
                 if (appListAdapter != null) {
                     appListAdapter.setData(appList);
                     for (AppInfo a : slottedF) appListAdapter.rememberApp(a);
@@ -2065,17 +2155,33 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     // ------------------------------------------------------------ 打开画中画
 
     /**
-     * 打开到画中画。
-     * 需求 3：这个应用已经在某块画中画里跑着时，不再重建/重开，只把桌面翻回首页。
-     * （重建会清掉虚拟屏再拉起，观感上就是"应用闪一下又重进"）
+     * 打开到画中画。三条互斥的走法，优先级从上到下：
+     *
+     *  1) **显式指定屏位**（preferred ≥ 1，来自「每屏默认应用」自动拉起、拖到某屏、调试命令）：
+     *     恢复原布局（单画临时布局先退出），在指定那块屏打开。
+     *  2) **已绑定的应用**（长按「指定画中画位置」= pane_map，设置里「每屏默认应用」= pane_default_N）：
+     *     恢复原布局，回到它自己那块屏打开。绑定是用户明确建立的关系，
+     *     优先级高于「打开方式」—— 设置只管没绑定的应用。
+     *  3) **未绑定的应用**：完全按「打开方式」走
+     *     （活动画中画【默认】/ 单画中画 / 全屏）。**打开动作本身不写入任何绑定**，
+     *     所以它下次点开还是按设置走，不会因为"开过一次"就被钉在某块屏上。
      */
     private void openPip(String pkg, int preferred) {
         if (pkg == null) return;
-        // 未指定屏位的应用：按设置的默认打开方式走
-        //（0 = 活动画中画【默认】/ 1 = 全屏 / 2 = 单画中画）。
-        // 指定了屏位的应用不受这个设置影响，永远在它的屏位打开（并把布局切回去）。
-        if (preferred <= 0 && !pip.isAssigned(pkg)) {
-            int mode = Prefs.getOpenMode(this);
+        boolean bound = pip.isAssigned(pkg);
+        int mode = Prefs.getOpenMode(this);
+        FileLog.append("打开 " + pkg + " 显式屏位=" + preferred
+                + " 绑定屏位=" + (bound ? pip.paneOfPkg(pkg) + 1 : 0)
+                + " 打开方式=" + (mode == Prefs.OPEN_SINGLE ? "单画"
+                : mode == Prefs.OPEN_FULLSCREEN ? "全屏" : "活动画中画")
+                + " 单画布局=" + pip.inSingleMode());
+        if (preferred <= 0 && !bound) {
+            if (mode == Prefs.OPEN_SINGLE) {
+                // 单画用独立的虚拟屏，主页画中画一个都不碰（返回时零闪烁，见 PipManager.openSingle）
+                pip.openSingle(pkg);
+                if (pager.getCurrentPage() != 0) pager.setCurrentPageSmooth(0);
+                return;
+            }
             if (mode == Prefs.OPEN_FULLSCREEN) {
                 pip.launchFullScreen(pkg);
                 int i = pip.indexOfPkg(pkg);
@@ -2083,28 +2189,21 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 if (pager.getCurrentPage() != 0) pager.setCurrentPageSmooth(0);
                 return;
             }
-            if (mode == Prefs.OPEN_SINGLE) {
-                int idx = pip.openSingle(pkg);
-                if (idx >= 0) lastActivePane = pip.pane(idx);
-                if (pager.getCurrentPage() != 0) pager.setCurrentPageSmooth(0);
-                return;
+            // OPEN_ACTIVE（活动画中画）：停在单画临时布局里换应用就名不副实了，
+            // 先回到原布局，再开进活动那块屏。
+            if (pip.inSingleMode()) {
+                FileLog.append("活动画中画打开 " + pkg + "：恢复原布局");
+                pip.restoreSingleLayout();
             }
-        }
-        boolean running = pip.indexOfPkg(pkg) >= 0;
-        // 单画布局下点开「指定了屏位」的应用：即使它还在某块隐藏的屏上跑着
-        //（running=true 会跳过 pip.open、绕过 PipManager.open 里的恢复逻辑），
-        // 也要先恢复单画前的布局，否则单画布局永远退不回去。
-        // 恢复后强制走一遍 open：PipPane.open 对已运行的应用是幂等的（不重建虚拟屏），
-        // 只会把应用所在的屏重新放回显示。
-        if (pip.inSingleMode()) {
-            FileLog.append("单画中点击 " + pkg
-                    + " 指定屏位=" + pip.isAssigned(pkg) + " 已在运行=" + running);
-        }
-        if (pip.inSingleMode() && (preferred >= 1 || pip.isAssigned(pkg))) {
+        } else if (pip.inSingleMode()) {
+            // 绑定 / 指定屏位的应用：单画布局必须退回去（即使它还在隐藏的屏上跑着）
+            FileLog.append("打开已绑定 " + pkg + "（屏位=" + (preferred > 0 ? preferred : pip.paneOfPkg(pkg) + 1)
+                    + "）：恢复原布局");
             pip.restoreSingleLayout();
-            running = false;
         }
-        if (!running) pip.open(pkg, preferred);
+        // 幂等：已在跑的应用由 PipPane.open 自己判断（同一 pkg 先校验 task 是否还活着）。
+        // 不能因为"记着这个 pkg"就整段跳过 —— 应用被「返回」退掉后 pkg 还记着，跳过就变成"点了没反应"。
+        pip.open(pkg, preferred);
         // 刚在某个屏上打开了应用 → 那块屏成为返回键的目标（用户的心理预期就是"返回到刚开的那个"）
         int idx = pip.indexOfPkg(pkg);
         if (idx >= 0) lastActivePane = pip.pane(idx);
@@ -2185,6 +2284,9 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             if (pager != null) {
                 pager.setCurrentPageSmooth(pager.getCurrentPage() == 1 ? 0 : 1);
             }
+        } else if (AppInfo.VOICE_PKG.equals(pkg)) {
+            // 点一下开始听，说完自动断句执行；不需要唤醒词
+            Voice.get().listenOnce();
         } else if (AppInfo.SLEEP_PKG.equals(pkg)) {
             ScreenOff.sleep(this);
         } else if (AppInfo.RECENTS_PKG.equals(pkg)) {
@@ -2196,11 +2298,102 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         }
     }
 
+    // ------------------------------------------------------------ 语音
+
+    /**
+     * 语音只认"能启动的应用"。这里给的是 pkg → AppInfo 的全量索引副本：
+     * 语音线程在后台跑，直接返回内部 HashMap 的话，loadApps() 在 UI 线程
+     * clear()/putAll() 的过程中会读到半截数据（HashMap 并发读可能死循环）。
+     */
+    @Override
+    public List<AppInfo> apps() {
+        synchronized (allApps) {
+            return new ArrayList<>(allApps.values());
+        }
+    }
+
+    @Override
+    public void onVoiceEvent(int state, String text, String detail) {
+        switch (state) {
+            case Voice.S_LOADING:
+                // 新一轮开始：上一轮留下的候选列表要收掉，别新旧叠在一起
+                if (voiceCandMenu != null) {
+                    voiceCandMenu.dismiss();
+                    voiceCandMenu = null;
+                }
+                kickVoiceTick();
+                VoiceCard.show(this, detail, text, 0);
+                break;
+            case Voice.S_LISTEN:
+                kickVoiceTick();
+                VoiceCard.show(this, detail, text, Voice.get().level());
+                break;
+            case Voice.S_THINK:
+                VoiceCard.showThenHide(this, detail, text, 1600);
+                break;
+            case Voice.S_ERROR:
+                VoiceCard.showThenHide(this, "语音不可用", detail, 3200);
+                break;
+            default:
+                // 这一轮结束（回到待唤醒 / 关掉）：候选列表跟着收掉
+                voiceTicking = false;
+                if (voiceCandMenu != null) {
+                    voiceCandMenu.dismiss();
+                    voiceCandMenu = null;
+                }
+                VoiceCard.hide(this);       // S_OFF / S_WAKE 不打扰用户
+        }
+    }
+
+    @Override
+    public void onVoiceAction(String pkg) {
+        if (pkg == null) return;
+        if (AppInfo.isBuiltin(pkg)) {
+            runBuiltin(pkg);
+            return;
+        }
+        // 打开方式完全复用桌面原有的一条路：默认画中画 / 全屏 / 单画 + 屏位指派都自动生效
+        openPip(pkg, 0);
+        if (Prefs.voiceBringFront(this) && !AppState.mainResumed) bringLauncherToFront();
+    }
+
+    @Override
+    public void onVoiceCandidates(String phrase, List<AppInfo> cands) {
+        if (cands == null || cands.isEmpty()) return;
+        if (voiceCandMenu != null) {
+            voiceCandMenu.dismiss();
+            voiceCandMenu = null;
+        }
+        List<String> items = new ArrayList<>(cands.size() + 1);
+        for (AppInfo a : cands) items.add(a.label);
+        items.add("都不是");
+        voiceCandMenu = GlassMenu.show(this, "「" + phrase + "」是哪个？说「第一个」也行", items, which -> {
+            voiceCandMenu = null;
+            if (which < 0 || which >= cands.size()) return;
+            AppInfo pick = cands.get(which);
+            // 用户点过就记住这个说法：下一次同样的发音直接命中，不用再选
+            Prefs.addVoiceAlias(this, pick.pkg, phrase);
+            FileLog.append("VOICE 学到别名 \"" + phrase + "\" → " + pick.label);
+            openPip(pick.pkg, 0);
+        });
+    }
+
+    /** 用嘴选了第几个：把候选列表收掉，顺手把这个说法记成别名 */
+    @Override
+    public void onVoiceCandidatesPicked(String phrase, AppInfo pick) {
+        if (voiceCandMenu != null) {
+            voiceCandMenu.dismiss();
+            voiceCandMenu = null;
+        }
+        if (pick == null || pick.pkg == null || phrase == null) return;
+        Prefs.addVoiceAlias(this, pick.pkg, phrase);
+        FileLog.append("VOICE 学到别名 \"" + phrase + "\" → " + pick.label + "（语音选号）");
+    }
+
     /**
      * 音量提示：车机上系统音量条经常不显示（FLAG_SHOW_UI 被 ROM 吞掉），
      * 这里自己在窗口顶部浮一个小玻璃条，1.2 秒后淡出。
-     */
-    private void showVolumeHud(int[] vol, boolean up) {
+     */    private void showVolumeHud(int[] vol, boolean up) {
         if (vol == null || vol.length < 2) return;
         final ViewGroup decor = (ViewGroup) getWindow().getDecorView();
         View old = decor.findViewWithTag("pipdesk-vol-hud");
@@ -2257,15 +2450,124 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     private void sendBack() {
         PipPane t = backTargetPane();
         if (t != null) {
+            final String pkg = t.pkg();
             Keys.backOnDisplay(this, t.displayId());
-            return;
+            // 单画临时布局：这一下返回可能把「临时应用」弄走（退出、或只是退到后台）。
+            // 两种情况下这块屏的前台都会换人，而用户下一步想看的是原来的双画/三画。
+            if (pip != null && pip.inSingleMode()) {
+                watchSingleExitIfNeeded();
+            } else if (pkg != null) {
+                // 普通画中画：应用被真按退出后这块屏就空了，得把画面清掉 ——
+                // 否则纹理停在最后一帧，用户会以为"返回键没反应"
+                watchPaneExit(t, pkg);
+            }
+        } else {
+            Keys.back(this);
+            watchSingleExitIfNeeded();
         }
-        Keys.back(this);
+    }
+
+    /**
+     * 普通画中画按了返回之后：这块屏的前台如果换人（应用退出/被 Finish），
+     * 就把这块画中画清空（显示"点图标打开应用"的空态），不要留着最后一帧。
+     * 应用内部返回（详情→列表）时前台还是同一个包名，不会误清。
+     */
+    private void watchPaneExit(final PipPane pane, final String pkg) {
+        final int d = pane.displayId();
+        if (d < 0) return;
+        new Thread(() -> {
+            long[] waits = {120, 200, 260, 320};
+            for (long w : waits) {
+                try {
+                    Thread.sleep(w);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (isDestroyed() || pip == null) return;
+                String top;
+                try {
+                    top = pip.topPkgOnDisplay(d);
+                } catch (Throwable t) {
+                    return;
+                }
+                if (top == null) continue;
+                if (top.equals(pkg)) continue;
+                final String nowTop = top;
+                runOnUiThread(() -> {
+                    if (pane.pkg() == null || !pkg.equals(pane.pkg())) return;
+                    FileLog.append("画中画 " + pkg + " 已退出（现在 "
+                            + (nowTop.isEmpty() ? "空屏" : nowTop) + "）→ 清空这块屏");
+                    pane.close();
+                });
+                return;
+            }
+        }, "pipdesk-pane-exit").start();
+    }
+
+    /** 单画布局中时，盯一下单画专用屏的前台应用有没有换人 */
+    private void watchSingleExitIfNeeded() {
+        if (pip == null || !pip.inSingleMode()) return;
+        String pkg = pip.singleAppPkg();
+        PipPane p = pip.singlePane();
+        if (pkg == null || p == null) return;
+        watchSingleExit(pkg, p.displayId());
+    }
+
+    /**
+     * 单画里按了返回 / 回到桌面：确认这块屏的前台还是不是那个临时应用，不是了就恢复原布局。
+     *
+     * 【为什么看"前台是谁"而不是"task 还在不在"】用户遇到的实际情况是应用**退到了后台**
+     * （task 还在），此时屏幕上露出的是底下那个应用（比如百度地图），单画就变成了
+     * "把百度地图单独铺满"，与单画的目的（临时全屏看某个应用）不符。
+     * 同时应用内部还有返回栈（详情→列表），只看"按了返回"就把布局收掉也是错的。
+     * 判据只有一个：这块屏的 topResumedActivity 还是不是它。
+     *
+     * 两次采样（0.45s / 0.75s）都换人才收，避免切换瞬间误判；读不到就不动布局。
+     */
+    private void watchSingleExit(final String pkg, final int displayId) {
+        if (displayId < 0) return;
+        new Thread(() -> {
+            // 采样：返回键刚下发时这块屏的前台可能还没换人，所以从 80ms 起密集看几次。
+            // **第一次读到换了人就恢复**，不再要求连续两次 ——
+            // 判据是「这块屏的前台还是不是那个临时应用」，应用内部返回（详情→列表）
+            // 时前台仍是同一个包名，不存在误判；多等一轮只会多一帧"全屏露出底下应用"。
+            long[] waits = {40, 60, 100, 150, 200, 240};
+            for (long w : waits) {
+                try {
+                    Thread.sleep(w);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                if (isDestroyed() || pip == null) return;
+                String top;
+                try {
+                    top = pip.topPkgOnDisplay(displayId);
+                } catch (Throwable t) {
+                    return;                     // 读不到就别乱动布局
+                }
+                if (top == null) continue;      // 这一次没读到（命令超时等），过一会儿再试
+                if (top.equals(pkg)) continue;  // 还在前台：应用内返回，保持单画
+                final String nowTop = top;
+                runOnUiThread(() -> {
+                    if (pip == null || !pip.inSingleMode()) return;
+                    if (!pkg.equals(pip.singleAppPkg())) return;
+                    FileLog.append("单画临时应用 " + pkg + " 已不在前台（现在 "
+                            + (nowTop.isEmpty() ? "空屏" : nowTop) + "）→ 恢复原布局");
+                    pip.restoreSingleAfterExit();
+                });
+                return;
+            }
+        }, "pipdesk-single-exit").start();
     }
 
     /** 返回键该去哪块画中画；返回 null = 没有可返回的目标 */
     private PipPane backTargetPane() {
         if (pip == null) return null;
+        // 单画布局：屏幕上只有单画专用屏，返回当然发给它
+        if (pip.inSingleMode()) {
+            PipPane sp = pip.singlePane();
+            if (isBackTarget(sp)) return sp;
+        }
         PipPane p = lastActivePane;
         if (isBackTarget(p)) return p;
         // 没碰过/那块屏已空：退回「活动画中画」，再不行找第一块跑着应用的
@@ -2644,6 +2946,21 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         applySettings();
         // 回到桌面：把「全屏打开」过、还挂在主屏的应用搬回画中画继续显示
         pip.bringBackFullscreened();
+        // 单画临时布局里，如果那个临时应用已经不在前台了（退到后台、退出、崩溃），
+        // 回到桌面这一下顺手收掉单画，别停在一块只剩底应用的布局上
+        watchSingleExitIfNeeded();
+        // 语音：接上宿主；设置里开着常驻唤醒就顺带把 KWS 拉起来（已起则幂等）
+        Voice.get().attach(this, this);
+        // 最后一道兜底：AppOps / pm grant 都没拿到录音权限时，才真的弹系统权限框。
+        // 只弹一次，用户拒绝也不再纠缠（设置页可以手动授权）。
+        if (Prefs.voiceWake(this) && !VoicePerm.has(this) && !voicePermAsked) {
+            voicePermAsked = true;
+            try {
+                requestPermissions(new String[]{"android.permission.RECORD_AUDIO"}, 0x5b01);
+            } catch (Throwable t) {
+                Log.w(TAG, "申请录音权限失败", t);
+            }
+        }
         // 开机首次 onResume 在首帧之前，别在这里 fork 注入服务抢首帧 CPU：
         // 交给 runBootWork()；之后每次回桌面照常预热。
         if (bootHeavyDone) {
@@ -2815,6 +3132,9 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     protected void onDestroy() {
         super.onDestroy();
         if (instance == this) instance = null;
+        Voice.get().detach();
+        Voice.get().stop();          // 内部丢后台线程收尾，不阻塞主线程
+        VoiceCard.reset();
         if (wallpaperReceiver != null) {
             try { unregisterReceiver(wallpaperReceiver); } catch (Throwable ignored) { }
             wallpaperReceiver = null;

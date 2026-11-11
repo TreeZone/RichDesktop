@@ -361,6 +361,21 @@ public class PipPane {
         return pkg;
     }
 
+    /**
+     * 只记录「这块屏当前前台是谁」，**不拉应用、不动虚拟屏**。
+     *
+     * 用在单画临时应用自己退走的场景：按返回之后那块屏往下露出来的就是原应用，
+     * 没必要再 launch 一次（多一次冷启动闪动）。但 pkg 字段得跟上，
+     * 否则下次点同一个应用会被当成"没开过"重新冷启动一遍。
+     */
+    public void adoptForeground(String targetPkg) {
+        if (targetPkg == null) return;
+        pkg = targetPkg;
+        livePkg = targetPkg;
+        hint.setVisibility(View.GONE);
+        loading.setVisibility(View.GONE);
+    }
+
     public boolean isBusy() {
         return pkg != null;
     }
@@ -419,11 +434,21 @@ public class PipPane {
 
     public void open(String targetPkg) {
         if (targetPkg == null) return;
-        // 已经在这块屏上跑着：不重建、不重开（否则虚拟屏重建 + 重新拉起，观感是"闪一下又重进"）
+        // 这块屏记着这个应用：不重建虚拟屏、不换 texture，但**必须把它的 task 带到前台**。
+        //
+        // 踩过的坑：用户按「返回」后，栈可能退到上一个应用（A 还在栈里但不在前台），
+        // 也可能直接把 A 退出（task 没了，只剩我们记的 pkg）。原来的"直接 return"在这两种
+        // 情况下都表现为"点了图标没反应"（其实应用是开着的/被重新创建了，但画面不弹）。
+        // launch intent 对这两种情况的处理正好都对：
+        //   task 还在 → 一次 resume（不重建、不闪）；
+        //   task 没了 → 在本屏重新创建。
         if (targetPkg.equals(pkg) && vd != null && displayId >= 0) {
-            Log.i(TAG, "pane " + index + " 已在运行 " + targetPkg + "，跳过重建");
+            Log.i(TAG, "pane " + index + " 已记着 " + targetPkg + "，把它的 task 带回前台");
+            livePkg = targetPkg;
             texture.setOpaque(true);
             texture.setAlpha(1f);
+            launchOn(targetPkg, displayId);
+            ensureOnDisplay(targetPkg, displayId);
             return;
         }
         // 兜底：TextureView 已经可用但回调被漏掉（例如先 attach 后注册）
@@ -463,6 +488,11 @@ public class PipPane {
                 // 「可见的 task」，进程留着不放、surface 也占着 —— 换几次应用之后
                 // 三块屏能堆出十几个常驻进程，内存越用越紧（表现就是跑一阵子开始卡）。
                 scheduleReap(stale, 2500);
+                // 这块屏上除新应用以外的历史 task 一并清掉：一屏一个栈，
+                // 返回键才是"退出应用"而不是"翻出上一个应用"
+                main.postDelayed(() -> {
+                    if (targetPkg.equals(pkg)) trimTasks(targetPkg);
+                }, 2000);
             }
             return;
         }
@@ -528,6 +558,10 @@ public class PipPane {
         // 用户看到的就是"桌面闪一下"。屏留着（盖着空白页），下次 open 直接复用，秒开。
         // 但被关掉的应用的 task 要收掉：否则它会一直留在栈底当"可见 task"常驻内存。
         scheduleReap(p, 1500);
+        // 屏已经空了：这块屏上残留的历史 task 全清（含被顶到后台的旧应用）
+        main.postDelayed(() -> {
+            if (pkg == null) trimTasks(null);
+        }, 1200);
         if (cb != null) cb.onPaneClosed(this);
     }
 
@@ -1049,6 +1083,38 @@ public class PipPane {
         }
     }
 
+    /** 调试用：把系统任务表（taskId / displayId / base / top）打成一串，验证任务查询在本机能否用 */
+    public static String debugDumpTasks(Context ctx, String pkg) {
+        StringBuilder sb = new StringBuilder("tasks want=" + pkg + " ");
+        try {
+            ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+            List<ActivityManager.RunningTaskInfo> ts = am.getRunningTasks(30);
+            sb.append("count=").append(ts == null ? -1 : ts.size()).append(" | ");
+            if (ts != null) {
+                for (ActivityManager.RunningTaskInfo t : ts) {
+                    Object top = objField(t, "topActivity");
+                    Object base = objField(t, "baseActivity");
+                    Integer disp = intField(t, "displayId");
+                    Integer id = intField(t, "taskId");
+                    sb.append("#").append(id)
+                            .append(" d=").append(disp)
+                            .append(" base=").append(top == null ? "?" : shortComp(base))
+                            .append(" top=").append(top == null ? "?" : shortComp(top))
+                            .append(" || ");
+                }
+            }
+        } catch (Throwable t) {
+            sb.append("ERR ").append(t.getClass().getSimpleName());
+        }
+        return sb.toString();
+    }
+
+    private static String shortComp(Object o) {
+        if (!(o instanceof ComponentName)) return String.valueOf(o);
+        ComponentName c = (ComponentName) o;
+        return c.getPackageName() + "/" + c.getClassName();
+    }
+
     /**
      * 拿系统任务栈服务的 binder 代理（IActivityTaskManager / 老 IActivityManager）。
      * 返回 null 表示全都没走通。
@@ -1174,6 +1240,57 @@ public class PipPane {
                 }
             }, "pipdesk-reap").start();
         }, Math.max(300, delayMs));
+    }
+
+    /**
+     * 一屏只留一个应用：把这块虚拟屏上**其余历史 task** 全移除（保留 keepPkg）。
+     *
+     * 不清理会怎样（实测）：同一块屏会攒下一串 task —— 我们只能关掉"这块屏记着的
+     * 那个应用"，之前在这块屏上开过的（被 BlankActivity 顶到后台的）task 会一直躺在
+     * 栈里。于是用户按返回键时，看到的不是"应用退出"，而是**上一个应用被翻出来**，
+     * 有的人会以为返回键坏了。
+     *
+     * keepPkg = null 表示"这块屏现在空闲，除了桌面自己的空白页全清"。
+     * 必须在后台线程调用（dumpsys + binder）。
+     */
+    public void trimTasks(final String keepPkg) {
+        final int d = displayId;
+        if (d < 0) return;
+        new Thread(() -> {
+            try {
+                String cmd = "dumpsys activity activities 2>/dev/null | awk -v h='Display #" + d
+                        + " (activities' 'index($0,h)==1{inb=1;next}"
+                        + " inb&&substr($0,1,9)==\"Display #\"{inb=0}"
+                        + " inb&&/\\* Task/{print}'";
+                String out = Shell.capture(cmd);
+                if (out == null) return;
+                java.util.regex.Pattern pId = java.util.regex.Pattern.compile("#(\\d+)");
+                java.util.regex.Pattern pPkg =
+                        java.util.regex.Pattern.compile("A=\\d+:([A-Za-z0-9_.]+)");
+                int removed = 0;
+                for (String line : out.split("\n")) {
+                    if (!line.contains("Task{")) continue;
+                    java.util.regex.Matcher mi = pId.matcher(line);
+                    java.util.regex.Matcher mp = pPkg.matcher(line);
+                    if (!mi.find() || !mp.find()) continue;
+                    String pkgOnTask = mp.group(1);
+                    if (pkgOnTask == null) continue;
+                    if (pkgOnTask.startsWith("com.cz.richdesk")) continue;  // 空白页/桌面自己
+                    if (pkgOnTask.equals(keepPkg)) continue;
+                    int tid = Integer.parseInt(mi.group(1));
+                    if (removeTask(tid)) {
+                        removed++;
+                        Log.i(TAG, "trim 移除 d=" + d + " 上的历史任务 " + pkgOnTask + " task=" + tid);
+                    }
+                }
+                if (removed > 0) {
+                    FileLog.append("trim：display " + d + " 清掉 " + removed
+                            + " 个历史任务（保留 " + (keepPkg == null ? "无" : keepPkg) + "）");
+                }
+            } catch (Throwable t) {
+                Log.i(TAG, "trim 失败 d=" + d + " " + t.getClass().getSimpleName());
+            }
+        }, "pipdesk-trim").start();
     }
 
     /** 在指定屏上找某应用的 task（只看这块屏，避免误伤主屏/别的屏上的同一个应用） */

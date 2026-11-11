@@ -172,32 +172,66 @@ public class Keys {
 
     /**
      * 后台注入一次按键到指定 display。
-     * 三层兜底：进程内定向反射 → shell `input -d` → 全局注入。
-     * 返回的 boolean 只表示"已尝试"，结果看 logcat。
+     *
+     * 【0.21.0 关键修复：先点一下目标屏再发键】
+     * 这台 ROM 只有「顶层焦点屏」的窗口是可聚焦的（dumpsys input 里其余屏一律
+     * FocusRequests result=NOT_FOCUSABLE）。用户点 Dock 上的返回按钮那一刻，
+     * 手指已经把焦点抢回主屏，所以直接注入到画中画屏的 BACK 没有任何窗口接收。
+     * 现在的顺序是：触摸探针把焦点搬到目标屏（DOWN+CANCEL，不触发点击）→
+     * 等 60ms 让 WMS/InputDispatcher 落位 → 注入按键。
+     * 失败链：进程内反射（hidden API 被限）→ shell `input -d`（uid 1000 有 INJECT_EVENTS）。
+     * **不再退回全局注入**：全局 BACK 只会打给桌面自己，等于误触。
      */
     public static void send(final Context ctx, final int keyCode, final int displayId) {
         if (ctx == null) return;
         final Context app = ctx.getApplicationContext();
         EXEC.execute(() -> {
-            if (displayId >= 0 && displayId != android.view.Display.DEFAULT_DISPLAY) {
-                if (inject(app, keyCode, displayId)) {
-                    Log.i(TAG, "按键定向注入成功 keyCode=" + keyCode + " d=" + displayId);
-                    return;
-                }
-                Log.w(TAG, "定向注入失败，改走 shell -d keyCode=" + keyCode + " d=" + displayId);
-                if (Shell.runSync("input -d " + displayId + " keyevent " + keyCode)) {
-                    Log.i(TAG, "shell -d 注入成功 keyCode=" + keyCode + " d=" + displayId);
-                    return;
-                }
-                Log.w(TAG, "shell -d 也失败，退回全局注入 keyCode=" + keyCode);
-            }
-            if (inject(app, keyCode, android.view.Display.DEFAULT_DISPLAY)) {
-                Log.i(TAG, "按键注入成功 keyCode=" + keyCode);
+            if (displayId < 0 || displayId == android.view.Display.DEFAULT_DISPLAY) {
+                if (inject(app, keyCode, android.view.Display.DEFAULT_DISPLAY)) return;
+                Shell.runSync("input keyevent " + keyCode);
                 return;
             }
-            Log.w(TAG, "按键注入失败，改走 shell keyCode=" + keyCode);
-            Shell.runSync("input keyevent " + keyCode);
+            // 1) 焦点探针：把这块虚拟屏变成「顶层焦点屏」
+            try {
+                TouchBridge.get(app).pokeFocus(displayId);
+            } catch (Throwable t) {
+                Log.w(TAG, "焦点探针异常：" + t.getClass().getSimpleName());
+            }
+            try {
+                Thread.sleep(60);
+            } catch (InterruptedException ignored) {
+                return;
+            }
+            // 2) 进程内定向注入（hidden API 放行时最省事）
+            if (inject(app, keyCode, displayId)) {
+                Log.i(TAG, "按键定向注入成功 keyCode=" + keyCode + " d=" + displayId);
+                releaseFocus(app, displayId);
+                return;
+            }
+            // 3) shell `input -d`（uid 1000 下 INJECT_EVENTS 可用；只打日志不吹"成功"，
+            //    因为 input 命令把异常打在 stderr 上时退出码不一定是非 0）
+            boolean ok = Shell.runSync("input -d " + displayId + " keyevent " + keyCode);
+            Log.i(TAG, "shell -d 注入 keyCode=" + keyCode + " d=" + displayId + " ok=" + ok);
+            releaseFocus(app, displayId);
         });
+    }
+
+    /**
+     * 把「顶层焦点屏」还给主屏。
+     *
+     * 探针把焦点搬到画中画屏之后，焦点就**留在那儿**了 —— 而桌面自己在 0 屏，
+     * 于是接下来桌面上的点击、单画里应用的点击全部失去接收窗口，
+     * 用户看到的就是「单画打开 app 完全无法获得焦点 / 整个桌面点不动」。
+     * 所以键注完立刻还一次，别让焦点悬在虚拟屏上。
+     */
+    private static void releaseFocus(Context app, int fromDisplay) {
+        try {
+            if (fromDisplay == android.view.Display.DEFAULT_DISPLAY) return;
+            TouchBridge.get(app).pokeFocus(android.view.Display.DEFAULT_DISPLAY);
+            Log.i(TAG, "焦点已还给主屏（原 d=" + fromDisplay + "）");
+        } catch (Throwable t) {
+            Log.w(TAG, "焦点归还失败：" + t.getClass().getSimpleName());
+        }
     }
 
     /** 注入一次 DOWN+UP；displayId >= 0 时把事件定向到该屏 */
