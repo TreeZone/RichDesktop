@@ -150,6 +150,9 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
             panes.add(p);
         }
         weights = Prefs.getPaneWeights(app, paneCount);
+        // 槽位号≥paneCount 的虚拟屏（以前是单画那块、或屏数从多改少）真释放掉，
+        // 否则它们会一直留在 DisplayManager 里当"野屏"，白白占合成器开销。
+        PipDisplays.releaseFrom(paneCount);
         container.setListener(this);
         applyOrientation();
         // 存下来的比例可能是脏的（改过屏数/版本升级）：收敛到支持的那几种

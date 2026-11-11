@@ -125,7 +125,9 @@ public class PipPane {
                 surfaceH = h;
                 android.graphics.SurfaceTexture st = texture.getSurfaceTexture();
                 if (st != null) st.setDefaultBufferSize(buf(w), buf(h));
-                if (vd != null && !resizeDisplay(buf(w), buf(h), density())) scheduleRecreate();
+                // resize 只是"调尺寸"，失败也不重建屏 —— 重建会换 displayId，
+                // 屏内 task 就再也回不到这块屏上（= 卡死）。宁可让纹理拉伸一下。
+                if (vd != null) resizeDisplay(buf(w), buf(h), density());
             }
         });
 
@@ -167,11 +169,10 @@ public class PipPane {
                 if (w != surfaceW || h != surfaceH) {
                     surfaceW = w;
                     surfaceH = h;
-                    // 旋转/分屏：优先原地 resize（等价于设备旋转，应用收到 config change），
-                    // 销毁重建会让屏内应用掉到手机主屏上（不 resize 时才有这个兜底）
-                    if (vd != null && (buf(w) != displayW || buf(h) != displayH)
-                            && !resizeDisplay(buf(w), buf(h), density())) {
-                        scheduleRecreate();
+                    // 旋转/分屏/拖拽：原地 resize（等价于设备旋转，应用收到 config change）。
+                    // 失败也不重建屏 —— 重建会换 displayId，屏内 task 会掉回主屏（= 卡死）。
+                    if (vd != null && (buf(w) != displayW || buf(h) != displayH)) {
+                        resizeDisplay(buf(w), buf(h), density());
                     }
                 }
             }
@@ -300,7 +301,8 @@ public class PipPane {
         surfaceH = h;
         SurfaceTexture st = texture.getSurfaceTexture();
         if (st != null) st.setDefaultBufferSize(buf(w), buf(h));
-        if (vd != null && !resizeDisplay(buf(w), buf(h), density())) scheduleRecreate();
+        // 同上：尺寸对不齐也不重建屏，避免换 displayId 把屏内 task 甩到主屏
+        if (vd != null) resizeDisplay(buf(w), buf(h), density());
     }
 
     /**
@@ -685,12 +687,44 @@ public class PipPane {
     // ------------------------------------------------------------ 虚拟屏
 
     private void createDisplay() {
-        releaseDisplay();
         if (!surfaceReady) return;
         SurfaceTexture st = texture.getSurfaceTexture();
         if (st == null) return;
         int w = Math.max(1, buf(surfaceW));
         int h = Math.max(1, buf(surfaceH));
+
+        // ① 槽位里已经有这块屏 → 只换 surface（必要时 resize），displayId 保持不变。
+        //    displayId 不变，屏内应用的 task 就不会被系统搬走，新 TextureView 接上就有画面。
+        //    这就是"不再卡死"的关键：重建 pane 不再是"换一块屏"，只是"换一根线"。
+        PipDisplays.Slot reuse = PipDisplays.slot(key());
+        if (reuse != null) {
+            vd = reuse.vd;
+            displayId = reuse.vd.getDisplay() == null ? -1 : reuse.vd.getDisplay().getDisplayId();
+            if (displayId < 0) {            // 读到一半失效了：当没有处理
+                vd = null;
+            } else {
+                if (reuse.w != w || reuse.h != h || reuse.dpi != density()) {
+                    // resize 失败也不重建屏：TextureView 会把旧尺寸的 buffer 拉伸显示，
+                    // 顶多比例不完美；重建却会让屏内 task 掉回主屏（= 卡死）。
+                    if (resizeDisplay(w, h, density())) {
+                        reuse.w = w;
+                        reuse.h = h;
+                        reuse.dpi = density();
+                    }
+                }
+                // bind 用的 buffer 尺寸必须是这块屏**当前真实**的像素尺寸，
+                // 不是这次算出来的 w/h —— resize 没成功时两者并不相等。
+                displayW = reuse.w;
+                displayH = reuse.h;
+                PipDisplays.bind(reuse, st, displayW, displayH);
+                Log.i(TAG, "pane " + index + " 复用 display=" + displayId + " "
+                        + displayW + "x" + displayH + " dpi=" + reuse.dpi + "（只换 surface，不动 task）");
+                showContentAfter(200);
+                return;
+            }
+        }
+
+        // ② 没有可用屏（冷启动 / 屏被真释放过）：新建，并登记到进程级槽位
         Surface surface = new Surface(st);
         int baseFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
                 | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
@@ -713,7 +747,20 @@ public class PipPane {
         displayW = w;
         displayH = h;
         Log.i(TAG, "pane " + index + " display=" + displayId + " " + w + "x" + h + " dpi=" + dpi);
-        if (displayId >= 0) ignoreOrientationRequest(displayId);
+        if (displayId >= 0) {
+            PipDisplays.Slot s = new PipDisplays.Slot();
+            s.vd = vd;
+            s.w = w;
+            s.h = h;
+            s.dpi = dpi;
+            PipDisplays.put(key(), s);
+            ignoreOrientationRequest(displayId);
+        }
+    }
+
+    /** 本 pane 对应的槽位名（进程级虚拟屏按它复用） */
+    private String key() {
+        return "PipDesk-" + index;
     }
 
     /**
@@ -745,23 +792,35 @@ public class PipPane {
         }
     }
 
+    /**
+     * 解绑（Activity 销毁 / 纹理销毁 / pane 关闭）：只把 surface 从虚拟屏上摘掉，**屏留着**。
+     *
+     * 以前这里 `vd.release()`：屏一销毁，屏内 task 就被系统丢回主屏，接着还得 restoreDesktop()
+     * 把桌面拉回来，用户看到的就是"桌面闪一下 + 应用变全屏"。更要命的是下次 open 会建一块
+     * **新 displayId** 的屏，而应用 task 还在旧 id 上 —— 新屏永远空白 = 卡死。
+     */
     private void releaseDisplay() {
-        boolean hadApp = livePkg != null || pkg != null;
-        livePkg = null;
-        boolean released = false;
-        if (vd != null) {
-            try {
-                vd.release();
-                released = true;
-            } catch (Throwable ignored) { }
-            vd = null;
-        }
+        PipDisplays.detach(key());
+        vd = null;
         displayId = -1;
         displayW = displayH = 0;
-        // 屏被销毁后，原本跑在这块屏上的 task 会被系统搬到主屏并顶到最前
-        // （用户看到的就是"画中画没了，应用变成全屏把桌面盖住"）。
-        // 桌面在前台时把桌面重新拉回最前，应用就退回后台，不再抢屏幕。
-        if (hadApp && released) restoreDesktop();
+    }
+
+    /**
+     * 真销毁这块屏。只在两种"屏确实要换"的场合用：
+     *   1) 减少屏数（槽位不再需要）；
+     *   2) 用户显式改「屏内渲染分辨率」（要连带重启屏内应用，见 setRenderScale）。
+     * 日常的重排/重建一律走 {@link #createDisplay()} 的复用分支，绝不动 displayId。
+     */
+    private void destroyDisplay() {
+        boolean hadApp = livePkg != null || pkg != null;
+        livePkg = null;
+        PipDisplays.release(key());
+        vd = null;
+        displayId = -1;
+        displayW = displayH = 0;
+        // 屏被真销毁时 task 才会被系统搬回主屏，这时候才需要把桌面拉回前台
+        if (hadApp) restoreDesktop();
     }
 
     /** 把桌面拉回前台。设置页在前台时不抢焦点 */
@@ -791,24 +850,26 @@ public class PipPane {
         main.postDelayed(recreateTask, 250);
     }
 
+    /**
+     * 真·重建（**只有改 DPI / 渲染分辨率时才走这里**，日常重排绝不进）。
+     *
+     * 这类改动靠 resize 改不动（屏内应用不会重新测量，画面缩在左上角），必须换一块屏。
+     * 换屏就意味着屏内 task 会被系统丢回主屏，而且新屏再 launchOn 也拉不回来
+     * （activity 实例还在 → AMS 只做 START_DELIVERED_TO_TOP，不 reparent）。
+     * 所以这里直接把屏内应用进程 force-stop 掉，让下一次启动建一个全新 task 落在新屏上。
+     */
     private void recreateNow() {
         final String keep = pkg;
-        clearDisplayApp(keep);
-        // 先把屏内应用压后台 → 释放旧屏 → 建新屏 → 重新拉起，顺序不能交叉
+        // 旧屏不再需要：真释放（不带 clearDisplayApp —— 空白页在新屏上没意义）
+        destroyDisplay();
+        if (keep == null || !surfaceReady) return;
         main.postDelayed(() -> {
-            releaseDisplay();
-            if (keep == null || !surfaceReady) return;
-            main.postDelayed(() -> {
-                if (!keep.equals(pkg) || !surfaceReady) return;
-                createDisplay();
-                if (displayId >= 0) {
-                    livePkg = keep;
-                    launchOn(keep, displayId);
-                    ensureOnDisplay(keep, displayId);
-                    showContentAfter(450);
-                }
-            }, 120);
-        }, 220);
+            if (!keep.equals(pkg) || !surfaceReady) return;
+            createDisplay();
+            if (displayId < 0) return;
+            livePkg = keep;
+            relaunchAfterStop(keep, 300);
+        }, 200);
     }
 
     // ------------------------------------------------------------ 启动应用
