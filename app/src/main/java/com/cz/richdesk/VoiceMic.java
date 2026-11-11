@@ -58,6 +58,8 @@ public final class VoiceMic {
     private volatile boolean running;
     private volatile String error;
     private volatile int sampleRate = SR;
+    /** 本次采集的 audio session id：录音配置列表里用它把自己排除掉 */
+    private volatile int session;
     /**
      * 连续"没有信号"的起点（0 = 当前有信号）。
      *
@@ -79,6 +81,11 @@ public final class VoiceMic {
 
     public int sampleRate() {
         return sampleRate;
+    }
+
+    /** 当前 AudioRecord 的 session id（未开麦时 -1）。Voice 用它从录音配置里认出"自己" */
+    public int audioSessionId() {
+        return session;
     }
 
     /** 已经连续多久没有信号（ms）。0 = 当前在正常收到声音 */
@@ -149,6 +156,7 @@ public final class VoiceMic {
                 return false;
             }
             sampleRate = r.getSampleRate();          // ROM 可能改写采样率，记真实值
+            session = r.getAudioSessionId();
             rec = r;
             // 保守起见先当"没有信号"：第一个真正有声的 chunk 会把它清掉。
             // 这样 HAL 开了却一直不回数据（read 阻塞）也能被 silentMs() 发现。
@@ -236,6 +244,7 @@ public final class VoiceMic {
     public void stop() {
         running = false;
         silentSince = 0;
+        session = -1;
         Thread t = th;
         th = null;
         if (t != null) {

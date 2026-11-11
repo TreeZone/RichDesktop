@@ -1,6 +1,7 @@
 package com.cz.richdesk;
 
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.media.AudioManager;
 import android.media.ToneGenerator;
 import android.os.Handler;
@@ -43,6 +44,16 @@ public final class Voice {
      * 而正常说话不可能连续 1.2 秒一个非零采样都没有（真实麦克风有底噪）。
      */
     private static final long SILENT_RECOVER_MS = 1_200L;
+    /**
+     * 让路后等对方收工的耐心上限。
+     *
+     * 「小度小度」是一次对话：唤醒 → 对话几秒 → 录音停止。这种我们让路，
+     * 对方一停立刻收回，两家的唤醒词互不干扰。
+     * 但如果对方是**常驻监听**（语音服务 7×24 抓着 input 不放），一直让下去
+     * 我们就永远聋了 —— 所以超过这个时长就温和地收回试一次（探测）：
+     * 若 HAL 其实支持并发，探测直接成功；若真单路独占，1.2 秒死寂后会再次让路。
+     */
+    private static final long YIELD_WATCHDOG_MS = 15_000L;
     /** 重开麦克风的退避起点 / 上限：连续失败时翻倍，封顶后一直以这个节奏后台重试 */
     private static final long MIC_RETRY_MIN_MS = 1_200L;
     private static final long MIC_RETRY_MAX_MS = 15_000L;
@@ -139,6 +150,18 @@ public final class Voice {
     private long micRetryGap = MIC_RETRY_MIN_MS;
     /** 本轮总共重开了几次（每两次换一个 audio source 试） */
     private int micTries;
+    /**
+     * 让路中：别的应用（典型是小度）正在录音，我们已主动停采，等它结束后收回。
+     * 这是与「重开抢回」并行的另一条恢复路 —— 抢回只用于**没有任何录音方**的
+     * 死寂（HAL 选路问题），有明确占用者时先礼后兵，免得把小度抢聋。
+     */
+    private volatile boolean yielded;
+    /** 让路开始 / 下一次探测收回的时刻 */
+    private volatile long yieldSince;
+    private volatile long yieldWatchAt;
+    /** 录音回调通知「占用方已停止」：由控制循环收回麦克风 */
+    private volatile boolean reclaimReq;
+    private boolean recCbRegistered;
     private volatile long cooldownUntil;
     private volatile long idleSince;
     private volatile long lastUiPush;
@@ -361,20 +384,65 @@ public final class Voice {
                     continue;
                 }
 
-                // 被独占的另一种形态：read **照常返回**，但内容全是死寂 ——
-                // 上面那条"2.5 秒没收到 PCM"永远等不到。典型现场：百度地图的
-                // 「小度小度」唤醒后占住 input，之后我们的「你好小瑞」怎么喊都不应，
-                // 点语音图标也只听到死寂。这时唯一的自救是重开麦克风重新选路。
-                if (mic != null && now >= micRetryAt
+                // 占用方（小度）停止了录音：录音回调会置这个标志。
+                // 立刻收回麦克风 —— 回调可能只来一次，错过就得等 watchdog，所以要快。
+                if (reclaimReq) {
+                    reclaimReq = false;
+                    if (yielded) {
+                        yielded = false;
+                        boolean ok;
+                        synchronized (lock) { ok = ensureMic(); }
+                        if (ok) {
+                            FileLog.append("VOICE 占用方已停止录音 → 收回麦克风，恢复待唤醒");
+                            pushState(hint(), null);
+                        } else {
+                            // 开麦失败（权限/初始化）：退回让路态，走既有退避重试
+                            yielded = true;
+                            yieldWatchAt = SystemClock.elapsedRealtime() + micRetryGap;
+                            FileLog.append("VOICE 收回麦克风失败：" + lastError
+                                    + "，" + micRetryGap + "ms 后再试");
+                        }
+                    }
+                }
+
+                // 被独占的两种形态：
+                //   a) read 照常返回、内容全是死寂（HAL 只给一路，后来者拿全 0）；
+                //   b) 2.5 秒没有任何回调（上面已处理）。
+                // 现在的恢复分两路，先看**有没有人在录音**再决定礼让还是抢回：
+                //   - 有明确占用者（getActiveRecordingConfigurations 查得到）→ 让路：
+                //     停我们的采，对方结束的瞬间自动收回。两家的唤醒词互不干扰，
+                //     也不会出现"我们把小度抢聋"的反向事故。
+                //   - 没有任何录音方却收到死寂 → 这是 HAL 选路问题，等是等不回来的，
+                //     只能 recycleMic 重新 open 让 AudioFlinger 重选。
+                if ((mic != null || yielded) && now >= micRetryAt
                         && (state == S_WAKE || state == S_LISTEN || state == S_LOADING)) {
-                    long dead = mic.silentMs();
+                    long dead = mic == null ? 0 : mic.silentMs();
                     if (dead > SILENT_RECOVER_MS) {
-                        recycleMic("连续 " + dead + "ms 采样全为死寂（疑似被其他应用占用）");
+                        java.util.List<android.media.AudioRecordingConfiguration> others = otherRecorders();
+                        if (!others.isEmpty()) {
+                            if (!yielded) {
+                                yieldMic(describeRecorders(others));
+                            } else if (now >= yieldWatchAt) {
+                                // 让路超时还没等到对方收工：像常驻监听，温和探测一次
+                                FileLog.append("VOICE 让路已 " + (now - yieldSince) / 1000
+                                        + "s 对方仍录音 → 探测性收回");
+                                yielded = false;
+                                synchronized (lock) { ensureMic(); }
+                                yieldWatchAt = now + YIELD_WATCHDOG_MS;
+                                // 若探测拿到的仍是死寂（真独占），1.2s 后这里会再次让路
+                            }
+                        } else {
+                            recycleMic("连续 " + dead + "ms 采样全为死寂（无其他录音方，疑似 HAL 选路）");
+                        }
                         try { Thread.sleep(80); } catch (InterruptedException ie) { break; }
                         continue;
-                    } else if (micTries != 0) {
+                    } else if (mic != null && (micTries != 0 || yielded)) {
                         micTries = 0;                    // 已经重新听到声音，计数清零
                         micRetryGap = MIC_RETRY_MIN_MS;
+                        if (yielded) {
+                            yielded = false;             // 让路期间收到了真声音（比如对方只是瞬断）
+                            FileLog.append("VOICE 让路中收到信号 → 取消让路，恢复待唤醒");
+                        }
                     }
                 }
 
@@ -575,6 +643,136 @@ public final class Voice {
     }
 
     /**
+     * 让路：检测到其他应用正在录音（典型是小度），主动停掉我们的采集，
+     * 把 input 完整留给对方。注册了录音回调，对方一停 reclaimReq 就会置位，
+     * 控制循环在 ~80ms 内收回麦克风 —— 小度的对话结束后，「你好小瑞」几乎无感恢复。
+     *
+     * KWS / ASR 模型都保留着，只是没有 PCM 可喂，收回后立即可用。
+     */
+    private void yieldMic(String who) {
+        long now = SystemClock.elapsedRealtime();
+        synchronized (lock) {
+            if (mic != null) {
+                try {
+                    mic.stop();
+                } catch (Throwable ignored) {
+                }
+                mic = null;
+            }
+        }
+        yielded = true;
+        yieldSince = now;
+        yieldWatchAt = now + YIELD_WATCHDOG_MS;
+        lastPcmAt = now;      // 麦克风没了，别让"2.5s 没 PCM"断流分支乱报
+        registerRecCb();
+        FileLog.append("VOICE 麦克风让路：" + who + " 正在录音 → 停采待命，对方结束后自动收回"
+                + "（" + YIELD_WATCHDOG_MS / 1000 + "s 后仍未结束则探测收回）");
+        pushState("麦克风被 " + who + " 占用，结束后自动恢复", null);
+    }
+
+    /**
+     * 当前有哪些**别的**应用在录音。
+     *
+     * 排除自己用的不是 uid —— getClientUid() 是隐藏 API（编译不过）—— 而是
+     * AudioRecord 的 session id：我们自己的采集配置里 session 一定对得上，
+     * 其余的都算别人。没开麦（让路中）时 -1 对不上任何记录，全部算别人，正合适。
+     */
+    private java.util.List<android.media.AudioRecordingConfiguration> otherRecorders() {
+        try {
+            AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+            if (am == null) return java.util.Collections.emptyList();
+            java.util.List<android.media.AudioRecordingConfiguration> all =
+                    am.getActiveRecordingConfigurations();
+            if (all == null || all.isEmpty()) return java.util.Collections.emptyList();
+            int mySession;
+            synchronized (lock) {
+                mySession = mic == null ? -1 : mic.audioSessionId();
+            }
+            java.util.List<android.media.AudioRecordingConfiguration> out = new java.util.ArrayList<>();
+            for (android.media.AudioRecordingConfiguration c : all) {
+                try {
+                    if (c.getClientAudioSessionId() != mySession) out.add(c);
+                } catch (Throwable ignored) {
+                }
+            }
+            return out;
+        } catch (Throwable t) {
+            return java.util.Collections.emptyList();
+        }
+    }
+
+    /** 把录音方列表翻成人话：「百度地图」/「百度地图 等 2 个」/「其他应用」 */
+    private String describeRecorders(java.util.List<android.media.AudioRecordingConfiguration> list) {
+        if (list == null || list.isEmpty()) return "其他应用";
+        java.util.LinkedHashSet<String> names = new java.util.LinkedHashSet<>();
+        try {
+            PackageManager pm = ctx.getPackageManager();
+            for (android.media.AudioRecordingConfiguration c : list) {
+                String pkg = packageNameOf(c);
+                if (pkg == null) continue;
+                String label = null;
+                try {
+                    label = (String) pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0));
+                } catch (Throwable ignored) {
+                }
+                names.add(label != null ? label : pkg);
+            }
+        } catch (Throwable ignored) {
+        }
+        if (names.isEmpty()) return "其他应用";
+        StringBuilder b = new StringBuilder();
+        int i = 0;
+        for (String n : names) {
+            if (i++ >= 2) {
+                b.append(" 等 ").append(names.size()).append(" 个");
+                break;
+            }
+            if (i > 1) b.append('、');
+            b.append(n);
+        }
+        return b.toString();
+    }
+
+    /**
+     * 录音配置里拿包名。getClientPackageName() 是隐藏 API，公开表里只有 session id ——
+     * 用反射试一下（部分 ROM 没挂拦截就能拿到真名），拿不到就返回 null，
+     * 让上层显示"其他应用"。反射失败无副作用，纯展示用途。
+     */
+    private static String packageNameOf(android.media.AudioRecordingConfiguration c) {
+        try {
+            Object pkg = c.getClass().getMethod("getClientPackageName").invoke(c);
+            return pkg instanceof String ? (String) pkg : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * 注册录音状态回调：占用方停止录音的瞬间置 reclaimReq，让控制循环收回麦克风。
+     * 回调只在让路状态下有作用；注册一次、进程生命周期有效。
+     */
+    private void registerRecCb() {
+        if (recCbRegistered) return;
+        try {
+            AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+            if (am == null) return;
+            am.registerAudioRecordingCallback(new AudioManager.AudioRecordingCallback() {
+                @Override
+                public void onRecordingConfigChanged(
+                        java.util.List<android.media.AudioRecordingConfiguration> configs) {
+                    // 不直接信参数（里面混着我们自己的记录），让控制循环重新查一遍
+                    if (yielded) reclaimReq = true;
+                }
+            }, new Handler(Looper.getMainLooper()));
+            recCbRegistered = true;
+            FileLog.append("VOICE 已注册录音状态回调（占用方结束时可立即收回麦克风）");
+        } catch (Throwable t) {
+            // 没有回调也能活：控制循环的 watchdog 15 秒兜底
+            FileLog.append("VOICE 注册录音回调失败（退化为 15s watchdog）：" + t);
+        }
+    }
+
+    /**
      * 重开麦克风。车机上「小度小度」唤醒后，百度地图的语音占着 input，我们这边
      * read 照常返回但内容全是死寂 —— KWS 永不命中、ASR 一个字也出不来，
      * 用户看到的就是「你好小瑞再也唤不醒、点语音图标也收不到声音」。
@@ -638,8 +836,26 @@ public final class Voice {
 
         // 上一轮收工时麦克风可能正被别人占着（读到的是死寂数据）。不先处理，
         // 这一轮从头到尾都是白听 —— 用户看到的就是"点了语音图标却没反应"。
+        // 用户主动要点语音：结束让路态，全力以赴开麦
+        yielded = false;
         if (mic != null && mic.silentMs() > 600) {
-            recycleMic("聆听前发现麦克风已 " + mic.silentMs() + "ms 无信号");
+            // 有明确占用者（小度还在对话）→ 试一次收回，收不回就明说，别白听一轮；
+            // 没有占用者的死寂 → 纯 HAL 选路问题，recycleMic 能救。
+            java.util.List<android.media.AudioRecordingConfiguration> others = otherRecorders();
+            if (!others.isEmpty()) {
+                String who = describeRecorders(others);
+                recycleMic("聆听前发现被占用：" + who);
+                try { Thread.sleep(300); } catch (InterruptedException ie) { return; }
+                if (mic != null && mic.silentMs() > 250) {
+                    lastError = "麦克风被 " + who + " 占用";
+                    state = wakeMode ? S_WAKE : S_OFF;
+                    pushState("麦克风被 " + who + " 占用，等它结束后再试", null);
+                    idleSince = SystemClock.elapsedRealtime();
+                    return;
+                }
+            } else {
+                recycleMic("聆听前发现麦克风已 " + mic.silentMs() + "ms 无信号");
+            }
         }
 
         if (!wakeMode) {
