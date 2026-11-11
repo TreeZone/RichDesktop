@@ -46,6 +46,8 @@ public class PipPane {
     private static final String TAG = "PipDesk";
     /** DisplayManager.VIRTUAL_DISPLAY_FLAG_TRUSTED（隐藏常量） */
     private static final int FLAG_TRUSTED = 1 << 10;
+    /** VIRTUAL_DISPLAY_FLAG_OWN_DISPLAY_GROUP（@hide）：让这块屏自成 display group */
+    private static final int FLAG_OWN_GROUP = 1 << 11;
 
     public int index;   // 位置序号：调换顺序时由 PipManager.swap 改写
     public final FrameLayout root;
@@ -726,17 +728,35 @@ public class PipPane {
 
         // ② 没有可用屏（冷启动 / 屏被真释放过）：新建，并登记到进程级槽位
         Surface surface = new Surface(st);
-        int baseFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
-                | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
+        // 屏的 flags 直接决定"谁能往这块屏上放窗口"，是"画中画被车机浮层盖住"的开关：
+        //   OWN_CONTENT_ONLY —— 只显示 owner 启动的内容（不镜像主屏）；
+        //   OWN_DISPLAY_GROUP —— 让这块屏自成 display group，车机 SystemUI 的
+        //       "给每块屏挂装饰/媒体卡片"逻辑便不会跟过来（它的全屏 APPLICATION_OVERLAY
+        //       就是那把画面盖死、点击吞掉的元凶）；
+        //   不再要 PUBLIC —— public 屏对全系统开放，任何应用都能往上摆窗口。
+        int baseFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
         try {
             vd = dm.createVirtualDisplay("PipDesk-" + index, w, h, density(), surface, baseFlags | FLAG_TRUSTED);
         } catch (Throwable t1) {
-            Log.w(TAG, "trusted display 失败，退回普通屏", t1);
+            Log.w(TAG, "私有屏(trusted)失败，退回不带 trusted", t1);
             try {
                 vd = dm.createVirtualDisplay("PipDesk-" + index, w, h, density(), surface, baseFlags);
             } catch (Throwable t2) {
-                Log.w(TAG, "createVirtualDisplay 失败", t2);
-                vd = null;
+                // 最后兜底：老配置（public）。public 屏会被车机 SystemUI 挂全屏浮层，
+                // 属于退化路径，日志里留一条便于现场判断。
+                Log.w(TAG, "私有屏建不出来，退回 public（可能被系统浮层覆盖）", t2);
+                int pub = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
+                        | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
+                try {
+                    vd = dm.createVirtualDisplay("PipDesk-" + index, w, h, density(), surface, pub | FLAG_TRUSTED);
+                } catch (Throwable t3) {
+                    try {
+                        vd = dm.createVirtualDisplay("PipDesk-" + index, w, h, density(), surface, pub);
+                    } catch (Throwable t4) {
+                        Log.w(TAG, "createVirtualDisplay 失败", t4);
+                        vd = null;
+                    }
+                }
             }
         }
         // 虚拟屏已持有 producer 引用，本地 Surface 可以立即释放
@@ -919,19 +939,44 @@ public class PipPane {
         }, 1200);
     }
 
-    /** 把应用 task 弄到本面板的虚拟屏：搬 task 优先；搬不动就移除后重新拉起 */
+    /**
+     * 把应用 task 弄到本面板的虚拟屏。
+     *
+     * ★ 这里**绝对不允许**跨屏搬 task（move-stack / moveTaskToDisplay）。
+     *
+     * 车机日志实证（18:23:55~56，同一块屏连续 4 次）：
+     *   PipDesk: moveTask(shell move-stack) 1779 -> display 58
+     *   wm_on_destroy_called  com.tw.bt/.ATBluetoothActivity performDestroy
+     *   wm_on_create_called   com.tw.bt/.ATBluetoothActivity performCreate
+     *   Focused display #58 does not have a focused window
+     *   wm_pause_activity / wm_add_to_stopping ... makeInvisible
+     *
+     * 因为主屏（1920x1200）和虚拟屏（629x1045 / 1259x1045）的尺寸与 DPI 不同，
+     * 跨屏 reparent 在 AMS 眼里就是一次配置变更 → **activity 销毁重建**。
+     * 重建期间目标屏上一个可聚焦窗口都没有，DisplayContent 的
+     * adjustFocusToNextFocusableTask 会把焦点交还 display 0 的 home，
+     * 顺手把刚搬过去那个 activity pause 掉、makeInvisible —— 虚拟屏只剩最后一帧。
+     * 巡检看到"停帧"再搬一次，就是用户看到的"卡死 → 自己重启 → 又卡死"死循环。
+     *
+     * 所以改成：**删掉老 task，让新 task 直接长在目标屏上**。
+     * removeTask 只销毁 activity，进程和常驻 service 都还在（蓝牙放歌不受影响），
+     * 之后 launchOn 带 launchDisplayId 会把 task 建在本屏，全程没有 reparent。
+     */
     private void forceToDisplay(final String targetPkg, final int display) {
         new Thread(() -> {
-            int tid = findTaskId(targetPkg);
-            if (tid >= 0 && moveTask(tid, display)) return;
-            // 这台 ROM 的 moveTaskToDisplay 反射不通（或 task 又变了）：
-            // 移除 task 后重新拉起 —— 新 task 会直接建在本面板的虚拟屏上
-            Log.i(TAG, "moveTask 搬不动，移除 task 后重新拉起 (" + targetPkg + ")");
-            if (tid >= 0) removeTask(tid);
+            final int tid = findTaskId(targetPkg);
+            if (tid >= 0) {
+                boolean ok = removeTask(tid);
+                Log.i(TAG, "重建到本屏：移除旧 task " + tid + "(" + targetPkg + ") ok=" + ok);
+            }
             main.postDelayed(() -> {
-                if (targetPkg.equals(pkg) && displayId >= 0) launchOn(targetPkg, displayId);
-            }, 300);
-        }, "pipdesk-forcedisp").start();
+                if (!targetPkg.equals(pkg) || displayId != display) return;
+                Log.i(TAG, "重建到本屏：在 display " + display + " 新建 task " + targetPkg);
+                livePkg = targetPkg;
+                launchOn(targetPkg, display);
+                showContentAfter(450);
+            }, 260);
+        }, "pipdesk-rebuild").start();
     }
 
     /**
@@ -967,8 +1012,15 @@ public class PipPane {
 
     // ------------------------------------------------- 被系统 stop 后自愈
 
-    /** 两次自愈之间的最小间隔：别跟系统的 relaunch 撞车 */
-    private static final long REVIVE_GAP_MS = 3_000L;
+    /**
+     * 两次自愈之间的最小间隔。
+     *
+     * 原来 3 秒是怕跟系统的 relaunch 撞车；但现场实测撞车并不会发生，反而是
+     * 3 秒的节流让「task 被拽走 → 搬回来」这一段空窗长得用户能看见冻帧。
+     * 现在搬回动作改成"搬 + 立刻 resume"（幂等、几百毫秒），节流压到 700ms：
+     * 播放状态一变，两三次巡检内就能把画面接回来。
+     */
+    private static final long REVIVE_GAP_MS = 700L;
     private volatile long lastReviveAt;
 
     /**
@@ -977,9 +1029,9 @@ public class PipPane {
      * 每次 launchOn 都是一次新的 startActivity，会在 WindowManager 里再触发一次
      * 焦点重算（现场就是 `setFocusedApp = null`）。几块屏各自复活 = 每几秒搅一次
      * 全局焦点，刚被拉回来的屏很可能又被另一块屏的复活挤掉 —— 表现就是
-     * "越点越死、几块屏轮流黑"。同一时刻只救一块。
+     * "越点越死、几块屏轮流黑"。同一时刻只救一块，间隔也跟着压到 700ms。
      */
-    private static final long REVIVE_GLOBAL_GAP_MS = 2_500L;
+    private static final long REVIVE_GLOBAL_GAP_MS = 700L;
     private static volatile long lastReviveGlobal;
 
     /**
@@ -1075,12 +1127,15 @@ public class PipPane {
                 lastReviveGlobal = now;
                 lastReviveAt = now;
                 Log.w(TAG, "自愈：pane " + index + " " + keep
-                        + " 在本屏但 numRunning=0（activity 被系统 stop），拉回前台");
-                FileLog.append("REVIVE pane=" + index + " pkg=" + keep + " numRunning=0"
+                        + " 在本屏但 activity 被系统 stop，删 task 重建");
+                FileLog.append("REVIVE pane=" + index + " pkg=" + keep + " stopped"
                         + " frames=" + frames + " @ " + FileLog.nowStamp());
                 livePkg = keep;
-                launchOn(keep, displayId);
-                ensureOnDisplay(keep, displayId);
+                // 用 forceToDisplay（删 task + 新建）而不是 launchOn：
+                // 对已经存在、已被 stop 的 task，startActivity 只会走
+                // START_DELIVERED_TO_TOP —— 把 task 顶到前台但不 resume，
+                // 于是"救了等于没救"，还要再等 3 秒才升级到杀进程。
+                forceToDisplay(keep, displayId);
                 showContentAfter(600);
                 // 复活必须验证：startActivity 打进去不等于画面动起来。
                 // 3 秒还没有新帧，说明这 task/进程已经被系统判死 → 杀进程重开，
@@ -1659,8 +1714,14 @@ public class PipPane {
                 main.post(this::resetAfterExternalClose);
                 return;
             }
-            moveTask(tid, displayId);
-            Log.i(TAG, "全屏返回：" + p0 + " task " + tid + " 搬回 display " + displayId);
+            // 同样不跨屏搬：跨屏 reparent = 配置变更 = activity 销毁重建，
+            // 重建期间本屏没有可聚焦窗口，焦点会被交还 display 0，画面永久停在最后一帧。
+            // 删掉主屏上的 task，让它在虚拟屏上重建。
+            Log.i(TAG, "全屏返回：" + p0 + " task " + tid + " 从主屏重建到 display " + displayId);
+            final int disp = displayId;
+            main.post(() -> {
+                if (p0.equals(pkg)) forceToDisplay(p0, disp);
+            });
         }, "pipdesk-bringback").start();
     }
 

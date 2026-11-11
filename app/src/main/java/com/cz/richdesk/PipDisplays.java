@@ -38,6 +38,12 @@ final class PipDisplays {
     static final class Slot {
         VirtualDisplay vd;
         int w, h, dpi;
+        /**
+         * 当前交给虚拟屏的 Surface。**必须由我们持有强引用**：
+         * 一旦本地 Surface 被 release，虚拟屏那头的输出队列就可能变成悬垂 producer，
+         * SurfaceFlinger 往队列里投帧投不进去，画面就会定格在最后一帧（正是卡死的样子）。
+         */
+        Surface surface;
     }
 
     private static final HashMap<String, Slot> SLOTS = new HashMap<>();
@@ -71,9 +77,16 @@ final class PipDisplays {
         Surface surface = new Surface(st);
         try {
             s.vd.setSurface(surface);
-        } finally {
-            // 虚拟屏已持有 producer 引用，本地包装可以放掉
+        } catch (Throwable t) {
             try { surface.release(); } catch (Throwable ignored) { }
+            return;
+        }
+        // 新 surface 装上之后再放旧的：VD 全程都有一份我们持有的强引用，
+        // 不会出现"输出队列指向已释放 producer"导致整块屏不再出帧。
+        Surface old = s.surface;
+        s.surface = surface;
+        if (old != null && old != surface) {
+            try { old.release(); } catch (Throwable ignored) { }
         }
     }
 
@@ -84,14 +97,24 @@ final class PipDisplays {
         try {
             s.vd.setSurface(null);
         } catch (Throwable ignored) { }
+        if (s.surface != null) {
+            try { s.surface.release(); } catch (Throwable ignored) { }
+            s.surface = null;
+        }
     }
 
     /** 真正销毁一块屏（减屏数、强制重建时用）。注意：屏上的 task 会被系统丢回主屏 */
     static synchronized void release(String key) {
         Slot s = SLOTS.remove(key);
-        if (s == null || s.vd == null) return;
-        try { s.vd.setSurface(null); } catch (Throwable ignored) { }
-        try { s.vd.release(); } catch (Throwable ignored) { }
+        if (s == null) return;
+        if (s.vd != null) {
+            try { s.vd.setSurface(null); } catch (Throwable ignored) { }
+            try { s.vd.release(); } catch (Throwable ignored) { }
+        }
+        if (s.surface != null) {
+            try { s.surface.release(); } catch (Throwable ignored) { }
+            s.surface = null;
+        }
     }
 
     /** 屏数从 n 减到 keep：把多出来的槽位真释放掉 */

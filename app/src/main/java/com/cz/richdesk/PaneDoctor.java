@@ -61,6 +61,58 @@ public final class PaneDoctor {
         t.setDaemon(true);
         t.start();
         Log.i(TAG, "听诊器已启动：屏内应用 ANR 自动记录，必要时重启恢复");
+        watchPlayback();   // 事件驱动：播放状态一变就进快巡检（见 kick 的注释）
+    }
+
+    /**
+     * 盯「音频播放状态」。
+     *
+     * 现场两个必现路径（点蓝牙播放 / 手机首次连蓝牙后点「媒体」）本质是同一件事：
+     * 屏内应用被系统在 display 0 上重新拉起，task 从虚拟屏被拽走，虚拟屏只剩最后一帧。
+     * 从"播放状态变化"到虚拟屏变空只有几百毫秒，1 秒一轮的巡检 + 3 秒自愈节流
+     * 意味着用户已经盯着冻住的画面好几秒了。
+     *
+     * 所以这里挂 AudioManager 的播放回调：一旦有任何应用开始/停止播放（蓝牙 A2DP 也算），
+     * 立刻把巡检提速到 200ms 一档并持续 6 秒 —— 在任务被拽走的同一下把它搬回来。
+     */
+    private static void watchPlayback() {
+        try {
+            final android.media.AudioManager am = (android.media.AudioManager)
+                    app.getSystemService(Context.AUDIO_SERVICE);
+            if (am == null) return;
+            am.registerAudioPlaybackCallback(new android.media.AudioManager.AudioPlaybackCallback() {
+                @Override
+                public void onPlaybackConfigChanged(
+                        List<android.media.AudioPlaybackConfiguration> configs) {
+                    kick("音频播放状态变化");
+                }
+            }, main);
+            Log.i(TAG, "已监听音频播放状态（播放一变就快巡检）");
+        } catch (Throwable t) {
+            Log.w(TAG, "音频播放回调注册失败", t);
+        }
+    }
+
+    /** 快巡检窗口长度：播放状态变化后这 6 秒内按 200ms 一轮盯 */
+    private static final long FAST_WINDOW_MS = 6_000L;
+    private static final long FAST_PERIOD_MS = 200L;
+    private static final Object WAKE = new Object();
+    private static volatile long fastUntil;
+    private static volatile String fastWhy = "";
+
+    /** 立刻唤醒巡检线程并进入快巡检窗口 */
+    public static void kick(String why) {
+        long now = SystemClock.uptimeMillis();
+        if (now >= fastUntil) Log.i(TAG, "快巡检启动：" + why);
+        fastUntil = now + FAST_WINDOW_MS;
+        fastWhy = why;
+        synchronized (WAKE) {
+            WAKE.notifyAll();
+        }
+    }
+
+    static boolean fastMode() {
+        return SystemClock.uptimeMillis() < fastUntil;
     }
 
     /** Activity 销毁：断开引用 + 清掉统计状态，别把旧面板留在静态变量里 */
@@ -81,17 +133,23 @@ public final class PaneDoctor {
     private static void loop() {
         int tick = 0;
         while (true) {
+            // 平时 1s 一轮；收到"播放状态变化"后在 6 秒内按 200ms 一轮
+            long period = fastMode() ? FAST_PERIOD_MS : PERIOD_MS;
+            synchronized (WAKE) {
+                try {
+                    WAKE.wait(period);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
             try {
-                Thread.sleep(PERIOD_MS);
                 int n = ++tick;
                 PipManager p = pip;
-                if (p != null && p.count() > 0) checkStall(p);     // 每秒：只读 volatile 帧数，便宜
-                if (n % ANR_EVERY_N_TICKS == 0) tick();            // 每 8s：ANR 全校举扫描
-                // 每 32 个周期（约 32s）打一条帧心跳：卡死时对照时间轴，
+                if (p != null && p.count() > 0) checkStall(p);     // 每轮：只读 volatile 帧数，便宜
+                if (n % ANR_EVERY_N_TICKS == 0) tick();            // 每 8 拍：ANR 全校举扫描
+                // 每 32 个周期打一条帧心跳：卡死时对照时间轴，
                 // 就能看出"多块屏是同一时刻一起停帧"，还是各自陆续停的。
                 if (n % 32 == 0) heartbeat();
-            } catch (InterruptedException e) {
-                return;
             } catch (Throwable ignored) {
             }
         }
@@ -251,7 +309,8 @@ public final class PaneDoctor {
                 // 只判一次就正好错过后面才发生的 stop。
                 // 真正"拉回前台 / 重启"的频率由 PipPane 自己的闸门与升级策略控制。
                 Long lp = lastProbeAt.get(i);
-                if (lp == null || now - lp >= PROBE_GAP_MS) {
+                long gap = fastMode() ? FAST_PERIOD_MS : PROBE_GAP_MS;
+                if (lp == null || now - lp >= gap) {
                     lastProbeAt.put(i, now);
                     pane.probeAndRevive();
                 }
