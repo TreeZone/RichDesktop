@@ -50,11 +50,25 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
     /** 快捷方式格子的伪包名（下标 0 = 「桌面设置」，它没有伪包名，单独处理） */
     private static final String[] SHORTCUT_PKGS = {
             AppInfo.THEME_PKG, AppInfo.RESTART_PKG, AppInfo.BACK_PKG, AppInfo.HOME_PKG,
-            AppInfo.SLEEP_PKG, AppInfo.RECENTS_PKG, AppInfo.VOL_UP_PKG, AppInfo.VOL_DOWN_PKG};
+            AppInfo.APP_LIST_PKG, AppInfo.SLEEP_PKG, AppInfo.RECENTS_PKG,
+            AppInfo.VOL_UP_PKG, AppInfo.VOL_DOWN_PKG};
     private static final String[] SHORTCUT_LABELS = {
-            "深浅模式", "重启桌面", "返回", "主页", "息屏", "最近任务", "音量 +", "音量 -"};
+            "深浅模式", "重启桌面", "返回", "主页", "应用列表", "息屏", "最近任务",
+            "音量 +", "音量 -"};
+    /**
+     * 实际展示的快捷方式（去掉 {@link AppInfo#isHidden} 标记的）。
+     * SHORTCUT_PKGS 保留全量：老配置里可能还留着被隐藏的伪包名，
+     * 解析名字 / 图标时仍要认得出它，只是不再排进格子。
+     */
+    private static final String[] VISIBLE_SHORTCUT_PKGS = visibleShortcuts();
     /** 快捷方式一共几格（含「桌面设置」） */
-    private static final int SHORTCUT_COUNT = SHORTCUT_PKGS.length + 1;
+    private static final int SHORTCUT_COUNT = VISIBLE_SHORTCUT_PKGS.length + 1;
+
+    private static String[] visibleShortcuts() {
+        java.util.List<String> r = new java.util.ArrayList<>(SHORTCUT_PKGS.length);
+        for (String p : SHORTCUT_PKGS) if (!AppInfo.isHidden(p)) r.add(p);
+        return r.toArray(new String[0]);
+    }
 
     private List<AppInfo> data;
     private final Host host;
@@ -87,9 +101,30 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
 
     /** 宿主（MainActivity）在 setAdapter 前把持久化的顺序塞进来 */
     public void setShortcutOrder(List<String> order) {
-        if (order != null && order.size() == SHORTCUT_PKGS.length + 1) {
-            shortcutOrder = new ArrayList<>(order);
+        if (order == null) return;
+        List<String> cleaned = normalizeShortcutOrder(order);
+        if (cleaned.size() == SHORTCUT_COUNT) shortcutOrder = cleaned;
+    }
+
+    /**
+     * 老配置归一化：滤掉已隐藏的伪包名（音量 ±）、去掉重复、丢掉越界项，
+     * 缺口用还没排进去的内置快捷方式补齐 —— 保证结果恒为 SHORTCUT_COUNT 项。
+     */
+    private static List<String> normalizeShortcutOrder(List<String> raw) {
+        List<String> out = new ArrayList<>(SHORTCUT_COUNT);
+        out.add(AppInfo.SETTINGS_PKG);
+        for (String p : raw) {
+            if (p == null || AppInfo.isHidden(p)) continue;
+            if (AppInfo.SETTINGS_PKG.equals(p)) continue;   // 桌面设置固定占首格
+            if (out.contains(p)) continue;
+            if (out.size() >= SHORTCUT_COUNT) break;
+            out.add(p);
         }
+        for (String p : VISIBLE_SHORTCUT_PKGS) {
+            if (out.size() >= SHORTCUT_COUNT) break;
+            if (!out.contains(p)) out.add(p);
+        }
+        return out;
     }
 
     /**
@@ -101,18 +136,18 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         if (shortcutOrder == null || shortcutOrder.size() != SHORTCUT_COUNT) {
             shortcutOrder = new ArrayList<>(SHORTCUT_COUNT);
             shortcutOrder.add(AppInfo.SETTINGS_PKG);
-            for (String p : SHORTCUT_PKGS) shortcutOrder.add(p);
+            for (String p : VISIBLE_SHORTCUT_PKGS) shortcutOrder.add(p);
         }
         return shortcutOrder;
     }
 
-    /** slot（0..8）→ 伪包名：按可配置顺序取，配置缺失时退回固定顺序 */
+    /** slot（0..SHORTCUT_COUNT-1）→ 伪包名：按可配置顺序取，配置缺失时退回固定顺序 */
     private String shortcutPkgAt(int slot) {
         if (shortcutOrder != null && slot >= 0 && slot < shortcutOrder.size()) {
             return shortcutOrder.get(slot);
         }
         if (slot <= 0) return AppInfo.SETTINGS_PKG;
-        return SHORTCUT_PKGS[slot - 1];
+        return VISIBLE_SHORTCUT_PKGS[slot - 1];
     }
 
     /** 宿主在装载数据后把「已被换进快捷区的真实应用」塞进缓存，重载后图标才不丢 */
@@ -186,6 +221,7 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
         if (AppInfo.RESTART_PKG.equals(pkg)) return new RestartIcon();
         if (AppInfo.BACK_PKG.equals(pkg)) return new BackIcon();
         if (AppInfo.HOME_PKG.equals(pkg)) return new HomeIcon();
+        if (AppInfo.APP_LIST_PKG.equals(pkg)) return new AppListIcon();
         if (AppInfo.SLEEP_PKG.equals(pkg)) return new SleepIcon();
         if (AppInfo.RECENTS_PKG.equals(pkg)) return new RecentsIcon();
         if (AppInfo.VOL_UP_PKG.equals(pkg)) return new VolUpIcon();
@@ -194,16 +230,25 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
     }
 
     /**
-     * 五个内置快捷方式（桌面设置 / 深浅模式 / 重启桌面 / 返回 / 主页）。
+     * 内置快捷方式（桌面设置 / 深浅模式 / 重启桌面 / 返回 / 主页 / …），
+     * 已隐藏的（音量 ±）不出现。
      * 「选择应用」弹窗把它们排在最前面 —— 需求：Dock 也能绑这几个。
      */
     static List<AppInfo> shortcuts() {
-        List<AppInfo> r = new java.util.ArrayList<>(SHORTCUT_PKGS.length + 1);
+        List<AppInfo> r = new java.util.ArrayList<>(SHORTCUT_COUNT);
         r.add(new AppInfo(shortcutLabel(AppInfo.SETTINGS_PKG), AppInfo.SETTINGS_PKG,
                 new SettingsIcon()));
-        for (String pkg : SHORTCUT_PKGS) {
+        for (String pkg : VISIBLE_SHORTCUT_PKGS) {
             r.add(new AppInfo(shortcutLabel(pkg), pkg, shortcutIcon(pkg)));
         }
+        return r;
+    }
+
+    /** 快捷区永远会渲染的伪包名（桌面设置 + 全部可见内置快捷方式） */
+    static java.util.List<String> shortcutSlotPkgs() {
+        java.util.List<String> r = new java.util.ArrayList<>(SHORTCUT_COUNT);
+        r.add(AppInfo.SETTINGS_PKG);
+        for (String p : VISIBLE_SHORTCUT_PKGS) r.add(p);
         return r;
     }
 
@@ -960,6 +1005,29 @@ public class AppListAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder
             // 屋身
             cv.drawRoundRect(l + side * 0.30f, t + side * 0.48f,
                     l + side * 0.70f, t + side * 0.78f, side * 0.06f, side * 0.06f, p);
+        }
+    }
+
+    /** 「应用列表」：蓝色底板 + 3×3 九宫格（一眼看出是"全部应用"） */
+    static class AppListIcon extends ShortcutIcon {
+        @Override int[] plate() {
+            return Ui.dark ? new int[]{0xFF4C7FD0, 0xFF1A2C4A}
+                    : new int[]{0xFFDCE8FA, 0xFF9BB6E0};
+        }
+
+        @Override void glyph(Canvas cv, float l, float t, float side, Paint p) {
+            p.setColor(Ui.dark ? 0xFFEAF2FF : 0xFF1C3A63);
+            p.setStyle(Paint.Style.FILL);
+            float s = side * 0.155f;
+            float gap = side * 0.075f;
+            float x0 = l + side * 0.19f, y0 = t + side * 0.19f;
+            float r = side * 0.035f;
+            for (int row = 0; row < 3; row++) {
+                for (int col = 0; col < 3; col++) {
+                    float x = x0 + col * (s + gap), y = y0 + row * (s + gap);
+                    cv.drawRoundRect(x, y, x + s, y + s, r, r, p);
+                }
+            }
         }
     }
 

@@ -65,7 +65,8 @@
             android:exported="true"
             android:launchMode="singleTask"
             android:resizeableActivity="true"
-            android:theme="@style/Theme.PipDesk"
+            android:stateNotNeeded="true"
+            android:theme="@style/Theme.PipDesk.Launcher"
             android:windowSoftInputMode="adjustResize">
             <!-- HOME：装好后可在「设置 → 主屏幕 / 默认应用」里选它当桌面 -->
             <intent-filter>

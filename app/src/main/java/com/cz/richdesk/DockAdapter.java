@@ -36,6 +36,8 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
     private final Host host;
     private final int cornerDp;
     private int slotWidth;
+    /** Dock 竖排在左侧：格子沿垂直方向排，槽位尺寸作用在「高度」上 */
+    private boolean vertical;
     /** 图标大小（dp），设置里可调。Dock 高度由它反推（图标 + 24dp），不再单独设 */
     private int iconDp = 42;
     private ItemTouchHelper dragHelper;
@@ -50,6 +52,14 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
     public void setSlotWidth(int px) {
         if (px > 0 && px != slotWidth) {
             slotWidth = px;
+            notifyDataSetChanged();
+        }
+    }
+
+    /** 切换横/竖排：槽位尺寸从「宽度」换到「高度」，已复用的格子也要纠正 */
+    public void setVertical(boolean v) {
+        if (vertical != v) {
+            vertical = v;
             notifyDataSetChanged();
         }
     }
@@ -89,10 +99,11 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
     public VH onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
         FrameLayout cell = new FrameLayout(parent.getContext());
         int w = slotWidth > 0 ? slotWidth : Ui.dp(parent.getContext(), 60);
-        // 高度 MATCH_PARENT：跟 RecyclerView 内容区一样高，图标/加号靠 Gravity.CENTER
-        // 才是真正的垂直居中（固定 58dp 时内容区一旦更矮就会偏上）
-        cell.setLayoutParams(new RecyclerView.LayoutParams(w,
-                RecyclerView.LayoutParams.MATCH_PARENT));
+        // 横排：格宽固定、高度撑满；竖排（Dock 在左侧）：格高固定、宽度撑满。
+        // 两个维度都显式写，切换方向时复用旧 ViewHolder 也不会留着旧尺寸。
+        int cw = vertical ? RecyclerView.LayoutParams.MATCH_PARENT : w;
+        int ch = vertical ? w : RecyclerView.LayoutParams.MATCH_PARENT;
+        cell.setLayoutParams(new RecyclerView.LayoutParams(cw, ch));
         cell.setClipChildren(false);
 
         // Dock 图标同样套 iOS 风格遮罩，和应用列表外形统一
@@ -148,9 +159,14 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
         List<String> pkgs = host.dockPkgs();
         int w = slotWidth > 0 ? slotWidth : Ui.dp(vh.itemView.getContext(), 60);
         ViewGroup.LayoutParams lp = vh.itemView.getLayoutParams();
-        if (lp != null && lp.width != w) {
-            lp.width = w;
-            vh.itemView.setLayoutParams(lp);
+        if (lp != null) {
+            int cw = vertical ? RecyclerView.LayoutParams.MATCH_PARENT : w;
+            int ch = vertical ? w : RecyclerView.LayoutParams.MATCH_PARENT;
+            if (lp.width != cw || lp.height != ch) {
+                lp.width = cw;
+                lp.height = ch;
+                vh.itemView.setLayoutParams(lp);
+            }
         }
         int ic = iconPx(vh.itemView.getContext());
         ViewGroup.LayoutParams ilp = vh.ivIcon.getLayoutParams();
@@ -228,8 +244,12 @@ public class DockAdapter extends RecyclerView.Adapter<DockAdapter.VH> {
             public int getMovementFlags(@NonNull RecyclerView rvc, @NonNull RecyclerView.ViewHolder vh) {
                 int pos = vh.getBindingAdapterPosition();
                 if (pos < 0 || pos >= host.dockPkgs().size()) return makeMovementFlags(0, 0);
-                // rvDock 是水平 LayoutManager（视觉上被旋转成竖排，坐标仍是数据坐标）
-                return makeMovementFlags(ItemTouchHelper.LEFT | ItemTouchHelper.RIGHT, 0);
+                // Dock 竖排在左侧时格子沿垂直方向排，拖动换位必须走上下；
+                // 横排才用左右。之前固定 LEFT|RIGHT，竖排时只能横着甩、放不下去。
+                int drag = vertical
+                        ? (ItemTouchHelper.UP | ItemTouchHelper.DOWN)
+                        : (ItemTouchHelper.LEFT | ItemTouchHelper.RIGHT);
+                return makeMovementFlags(drag, 0);
             }
 
             @Override

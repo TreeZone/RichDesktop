@@ -19,6 +19,8 @@ public class AppInfo {
     public static final String BACK_PKG = "pipdesk://nav-back";
     /** 伪包名：主页（安卓主页键） */
     public static final String HOME_PKG = "pipdesk://nav-home";
+    /** 伪包名：应用列表（翻到应用页；已在应用页则翻回主页） */
+    public static final String APP_LIST_PKG = "pipdesk://app-list";
     /** 伪包名：息屏（PowerManager.goToSleep，双击屏幕可唤醒） */
     public static final String SLEEP_PKG = "pipdesk://sys-sleep";
     /** 伪包名：最近任务（KEYCODE_APP_SWITCH） */
@@ -30,6 +32,21 @@ public class AppInfo {
 
     /** 所有伪包名共用的前缀：凭它区分"桌面内置快捷方式"和真实应用 */
     public static final String SCHEME = "pipdesk://";
+
+    /**
+     * 暂时隐藏的内置快捷方式（不再出现在任何可选列表 / 快捷区 / 应用列表里）。
+     *
+     * 音量 ±：车机上方向盘走的是 Vehicle HAL / 功放 DSP 的独立通道，
+     * 我们只能调 Android 的 STREAM_MUSIC，两边数值根本不联动（见项目日志 11-11），
+     * 与其留两个按了没反应的按钮，先藏掉。代码路径保留，想恢复只需从这里删掉。
+     */
+    private static final java.util.Set<String> HIDDEN_PKGS =
+            new java.util.HashSet<>(java.util.Arrays.asList(VOL_UP_PKG, VOL_DOWN_PKG));
+
+    /** 这个内置快捷方式是否已隐藏 */
+    public static boolean isHidden(String pkg) {
+        return pkg != null && HIDDEN_PKGS.contains(pkg);
+    }
 
     public final String label;
     public final String pkg;

@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="blank_bg">#FF101014</color>
+    <!-- 开机启动窗口底色：首帧画完之前先盖住 SystemUI 的最近任务界面，
+         之后由 MainActivity 换回透明，恢复「透出系统壁纸」的桌面效果 -->
+    <color name="boot_bg">#FF14171C</color>
     <color name="dock_bg">#D9101014</color>
     <color name="dock_item_bg">#26FFFFFF</color>
     <!-- 画中画空闲态：玻璃（透出壁纸） -->

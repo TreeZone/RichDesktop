@@ -40,6 +40,13 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
 
     private static final String TAG = "PipDesk";
 
+    /** onCreate → 首帧的耗时（写进落盘日志）：车机不连 adb 也能看到开机到底慢在哪 */
+    private long bootT0;
+    /** 首帧后的重活只跑一次；recreate() 时重置 */
+    private boolean bootHeavyDone;
+    /** onCreate 代号：recreate() 后旧的首帧回调必须作废，别提前把重活跑了 */
+    private int bootGeneration;
+
     private SimplePager pager;
     private LinearLayout pageHome;
     private PaneBox paneBox;
@@ -100,6 +107,10 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     private float appliedRenderScale = -1f;
     private int appliedDockCorner = -1, appliedDockCount = -1, appliedIconSize = -1;
     private int appliedDockIcon = -1;
+    /** Dock 当前是否竖排在左侧（false = 底部横排）。布局、格宽、翻页判定都看它 */
+    private boolean dockVertical;
+    /** 两端面板是按哪个方向建的；换向时 LayoutParams 和可用宽高都得重算 */
+    private Boolean panelsBuiltVertical;
     private int appliedListColumns = -1;
     /** 当前已应用的性能模式：从设置页切回来只在这一项变化时重刷全部外观（默认低性能） */
     private boolean appliedPerfLow = true;
@@ -243,6 +254,16 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // 开机 / 重启桌面都重新计时：车机不连 adb，靠落盘日志看「首帧到底等多久」
+        bootT0 = android.os.SystemClock.uptimeMillis();
+        bootHeavyDone = false;
+        bootGeneration++;
+        // 启动底色只服务于「系统的 starting window」：它在桌面进程起来之前就画好，
+        // 负责盖住开机时的最近任务界面。真实窗口一创建就**一次性**换回透明，
+        // 之后绝不再动窗口背景。0.17.12 把这一步放在首帧回调里，赶上 Activity
+        // 反复重建就变成「深色 ↔ 透明」来回切 —— 用户看到的持续闪烁。
+        getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(
+                android.graphics.Color.TRANSPARENT));
         // 全局绘制开关必须早于任何 Ui.glass / Ui.clipRounded 调用
         Ui.syncPerfMode(this);
         instance = this;
@@ -271,8 +292,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             @Override public boolean allowSwipe(int fromPage, boolean toNext, float x, float y) {
                 if (fromPage == 0) {
                     if (!toNext) return false;   // 主页不能右滑（右边没有页）
-                    // 只允许从 Dock 区域起手：Dock 顶沿 = pager 高 - dockWrap 高
-                    return inDock(y);
+                    // 只允许从 Dock 区域起手：底部模式看 y，左侧模式看 x
+                    return inDock(x, y);
                 }
                 return !toNext;                  // 应用页：整页右滑回主页，左滑不翻
             }
@@ -280,12 +301,15 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             @Override public float strictness(float x, float y) {
                 // Dock 区：手指本来就贴在那儿点图标，稍微一碰就翻页太容易误触。
                 // 2.2 倍位移门槛 + 2.2 倍速度门槛，正常「甩一下」照样能翻。
-                return inDock(y) ? 2.2f : 1f;
+                return inDock(x, y) ? 2.2f : 1f;
             }
 
-            private boolean inDock(float y) {
-                return dockWrap != null && dockWrap.getHeight() > 0
-                        && y >= pager.getHeight() - dockWrap.getHeight();
+            private boolean inDock(float x, float y) {
+                if (dockWrap == null || dockWrap.getWidth() <= 0) return false;
+                // 左侧竖排：Dock 贴在左边缘，起手点 x 落在它的宽度内即可；
+                // 底部横排：Dock 顶沿 = pager 高 - dockWrap 高。
+                return dockVertical ? x <= dockWrap.getWidth()
+                        : y >= pager.getHeight() - dockWrap.getHeight();
             }
         });        FrameLayout root = new FrameLayout(this);
         root.addView(pager, new FrameLayout.LayoutParams(
@@ -413,22 +437,9 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             @Override public void onOpened(int index, String pkg) { }
             @Override public void onClosed(int index) { }
         });
-        pip.build(appliedPaneCount);
+        pip.build(appliedPaneCount);   // 首帧要看到画中画玻璃框，这一步必须同步
         bindPaneGestures();
         pip.setPaneLongClickListener(this::showPaneMenu);
-        pip.primeTouch();
-        // 屏内应用卡死（实测系统蓝牙 HMI 在虚拟屏上会整片冻住、触摸无响应）
-        // 是应用进程内部的问题，宿主侧救不回来，只能重启进程：
-        // 这里盯着 ANR 自动兜底，长按菜单还留了手动「重启这个应用」。
-        PaneDoctor.start(this, pip);
-        // 音频控制面探针：车机上"点蓝牙播放 → 三块屏一起冻住但音乐正常"，
-        // 直指 AudioService 在路由切换时被锁。probe 会把这个阻塞自动记进日志。
-        AudioProbe.start(this, pip);
-        // 资源心跳：每分钟一行（堆/PSS/线程/fd/Display 数/注入队列），
-        // 「跑一段时间变卡」时看这行数字是哪一个在涨就知道根因在哪。
-        PerfMon.start(this, pip);
-        PerfOverlay.apply(this, pip);       // 性能悬浮窗：按设置开关恢复显示
-        if (PerfOverlay.isShown()) UiJank.start();   // 桌面重建后重挂主线程抖动监测
         // 卡死时把各画中画的 display/尺寸/包名一起写进日志：能立刻看出是
         // "某块屏没建出来" 还是 "三块屏都正常但渲染卡住了"
         Watchdog.setProbe(() -> {
@@ -443,31 +454,109 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             b.append("page=").append(pager.getCurrentPage());
             return b.toString();
         });
-        openDefaults();            // 有默认应用的空闲屏：桌面一起来就自动拉起
-
-        dockPkgs.addAll(Prefs.getDock(this));
-        loadApps();
+        dockPkgs.addAll(Prefs.getDock(this));   // 首帧 Dock 就要有图标
+        // 新版「应用列表」按钮：升级后自动补一个到 Dock 末尾，装上就能看到。
+        // 只补一次（之后长按移除/拖动都不会被强行加回来）；Dock 满格时先把格数 +1，
+        // 绝不挤掉用户已有图标；格数已到上限才放弃，用户可在设置里腾位后手动加。
+        if (!Prefs.appListButtonAdded(this)
+                && !dockPkgs.contains(AppInfo.APP_LIST_PKG)) {
+            int count = Prefs.getDockCount(this);
+            boolean room = dockPkgs.size() < count;
+            if (!room && count < Prefs.DOCK_MAX) {
+                count++;
+                Prefs.setDockCount(this, count);
+                appliedDockCount = count;
+                room = true;
+            }
+            if (room) {
+                dockPkgs.add(AppInfo.APP_LIST_PKG);
+                Prefs.setDock(this, dockPkgs);
+                Prefs.setAppListButtonAdded(this);
+                if (dockAdapter != null) dockAdapter.notifyDataSetChanged();
+                if (rvDock != null) rvDock.post(this::applyDockSlots);
+                Log.i(TAG, "已自动补上「应用列表」按钮（Dock 格数=" + count + "）");
+            } else {
+                Log.i(TAG, "Dock 已满格，未自动补「应用列表」按钮");
+            }
+        }
 
         // 深浅色外观：先按手动/系统模式立即生效，壁纸亮度在后台精确算完后刷新
         Ui.updateAppearance(this);
         appliedDark = Ui.dark;
         // 壁纸亮度后台重算完成 → 主线程回这里比对并刷新（不再在主线程等解码）
         Ui.onWallpaperRechecked = this::refreshAppearanceIfChanged;
-        // 不是「跟随安卓」时，把结果反推给系统：开机后桌面和屏内应用保持一致
-        if (Prefs.getThemeMode(this) != Prefs.THEME_AUTO) {
-            syncSystemNightMode(Ui.dark);
-        }
+
+        // 其余全部推迟到首帧之后：调度放在 onResume（真正确认到前台之后），
+        // 见 runBootWork()。onCreate 越短，开机时桌面出现得越早。
+    }
+
+    /**
+     * 连等两帧再干重活。
+     *
+     * frameCallback 只可能发生在 onCreate / onResume 返回、主线程回到消息循环之后；
+     * 再等一帧，确保首帧 traversal 走完、画面已经提交，这时才启动常驻监控、
+     * 才去建虚拟屏拉默认应用。窗口底色不在这里动（见 onCreate）。
+     */
+    private void scheduleBootWork() {
+        final android.view.Choreographer ch = android.view.Choreographer.getInstance();
+        final int gen = bootGeneration;
+        ch.postFrameCallback(new android.view.Choreographer.FrameCallback() {
+            @Override public void doFrame(long frameTimeNanos) {
+                ch.postFrameCallback(t -> {
+                    if (gen == bootGeneration) runBootWork();
+                });
+            }
+        });
+    }
+
+    /** 首帧之后才做的事：这些活以前全塞在 onCreate 里，直接推迟了桌面出现的时间 */
+    private void runBootWork() {
+        // 不在前台就作废这次（不标记完成），等下次 onResume 重新调度。
+        // 0.17.12 没做这个检查，Activity 已 onStop 仍继续建虚拟屏，
+        // 每重建一次就多留两块虚拟屏 → 显示服务反复调刷新率 → 屏幕一直闪。
+        if (isFinishing() || isDestroyed() || !AppState.mainResumed) return;
+        if (bootHeavyDone) return;
+        bootHeavyDone = true;
+        final int gen = bootGeneration;
+
+        long ms = android.os.SystemClock.uptimeMillis() - bootT0;
+        Log.i(TAG, "BOOT onCreate→首帧 " + ms + "ms");
+        FileLog.append("BOOT onCreate→首帧 " + ms + "ms");
+
+        // 触摸注入服务预热会 fork app_process，跟首帧抢 CPU，挪到首帧后
+        if (pip != null) pip.primeTouch();
+
+        // 常驻监控 / 测试悬浮窗
+        PaneDoctor.start(this, pip);
+        AudioProbe.start(this, pip);
+        PerfMon.start(this, pip);
+        PerfOverlay.apply(this, pip);       // 性能悬浮窗：按设置开关恢复显示
+        if (PerfOverlay.isShown()) UiJank.start();   // 桌面重建后重挂主线程抖动监测
+
+        loadApps();                        // PackageManager 全量扫描 + 图标解码（内部走后台线程）
+
+        // 开机不再 syncSystemNightMode：改 uiMode 会触发全局配置变化，
+        // 把刚拉起的屏内应用销毁重建，还会连带重建桌面本身（闪烁放大器）。
+        // 用户在设置里改外观时本来就会同步，开机这一下纯属添乱。
         new Thread(() -> {
             SunTimes.refreshIfStale(getApplicationContext());   // 「跟随时间」需要日落/日出
             Ui.updateAppearance(getApplicationContext());
             runOnUiThread(this::refreshAppearance);
         }, "pipdesk-appearance").start();
-        // 应用名的黑白，按「壁纸那一块的实际颜色」定；壁纸缩略图后台取一次，
-        // 取到后刷一遍界面（没取到时先按外观模式兜底）
+        // 应用名的黑白，按「壁纸那一块的实际颜色」定；壁纸缩略图后台取一次
         WallTint.setOnReady(this::refreshAppearance);
         WallTint.load(this);
         registerWallpaperWatcher();
         registerThemeTicker();
+
+        // 默认应用是启动最重的一步：建虚拟屏 + 跨进程拉起应用。
+        // 必须确认桌面还在前台、且这次启动没被重建取代，否则宁可不拉 ——
+        // 后台建出来的虚拟屏没人回收，是 displays=5/面板=2 的来源。
+        dockHandler.postDelayed(() -> {
+            if (!isDestroyed() && gen == bootGeneration && AppState.mainResumed) {
+                openDefaults();
+            }
+        }, 400);
     }
 
     /**
@@ -616,12 +705,14 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                     }
                 });
         rvDock.setOnTouchListener((v, e) -> {
-            // 只有在应用栏真的「放不下」、必须自己横向滚动时才拦截翻页手势。
-            // 判断用「可滚距离 > 12dp」而不是 canScrollHorizontally：后者常常因为
+            // 只有在应用栏真的「放不下」、必须自己滚动时才拦截翻页手势。
+            // 判断用「可滚距离 > 12dp」而不是 canScrollXXX：后者常常因为
             // 一两个像素的取整余量就返回 true，结果在应用栏上横滑永远翻不到应用列表页。
             if (e.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                int range = rvDock.computeHorizontalScrollRange();
-                int extent = rvDock.computeHorizontalScrollExtent();
+                int range = dockVertical ? rvDock.computeVerticalScrollRange()
+                        : rvDock.computeHorizontalScrollRange();
+                int extent = dockVertical ? rvDock.computeVerticalScrollExtent()
+                        : rvDock.computeHorizontalScrollExtent();
                 if (range - extent > Ui.dp(this, 12)) {
                     v.getParent().requestDisallowInterceptTouchEvent(true);
                 }
@@ -660,10 +751,109 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         dockAdapter.setIconDp(Prefs.getDockIcon(this));
         rvDock.setAdapter(dockAdapter);
         dockAdapter.attachDragHelper(rvDock);   // 长按拖动排序（原地松手仍是菜单）
+        // 按配置切「底部横排 / 左侧竖排」：必须在 refreshDockPanels 之前，
+        // 功能区子 View 的 LayoutParams 要按 dockVertical 来建。
+        applyDockSide(Prefs.dockOnLeft(this));
         refreshDockPanels();                     // 左右功能区按配置显示
         rvDock.post(this::applyDockSlots);
         dockWrap.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> applyDockSlots());
+        // rvDock 量完才拿到真实可用长度：首帧它还是旧方向的尺寸，而 dockWrap
+        // 自身尺寸没变、不会再回调，必须单独听 rvDock 的排列轴变化（仅竖排）。
+        rvDock.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            if (!dockVertical) return;
+            if (b - t != ob - ot) applyDockSlots();
+        });
         return pageHome;
+    }
+
+    /**
+     * Dock 位置切换：底部横排 ↔ 左侧竖排。
+     *
+     * 只改 orientation / LayoutParams / LayoutManager，不重建 View —— 重建会销毁
+     * PaneBox 里的 TextureView，虚拟屏跟着整屏重启（画中画会闪，屏内应用还会被
+     * 搬回主屏）。重排时只 detach/attach dockWrap，paneBox 始终保持挂着。
+     */
+    private void applyDockSide(boolean left) {
+        dockVertical = left;
+        if (pageHome == null || paneBox == null || dockWrap == null || dockRow == null
+                || rvDock == null || dockLeftBox == null || dockRightBox == null) return;
+
+        // 主页：底部模式 = 上画中画 / 下 Dock；左侧模式 = 左 Dock / 右画中画。
+        // HORIZONTAL 时子 View 按添加顺序从左到右，所以左侧模式要把 dockWrap 挪到第一位。
+        pageHome.setOrientation(left ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
+        int idx = pageHome.indexOfChild(dockWrap);
+        if (left && idx > 0) {
+            pageHome.removeView(dockWrap);
+            pageHome.addView(dockWrap, 0);
+        } else if (!left && idx == 0) {
+            pageHome.removeView(dockWrap);
+            pageHome.addView(dockWrap);
+        }
+        paneBox.setLayoutParams(new LinearLayout.LayoutParams(
+                left ? 0 : ViewGroup.LayoutParams.MATCH_PARENT,
+                left ? ViewGroup.LayoutParams.MATCH_PARENT : 0, 1f));
+        int thickness = Ui.dp(this, effectiveDockHeight()) + paneGapPx();
+        dockWrap.setLayoutParams(new LinearLayout.LayoutParams(
+                left ? thickness : ViewGroup.LayoutParams.MATCH_PARENT,
+                left ? ViewGroup.LayoutParams.MATCH_PARENT : thickness));
+        // 间距永远留在「朝向画中画」的那一侧：底部模式在上沿，左侧模式在右沿
+        dockWrap.setPadding(0, left ? 0 : paneGapPx(), left ? paneGapPx() : 0, 0);
+
+        dockRow.setOrientation(left ? LinearLayout.VERTICAL : LinearLayout.HORIZONTAL);
+        dockRow.setGravity(left ? Gravity.CENTER_HORIZONTAL : Gravity.CENTER_VERTICAL);
+
+        dockLeftBox.setOrientation(left ? LinearLayout.VERTICAL : LinearLayout.HORIZONTAL);
+        dockRightBox.setOrientation(left ? LinearLayout.VERTICAL : LinearLayout.HORIZONTAL);
+        dockLeftBox.setGravity(left ? Gravity.CENTER_HORIZONTAL : Gravity.CENTER_VERTICAL);
+        dockRightBox.setGravity(left ? Gravity.CENTER_HORIZONTAL : Gravity.CENTER_VERTICAL);
+        dockLeftBox.setLayoutParams(dockSideChildParams(left));
+        dockRightBox.setLayoutParams(dockSideChildParams(left));
+
+        int div = Math.max(1, Ui.dp(this, 2));
+        int inset = Ui.dp(this, 6);
+        dockLeftDiv.setLayoutParams(dividerParams(left, div, inset));
+        dockRightDiv.setLayoutParams(dividerParams(left, div, inset));
+
+        rvDock.setLayoutParams(new LinearLayout.LayoutParams(
+                left ? ViewGroup.LayoutParams.MATCH_PARENT : 0,
+                left ? 0 : ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+        rvDock.setLayoutManager(new LinearLayoutManager(this,
+                left ? LinearLayoutManager.VERTICAL : LinearLayoutManager.HORIZONTAL, false));
+        if (dockAdapter != null) dockAdapter.setVertical(left);
+        // 换向之后格宽是按另一条轴算的，数值可能与换向前完全相同。
+        // 清掉 applyDockSlots 的去重缓存，否则它会 early-return，
+        // rvDock 的留白仍留在旧方向（左右 padding 而不是上下）。
+        appliedPitch = -1;
+        appliedSlotCount = -1;
+        appliedSlotWidth = -1;
+        appliedSlotCells = -1;
+        appliedSidePad = -1;
+        applyDockHeight();
+        // 面板子 View 的 LayoutParams 是按方向建的（竖排 col 宽撑满、高 = 格数×格宽）。
+        // 换向不重建的话它仍带着旧方向的尺寸，字号也会按旧宽度算 → 文字被裁。
+        if (panelsBuiltVertical == null || panelsBuiltVertical.booleanValue() != left) {
+            buildDockPanel(dockLeftBox, true);
+            buildDockPanel(dockRightBox, false);
+            updateDockRealtime();
+        }
+        rvDock.post(this::applyDockSlots);
+    }
+
+    /** 两端功能区在 Dock 里的占位：横排占满高度、宽度自适应；竖排反之 */
+    private LinearLayout.LayoutParams dockSideChildParams(boolean left) {
+        return new LinearLayout.LayoutParams(
+                left ? ViewGroup.LayoutParams.MATCH_PARENT : ViewGroup.LayoutParams.WRAP_CONTENT,
+                left ? ViewGroup.LayoutParams.WRAP_CONTENT : ViewGroup.LayoutParams.MATCH_PARENT);
+    }
+
+    /** 分隔线：横排是竖线（2dp 宽 + 上下留白），竖排是横线（2dp 高 + 左右留白） */
+    private LinearLayout.LayoutParams dividerParams(boolean left, int div, int inset) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                left ? ViewGroup.LayoutParams.MATCH_PARENT : div,
+                left ? div : ViewGroup.LayoutParams.MATCH_PARENT);
+        if (left) { lp.leftMargin = inset; lp.rightMargin = inset; }
+        else { lp.topMargin = inset; lp.bottomMargin = inset; }
+        return lp;
     }
 
     private View buildAppListPage() {
@@ -763,7 +953,16 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         if (dockWrap != null) {
             ViewGroup.LayoutParams lp = dockWrap.getLayoutParams();
             if (lp instanceof LinearLayout.LayoutParams) {
-                ((LinearLayout.LayoutParams) lp).height = Ui.dp(this, h) + paneGapPx();
+                int thickness = Ui.dp(this, h) + paneGapPx();
+                // 竖排时「Dock 高度」这个配置值其实是 Dock 的宽度；
+                // 两个维度都写全，切换方向后不会留下另一个方向的旧尺寸。
+                if (dockVertical) {
+                    lp.width = thickness;
+                    lp.height = ViewGroup.LayoutParams.MATCH_PARENT;
+                } else {
+                    lp.width = ViewGroup.LayoutParams.MATCH_PARENT;
+                    lp.height = thickness;
+                }
                 dockWrap.setLayoutParams(lp);
             }
         }
@@ -866,8 +1065,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     private void buildDockPanel(LinearLayout box, boolean left) {
         if (box == null) return;
         box.removeAllViews();
-        if (left) { dockClockL = null; dockWeatherL = null; dockGapL = null; dockPanelAvailWL = 0; }
-        else { dockClock = null; dockWeather = null; dockGap = null; dockPanelAvailW = 0; }
+        panelsBuiltVertical = dockVertical;   // 面板按当前方向建，换向时由 applyDockSide 重建
+        if (left) { dockClockL = null; dockWeatherL = null; dockGapL = null;
+                    dockDateL = null; dockPanelAvailWL = 0; }
+        else { dockClock = null; dockWeather = null; dockGap = null;
+               dockDate = null; dockPanelAvailW = 0; }
         if (!(left ? Prefs.dockLeftEnabled(this) : Prefs.dockRightEnabled(this))) return;
         int type = left ? Prefs.getDockLeftType(this) : Prefs.getDockRightType(this);
         if (type == Prefs.PANEL_CLOCK) buildClockPanel(box, left);
@@ -905,8 +1107,9 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         if (pkgs.isEmpty()) {
             // 一个图标都没有：留一格透明的长按区当作「添加」入口
             View blank = new View(this);
-            blank.setLayoutParams(new LinearLayout.LayoutParams(
-                    pitch, ViewGroup.LayoutParams.MATCH_PARENT));
+            blank.setLayoutParams(dockVertical
+                    ? new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, pitch)
+                    : new LinearLayout.LayoutParams(pitch, ViewGroup.LayoutParams.MATCH_PARENT));
             blank.setOnLongClickListener(v -> {
                 pickPanelApp(left);
                 return true;
@@ -944,7 +1147,9 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     /** 一个快捷图标：固定格宽、图标居中（图标之间的间距由格宽决定，与中间图标区一致） */
     private View shortcutIcon(final String pkg, final boolean left, int ic, int pitch) {
         FrameLayout box = new FrameLayout(this);
-        box.setLayoutParams(new LinearLayout.LayoutParams(pitch, ViewGroup.LayoutParams.MATCH_PARENT));
+        box.setLayoutParams(dockVertical
+                ? new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, pitch)
+                : new LinearLayout.LayoutParams(pitch, ViewGroup.LayoutParams.MATCH_PARENT));
         // 全局关闭震感：必须在构建时就关（放到长按监听里第一下震动已经出去了）
         box.setHapticFeedbackEnabled(false);
         android.widget.ImageView iv = new MaskedIconView(this);
@@ -1033,11 +1238,12 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         if (panelDragIndex < 0) return false;   // 非拖动态：交给点击/长按
         switch (e.getActionMasked()) {
             case android.view.MotionEvent.ACTION_DOWN:
-                panelDragStartRawX = e.getRawX();
+                // 竖排 Dock 沿 Y 轴拖，横排沿 X 轴；这个字段存「沿排列方向的起点」
+                panelDragStartRawX = dragAxis(e);
                 return false;
             case android.view.MotionEvent.ACTION_MOVE: {
-                if (panelDragStartRawX < 0) panelDragStartRawX = e.getRawX();
-                float dx = e.getRawX() - panelDragStartRawX;
+                if (panelDragStartRawX < 0) panelDragStartRawX = dragAxis(e);
+                float dx = dragAxis(e) - panelDragStartRawX;
                 // 8dp：手指按着不动时的轻微抖动不算「拖动」
                 boolean movedNow = Math.abs(dx) > Ui.dp(this, 8);
                 if (movedNow) {
@@ -1051,7 +1257,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 // 被拖的图标不能移出面板：把跟手位移夹在首尾格之间
                 float shown = Math.max((0 - panelDragIndex) * (float) pitch,
                         Math.min((n - 1 - panelDragIndex) * (float) pitch, dx));
-                v.setTranslationX(shown);
+                if (dockVertical) v.setTranslationY(shown);
+                else v.setTranslationX(shown);
                 int target = Math.max(0, Math.min(n - 1,
                         panelDragIndex + Math.round(dx / (float) pitch)));
                 if (target != panelDragCur) {
@@ -1070,6 +1277,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         return true;
     }
 
+    /** 拖动沿排列方向的坐标：竖排 Dock 取 Y，横排取 X */
+    private float dragAxis(android.view.MotionEvent e) {
+        return dockVertical ? e.getRawY() : e.getRawX();
+    }
+
     /** 按当前顺序重算每个格子的位移：位移 =（现在的位置 − 原始位置）× 格宽 */
     private void layoutPanelCells(int pitch) {
         if (panelDragOrigin == null || panelDragList == null) return;
@@ -1078,7 +1290,10 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             if (c == panelDragView) continue;   // 被拖的那个跟着手指走
             int now = panelDragList.indexOf(panelDragOrigin.get(i));
             if (now < 0) continue;
-            c.setTranslationX((now - i) * (float) pitch);
+            float delta = (now - i) * (float) pitch;
+            // 竖排沿 Y 让位，横排沿 X；另一轴清 0，换向拖动后不留残影
+            if (dockVertical) { c.setTranslationX(0); c.setTranslationY(delta); }
+            else { c.setTranslationY(0); c.setTranslationX(delta); }
         }
     }
 
@@ -1095,11 +1310,12 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         boolean reordered = panelDragOrigin != null && !panelDragOrigin.equals(l);
         if (cell != null) {
             cell.setTranslationX(0);
+            cell.setTranslationY(0);
             cell.animate().scaleX(1f).scaleY(1f).setDuration(120).start();
             cell.setElevation(0);
             if (cell.getParent() != null) cell.getParent().requestDisallowInterceptTouchEvent(false);
         }
-        for (View c : panelDragCells) c.setTranslationX(0);   // 其余格子的位移动画一并不留
+        for (View c : panelDragCells) { c.setTranslationX(0); c.setTranslationY(0); }
         panelDragIndex = panelDragCur = -1;
         panelDragView = null;
         panelDragCells.clear();
@@ -1132,7 +1348,8 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             return;
         }
         pickerDialog = new AppPickerSheet(this,
-                (left ? "左侧" : "右侧") + "功能区 · 图标（已放 "
+                (left ? "左" : "右") + (dockVertical ? (left ? "（上）" : "（下）") : "")
+                        + "端功能区 · 图标（已放 "
                         + panelIcons(left).size() + " 个）",
                 AppListAdapter.shortcuts(), Prefs.getListColumns(this), Prefs.getIconSize(this),
                 ai -> {
@@ -1150,12 +1367,13 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     }
 
     /**
-     * 时间 + 天气：竖排两行（左右两侧可以各有一套）。
+     * 时间 + 天气（左右两侧可以各有一套）。
      *
-     * 需求后的版式：
-     *   第一行  2026-11-10 · 晴 12°   （日期和天气合并一行，灰色小字）
-     *   第二行  11:07:18              （当前时间，18sp 加粗，视觉主体）
-     * 建的时候就把文字填上 —— 面板可能被 applyDockSlots 重建，空 TextView 会把宽度塌成一条。
+     * 横排 Dock：两行 ——「2026-11-10 · 晴 12°」/「11:07:18」。
+     * 竖排 Dock：两行 ——「小时:分」/「天气」。窄条里年月日横着放不下，
+     *   三行又把每行的高度配额压得太小，所以竖排直接省掉日期（用户定的简化版），
+     *   秒也去掉（窄 Dock 宽度不够；每分钟一跳足够）。
+     * 建的时候就把文字填上 —— 面板可能被 applyDockSlots 重建，空 TextView 会塌成一条。
      */
     private void buildClockPanel(LinearLayout box, boolean left) {
         LinearLayout col = new LinearLayout(this);
@@ -1202,26 +1420,45 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         java.util.Calendar cal = java.util.Calendar.getInstance();
         date.setText(dateLabel(cal));
         weather.setText(Weather.dockLabel(this));
-        clock.setText(timeLabel(cal));
+        clock.setText(dockVertical ? timeLabelShort(cal) : timeLabel(cal));
 
-        top.addView(date);
-        top.addView(gap);
-        top.addView(weather);
-        col.addView(top);
-        col.addView(clock);
-        // 面板宽度 = 占的格数 × 统一格宽（时间天气最少 2 格），内容居中
+        if (dockVertical) {
+            // 时间 / 天气两行。date 仍然建出来（updateDockClock 会写它），
+            // 但不挂进竖排面板 —— 窄条放不下年月日，挂进去只会把另外两行挤裁。
+            col.addView(clock);
+            col.addView(weather);
+        } else {
+            top.addView(date);
+            top.addView(gap);
+            top.addView(weather);
+            col.addView(top);
+            col.addView(clock);
+        }
+        // 横排：面板宽度 = 格数 × 格宽（时间天气最少 2 格），高度撑满 Dock。
+        // 竖排：宽度撑满 Dock 厚度；高度不再按「格数 × 格宽」给 —— 两行字占两格
+        //   会在下面空出一大截（用户报的「时间占的位置太高」），改成按两行文字
+        //   行高算的紧凑固定值，跟 pitch 解耦（pitch 会随布局/屏数变化而飘）。
         int w = panelCellCount(left) * dockPitchPx();
-        col.setLayoutParams(new LinearLayout.LayoutParams(w, ViewGroup.LayoutParams.MATCH_PARENT));
-        int padH = Ui.dp(this, 4);
+        col.setLayoutParams(dockVertical
+                ? new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                        clockColumnHeightPx())
+                : new LinearLayout.LayoutParams(w, ViewGroup.LayoutParams.MATCH_PARENT));
+        int padH = Ui.dp(this, dockVertical ? 2 : 4);
         col.setPadding(padH, 0, padH, 0);
-        // 面板高度变化（改 Dock 图标大小 → Dock 变高/变矮）后重新收敛字号：
-        // 构建时 box.getHeight() 还是旧值，只能等这次布局完成再按新高度调一次
+        // 布局尺寸变了就重算字号：竖排时约束轴是 Dock 厚度（宽度），横排时是
+        // Dock 高度，两个方向都监听才不会在换向 / 改图标大小后留着旧字号。
         col.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or2, ob) -> {
-            if (b - t != ob - ot) refitClockRow(left);
+            if (r - l != or2 - ol || b - t != ob - ot) refitClockRow(left);
         });
+        // 首帧 build 时 col 还没量过，宽高都是 0；等这一轮布局走完再用实测值算一次
+        col.post(() -> refitClockRow(left));
         box.addView(col);
-        // 字号自适应：竖屏时格宽窄，按可用宽度把两行字号缩到「尽量大且完整」
-        int avail = w - 2 * padH;
+        // 字号自适应：横排按「面板占的宽」收敛；竖排时面板是上下占 w、左右撑满
+        // Dock 宽度，这里只是布局前的兜底值，真正计算以 refitClockColumn 里的
+        // col 实测宽高为准（竖排 = 宽度换到 Dock 厚度、高度换成紧凑固定值）。
+        int avail = dockVertical
+                ? Math.max(Ui.dp(this, 40), Ui.dp(this, effectiveDockHeight()) - Ui.dp(this, 16))
+                : w - 2 * padH;
         if (left) { dockDateL = date; dockClockL = clock; dockWeatherL = weather;
                     dockGapL = gap; dockPanelAvailWL = avail; }
         else { dockDate = date; dockClock = clock; dockWeather = weather;
@@ -1230,12 +1467,10 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
     }
 
     /**
-     * Dock 时间面板两行字号自适应：宽度、高度**双向**取「能显示完整」的最大字号。
-     * 第一行 = 日期 · 天气（13sp 起，最低 8sp）；第二行 = 时分秒（24sp 起，最大 30sp，最低 9sp）。
-     * 宽度：在 availPx 里量出两行文本需要的宽，超了就按比例缩。
-     * 高度：两行的行高加起来不能超过面板实际高度 —— Dock 图标改小后 Dock 变矮，
-     * 只按宽度放大会把字裁掉（用户报的「时间日期显示不全」就是这个）。
-     * 天气文案变化后要再调一次（updateDockRealtime）。
+     * Dock 时间面板字号自适应：宽度、高度**双向**取「能显示完整」的最大字号。
+     * 横排：第一行 = 日期 · 天气（13sp 起），第二行 = 时分秒（24sp 起）。
+     * 竖排：换成 col 的实测宽（Dock 厚度）× 实测高（格数×格宽）重新收敛两行，
+     *   见 refitClockColumn —— 横排那套「按面板宽度 + box 高度」在竖排下轴是反的。
      */
     private void refitClockRow(boolean left) {
         int avail = left ? dockPanelAvailWL : dockPanelAvailW;
@@ -1243,7 +1478,12 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         TextView g = left ? dockGapL : dockGap;
         TextView w = left ? dockWeatherL : dockWeather;
         TextView c = left ? dockClockL : dockClock;
-        if (avail <= 0 || d == null || w == null || c == null) return;
+        if (avail <= 0 || w == null || c == null) return;
+        if (dockVertical) {
+            refitClockColumn(d, c, w, left, avail);
+            return;
+        }
+        if (d == null) return;
         float sd = getResources().getDisplayMetrics().scaledDensity;
 
         // 高度预算：面板实际高度（已布局用真实值；没布局按「图标 dp + Dock 上下 padding」估算）
@@ -1283,6 +1523,71 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         c.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, clockSp);
     }
 
+    /**
+     * 竖排 Dock 时间区的紧凑高度：两行 15sp 文字的行高 + 上下呼吸缝。
+     * 不用格宽算 —— 格宽随布局/屏数变化，会让时间区忽高忽低。
+     */
+    private int clockColumnHeightPx() {
+        float sd = getResources().getDisplayMetrics().scaledDensity;
+        int line = (int) (15f * sd * 1.4f);
+        return 2 * line + Ui.dp(this, 8);
+    }
+
+    /**
+     * 竖排 Dock 时间区字号自适应：只有「时间 / 天气」两行。
+     *
+     * 宽度、高度要跟横排**对调**：竖排下面板是「宽 = Dock 厚度、高 = 格数×格宽」，
+     * 所以宽度预算取 col 的实测宽（横排取的是面板占的宽 w），高度预算取 col 的实测高
+     * （横排取的是 box 的高度）。两行各分一半高度，字号同时受「宽度放得下」和
+     * 「行高配额放得下」约束取更小值；不再留 8sp/9sp 的硬下限 —— 窄条里宁可
+     * 字小一点，也保证整行完整显示，不会被裁掉。
+     */
+    private void refitClockColumn(TextView d, TextView c, TextView w,
+                                  boolean left, int availFallback) {
+        if (c == null || w == null) return;
+        float sd = getResources().getDisplayMetrics().scaledDensity;
+        android.view.ViewParent parent = c.getParent();
+        android.view.View col = parent instanceof android.view.View
+                ? (android.view.View) parent : null;
+
+        int availW = col != null
+                ? col.getWidth() - col.getPaddingLeft() - col.getPaddingRight() : 0;
+        if (availW <= 0) availW = availFallback;                 // 首帧还没量过
+        int availH = col != null
+                ? col.getHeight() - col.getPaddingTop() - col.getPaddingBottom() : 0;
+        if (availH <= 0) availH = clockColumnHeightPx();
+        availW = Math.max(Ui.dp(this, 32), availW);
+        availH = Math.max(Ui.dp(this, 48), availH);
+
+        // 每行高度配额（留 6% 行间呼吸缝），换算成字号上限
+        float maxSpByHeight = (availH / 2f * 0.94f) / (1.4f * sd);
+        // 时间为主视觉：先按可用宽尽量放大，天气再取「比时间略小」的值
+        //（原来各行独立按宽度收敛，"00:00" 比天气长，反而被压得比天气小）。
+        float clockSp = Math.min(maxSpByHeight,
+                fitSp(c.getPaint(), "00:00", 26f, availW, sd));
+        float weatherSp = Math.min(clockSp * 0.85f,
+                fitSp(w.getPaint(), w.getText().toString(), 15f, availW, sd));
+
+        c.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, Math.max(4f, clockSp));
+        w.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, Math.max(4f, weatherSp));
+        // 日期不显示，但对象还在（updateDockClock 会写它），保持字号不失控
+        if (d != null) d.setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP,
+                Math.max(4f, weatherSp));
+        Log.i(TAG, "clock 竖排 宽=" + availW + " 高=" + availH
+                + " 时间=" + String.format(java.util.Locale.US, "%.1f", clockSp)
+                + "sp 天气=" + String.format(java.util.Locale.US, "%.1f", weatherSp) + "sp");
+    }
+
+    /** 按可用宽度算出「整行能完整显示」的最大字号，含 12% 粗体/字距/取整余量 */
+    private float fitSp(android.text.TextPaint src, String text, float baseSp,
+                        int availW, float sd) {
+        if (text == null || text.length() == 0 || availW <= 0) return baseSp;
+        android.text.TextPaint p = new android.text.TextPaint(src);
+        p.setTextSize(baseSp * sd);
+        float need = p.measureText(text) * 1.12f;
+        return need > availW ? baseSp * availW / need : baseSp;
+    }
+
     private static String dateLabel(java.util.Calendar c) {
         return String.format(java.util.Locale.US, "%04d-%02d-%02d",
                 c.get(java.util.Calendar.YEAR),
@@ -1295,6 +1600,13 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 c.get(java.util.Calendar.HOUR_OF_DAY),
                 c.get(java.util.Calendar.MINUTE),
                 c.get(java.util.Calendar.SECOND));
+    }
+
+    /** 竖排 Dock：只显示小时:分（窄条里放不下秒，也省得每秒重绘一次） */
+    private static String timeLabelShort(java.util.Calendar c) {
+        return String.format(java.util.Locale.US, "%02d:%02d",
+                c.get(java.util.Calendar.HOUR_OF_DAY),
+                c.get(java.util.Calendar.MINUTE));
     }
 
     /** 玻璃竖线：竖向渐变（上下淡出），比一条实线更像玻璃切面 */
@@ -1314,7 +1626,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         if (dockClock == null && dockClockL == null) return;
         java.util.Calendar cal = java.util.Calendar.getInstance();
         String date = dateLabel(cal);
-        String time = timeLabel(cal);
+        String time = dockVertical ? timeLabelShort(cal) : timeLabel(cal);
         if (dockDate != null) setTextIfChanged(dockDate, date);
         if (dockClock != null) setTextIfChanged(dockClock, time);
         if (dockDateL != null) setTextIfChanged(dockDateL, date);
@@ -1380,8 +1692,15 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
      * 两侧功能区永远按格宽占位，不会被压窄（时间/天气和操作按钮必须保持可点）。
      */
     private int dockPitchPx() {
-        int dockW = dockWrap != null && dockWrap.getWidth() > 0
-                ? dockWrap.getWidth() : getResources().getDisplayMetrics().widthPixels;
+        // 横排按 Dock 的宽度分格，竖排（Dock 在左侧）按 Dock 的高度分格
+        int dockSpan;
+        if (dockVertical) {
+            dockSpan = dockWrap != null && dockWrap.getHeight() > 0
+                    ? dockWrap.getHeight() : getResources().getDisplayMetrics().heightPixels;
+        } else {
+            dockSpan = dockWrap != null && dockWrap.getWidth() > 0
+                    ? dockWrap.getWidth() : getResources().getDisplayMetrics().widthPixels;
+        }
         int slots = Math.max(1, Prefs.getDockCount(this));
         int panels = panelCellCount(true) + panelCellCount(false);
         int divW = 2 * Math.max(1, Ui.dp(this, 2));   // 两条玻璃竖线也要从可用宽里扣掉
@@ -1393,7 +1712,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         // 分母用「Dock 槽位数」而不是实际图标数：格宽不能因为中间应用少就被放大，
         // 否则功能区（≤5 格）会跟着撑得很宽，把中间图标区的地盘挤掉。
         int fixed = 2 * Ui.dp(this, 8) + divW + Ui.dp(this, panelPad) + Ui.dp(this, 6);  // 6dp 取整余量
-        int pitch = (dockW - fixed) / Math.max(1, slots + panels);
+        int pitch = (dockSpan - fixed) / Math.max(1, slots + panels);
         return Math.max(lo, Math.min(hi, pitch));
     }
 
@@ -1415,12 +1734,15 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 buildDockPanel(dockRightBox, false);
             }
         }
-        // 图标区可用宽 = rvDock 自己的宽度（左右功能区 + 外框内边距已经扣掉）；
-        // 首帧宽度还是 0 时按「整条 Dock − 功能区格数」估，随后的 onLayoutChange 会纠正
-        int availW = rvDock.getWidth();
+        // 图标区可用长度 = rvDock 沿排列方向的长度（两端功能区 + 外框内边距已扣掉）；
+        // 首帧还是 0 时按「整条 Dock − 功能区格数」估，随后的 onLayoutChange 会纠正
+        int availW = dockVertical ? rvDock.getHeight() : rvDock.getWidth();
         if (availW <= 0) {
-            int dockW = dockWrap.getWidth() > 0 ? dockWrap.getWidth()
-                    : getResources().getDisplayMetrics().widthPixels;
+            int dockW = dockVertical
+                    ? (dockWrap.getHeight() > 0 ? dockWrap.getHeight()
+                            : getResources().getDisplayMetrics().heightPixels)
+                    : (dockWrap.getWidth() > 0 ? dockWrap.getWidth()
+                            : getResources().getDisplayMetrics().widthPixels);
             availW = dockW - 2 * Ui.dp(this, 8)
                     - (panelCellCount(true) + panelCellCount(false)) * pitch;
         }
@@ -1433,12 +1755,18 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             int fit = avail / cells;
             if (fit >= Ui.dp(this, 40)) slotW = fit;
         }
+        if (dockVertical && cells > 0) {
+            // 竖排「两端对齐」：操作区固定在顶端，应用区的图标首尾贴边、
+            // 沿剩余高度均分铺满，不再上下各留一大块居中空白。
+            slotW = Math.max(slotW, avail / cells);
+        }
         int content = cells * slotW;
         // 两侧留白只能是「真正剩余宽度的一半」。
         // 以前这里有个 8dp 下限：剩余不足 16dp 时，内容会比可用宽多出十几像素，
         // RecyclerView 于是有了可滚距离 —— 在应用栏上横滑就变成「列表自己滚几像素」，
         // 手不够长就翻不到应用列表页（用户报的正是这个）。
-        int side = Math.max(0, (avail - content) / 2);
+        // 竖排时上面已把格子高度均分铺满，留白恒为 0（两端对齐）。
+        int side = dockVertical ? 0 : Math.max(0, (avail - content) / 2);
         if (slots == appliedSlotCount && slotW == appliedSlotWidth
                 && cells == appliedSlotCells && side == appliedSidePad) return;
         appliedSlotCount = slots;
@@ -1447,15 +1775,23 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         appliedSidePad = side;
 
         dockAdapter.setSlotWidth(slotW);
-        rvDock.setPadding(side, 0, side, 0);   // 纵向内边距由 dockRow 统一给
+        // 两侧留白：横排加在左右，竖排加在上下；另一轴由 dockRow 的 padding 统一给
+        if (dockVertical) rvDock.setPadding(0, side, 0, side);
+        else rvDock.setPadding(side, 0, side, 0);
         dockAdapter.notifyDataSetChanged();
-        // 排查「应用栏明明放得下却还能左右滑」用：range - extent 必须 ≤ 0，
-        // 大于 0 就是内容比视口宽，rvDock 会把横滑手势吃掉、翻不到应用列表页。
+        // 排查「应用栏明明放得下却还能滑」用：range - extent 必须 ≤ 0，
+        // 大于 0 就是内容比视口长，rvDock 会把手势吃掉、翻不到应用列表页。
         final int fAvail = avail, fContent = content, fSide = side;
-        rvDock.post(() -> Log.i("PipDesk", "dock 格宽=" + appliedSlotWidth + " 可用=" + fAvail
-                + " 内容=" + fContent + " 留白=" + fSide
-                + " 可滚距离=" + (rvDock.computeHorizontalScrollRange()
-                - rvDock.computeHorizontalScrollExtent())));
+        rvDock.post(() -> {
+            int range = dockVertical ? rvDock.computeVerticalScrollRange()
+                    : rvDock.computeHorizontalScrollRange();
+            int extent = dockVertical ? rvDock.computeVerticalScrollExtent()
+                    : rvDock.computeHorizontalScrollExtent();
+            Log.i("PipDesk", "dock 格宽=" + appliedSlotWidth + " 可用=" + fAvail
+                    + " 内容=" + fContent + " 留白=" + fSide
+                    + " 可滚距离=" + (range - extent)
+                    + (dockVertical ? " 竖排" : " 横排"));
+        });
     }
 
     @Override
@@ -1668,6 +2004,10 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             List<String> shortcutOrder = Prefs.getShortcutOrder(this);
             java.util.Set<String> slotted = shortcutOrder == null
                     ? new java.util.HashSet<>() : new java.util.HashSet<>(shortcutOrder);
+            // 快捷区永远渲染全部内置快捷方式：app_order 里的残留副本（老版本跨区拖动
+            // 写进去的 pipdesk://nav-home 等）必须当作「已在快捷区」滤掉，
+            // 否则应用页网格里再画一个 —— 表现就是出现两个「主页」图标。
+            slotted.addAll(AppListAdapter.shortcutSlotPkgs());
             List<AppInfo> slottedInfos = new ArrayList<>();   // 已换进快捷区的真实应用：给 adapter 缓存图标用
             List<AppInfo> out;
             if (!order.isEmpty()) {
@@ -1676,6 +2016,7 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
                 java.util.Set<String> used = new java.util.HashSet<>();
                 List<AppInfo> ordered = new ArrayList<>(res.size());
                 for (String pkg : order) {
+                    if (AppInfo.isHidden(pkg)) continue;   // 已隐藏的内置快捷方式（音量 ±）不再露面
                     if (!used.add(pkg)) continue;
                     if (AppInfo.isBuiltin(pkg)) {
                         ordered.add(new AppInfo(AppListAdapter.shortcutLabel(pkg), pkg,
@@ -1839,6 +2180,11 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             sendBack();
         } else if (AppInfo.HOME_PKG.equals(pkg)) {
             Keys.home(this);
+        } else if (AppInfo.APP_LIST_PKG.equals(pkg)) {
+            // 翻到应用列表（应用页）；已经在那儿就翻回主页，一个按钮兼顾来回
+            if (pager != null) {
+                pager.setCurrentPageSmooth(pager.getCurrentPage() == 1 ? 0 : 1);
+            }
         } else if (AppInfo.SLEEP_PKG.equals(pkg)) {
             ScreenOff.sleep(this);
         } else if (AppInfo.RECENTS_PKG.equals(pkg)) {
@@ -2298,7 +2644,14 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
         applySettings();
         // 回到桌面：把「全屏打开」过、还挂在主屏的应用搬回画中画继续显示
         pip.bringBackFullscreened();
-        pip.primeTouch();
+        // 开机首次 onResume 在首帧之前，别在这里 fork 注入服务抢首帧 CPU：
+        // 交给 runBootWork()；之后每次回桌面照常预热。
+        if (bootHeavyDone) {
+            pip.primeTouch();
+        } else {
+            // 首帧后的重活到前台再排：中途被 stop 时回调作废，回来重新调度。
+            scheduleBootWork();
+        }
         Log.i(TAG, "LIFE onResume " + paneSnapshot());
     }
 
@@ -2336,6 +2689,10 @@ public class MainActivity extends AppCompatActivity implements DockAdapter.Host,
             appliedNamePlate = namePlate;
             appListAdapter.setNamePlate(namePlate);
         }
+        // Dock 位置可能在设置页刚改过：原地换横/竖排，不重建画中画（虚拟屏不受影响）。
+        // 下面的 refreshDockPanels() 会按新方向重建两端功能区的子 View。
+        boolean wantLeft = Prefs.dockOnLeft(this);
+        if (wantLeft != dockVertical) applyDockSide(wantLeft);
         int paneCount = Prefs.getPaneCount(this);
         int dpi = Prefs.getDpi(this);
         int pipCorner = Prefs.getPipCorner(this);

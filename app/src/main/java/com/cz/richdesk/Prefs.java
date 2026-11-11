@@ -30,6 +30,10 @@ public class Prefs {
     public static final int DOCK_MAX = 10;
     public static final int PANE_MAX = 3;
 
+    /** Dock 位置：0 = 屏幕底部（横向一排），1 = 屏幕左侧（竖向一列） */
+    public static final int DOCK_SIDE_BOTTOM = 0;
+    public static final int DOCK_SIDE_LEFT = 1;
+
     private static SharedPreferences sp(Context c) {
         return c.getSharedPreferences(FILE, Context.MODE_PRIVATE);
     }
@@ -97,6 +101,30 @@ public class Prefs {
     /** Dock 可绑定的应用格数（固定 n 格，满格后「＋」消失） */
     public static int getDockCount(Context c) {
         return clamp(sp(c).getInt("dock_count", 5), DOCK_MIN, DOCK_MAX);
+    }
+
+    /** Dock 位置。非法值一律按「底部」处理，避免脏配置把界面搞没 */
+    public static int getDockSide(Context c) {
+        return sp(c).getInt("dock_side", DOCK_SIDE_BOTTOM) == DOCK_SIDE_LEFT
+                ? DOCK_SIDE_LEFT : DOCK_SIDE_BOTTOM;
+    }
+
+    public static boolean dockOnLeft(Context c) {
+        return getDockSide(c) == DOCK_SIDE_LEFT;
+    }
+
+    public static void setDockSide(Context c, int side) {
+        sp(c).edit().putInt("dock_side",
+                side == DOCK_SIDE_LEFT ? DOCK_SIDE_LEFT : DOCK_SIDE_BOTTOM).apply();
+    }
+
+    /** 「应用列表」按钮是否已自动补进过 Dock（只补一次，之后用户可长按移除/拖动） */
+    public static boolean appListButtonAdded(Context c) {
+        return sp(c).getBoolean("app_list_btn_added", false);
+    }
+
+    public static void setAppListButtonAdded(Context c) {
+        sp(c).edit().putBoolean("app_list_btn_added", true).apply();
     }
 
     // ------------------------------------------------------------ 应用列表手动排序

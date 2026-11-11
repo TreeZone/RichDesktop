@@ -284,6 +284,7 @@ public class SettingsActivity extends AppCompatActivity {
         rebuildThemeBox();
 
         section("Dock");
+        action("Dock 位置：" + DOCK_SIDE_LABELS[Prefs.getDockSide(this)], this::pickDockSide);
         seek("Dock 应用数量", Prefs.DOCK_MIN, Prefs.DOCK_MAX, 1, Prefs.getDockCount(this),
                 v -> Prefs.setDockCount(this, v), v -> v + " 格");
         // 「Dock 高度」这一项已删除：高度 = 图标 dp + 24dp，跟着图标自动走。
@@ -291,32 +292,12 @@ public class SettingsActivity extends AppCompatActivity {
         seek("Dock 图标大小", Prefs.DOCK_ICON_MIN, Prefs.DOCK_ICON_MAX, 2, Prefs.getDockIcon(this),
                 v -> Prefs.setDockIcon(this, v), v -> v + " dp（Dock 高度随之自适应）");
 
-        // Dock 左右两端的功能区：两侧内容都能选「快捷功能」或「时间 + 天气」。
-        // 父开关关掉时，下面的内容选择/图标列表整块变灰（子级不可调）。
-        Switch leftSw = toggle("左端功能区", Prefs.dockLeftEnabled(this), b -> {
-            Prefs.setDockLeftEnabled(this, b);
-            if (b && Prefs.getDockLeft(this).isEmpty()
-                    && Prefs.getDockLeftType(this) == Prefs.PANEL_SHORTCUT) {
-                // 第一次打开先给一套能用的：返回 / 主页 / 最近任务
-                List<String> d = new ArrayList<>();
-                d.add(AppInfo.BACK_PKG);
-                d.add(AppInfo.HOME_PKG);
-                d.add(AppInfo.RECENTS_PKG);
-                Prefs.setDockLeft(this, d);
-                toast("已放入默认图标：返回 / 主页 / 最近任务");
-            }
-        });
-        View leftType = actionChild("左端内容：" + panelLabel(Prefs.getDockLeftType(this)),
-                () -> pickPanelType(true));
-        // 「左端图标…」这一行已去掉（需求）：图标增删都在桌面上长按完成，
-        // 设置里再列一遍只是噪音。
-        children(leftSw, leftType);
-
-        Switch rightSw = toggle("右端功能区", Prefs.dockRightEnabled(this),
-                b -> Prefs.setDockRightEnabled(this, b));
-        View rightType = actionChild("右端内容：" + panelLabel(Prefs.getDockRightType(this)),
-                () -> pickPanelType(false));
-        children(rightSw, rightType);
+        // Dock 两端的功能区：一行搞定 —— 点进去选「关闭 / 快捷功能 / 时间 + 天气」。
+        // 以前是「开关 + 子项：内容」，两项说的其实是同一件事，合并后少点一次。
+        action(panelTitle("功能区", true) + "：" + PANEL_MODE_LABELS[panelMode(true)],
+                () -> pickPanelMode(true));
+        action(panelTitle("功能区", false) + "：" + PANEL_MODE_LABELS[panelMode(false)],
+                () -> pickPanelMode(false));
 
         section("应用列表");
         seek("图标大小", Prefs.ICON_MIN, Prefs.ICON_MAX, 4, Prefs.getIconSize(this),
@@ -1103,25 +1084,93 @@ public class SettingsActivity extends AppCompatActivity {
         return b.toString();
     }
 
-    /** 功能区内容类型文案 */
-    private static String panelLabel(int type) {
-        return type == Prefs.PANEL_CLOCK ? "时间 + 天气" : "快捷功能（图标）";
+    /** 功能区三个状态：0 = 关闭，1 = 快捷功能，2 = 时间 + 天气（下标同时也是弹框选项序号） */
+    private static final String[] PANEL_MODE_LABELS = {"关闭", "快捷功能（图标）", "时间 + 天气"};
+    private static final String[] PANEL_MODE_HINTS = {
+            "这一端不放东西，Dock 两头留空",
+            "放自己挑的快捷图标（返回 / 主页 / 最近任务…），个数跟着 Dock 格数走",
+            "显示当前时间 + 天气（竖排时上下两行）"};
+
+    /** 当前这一端处于哪个模式（用于弹框打勾 / 行标题回显） */
+    private int panelMode(boolean left) {
+        boolean on = left ? Prefs.dockLeftEnabled(this) : Prefs.dockRightEnabled(this);
+        if (!on) return 0;
+        int type = left ? Prefs.getDockLeftType(this) : Prefs.getDockRightType(this);
+        return type == Prefs.PANEL_CLOCK ? 2 : 1;
     }
 
-    /** 选一侧功能区的内容：快捷功能（按 Dock 格数自动决定能放几个）或 时间 + 天气 */
-    private void pickPanelType(final boolean left) {
-        final int cur = left ? Prefs.getDockLeftType(this) : Prefs.getDockRightType(this);
-        GlassMenu.show(this, (left ? "左端" : "右端") + "功能区内容",
-                new CharSequence[]{"快捷功能（图标，按 Dock 格数放）",
-                        "时间 + 天气"},
-                which -> {
-                    int t = which == 1 ? Prefs.PANEL_CLOCK : Prefs.PANEL_SHORTCUT;
-                    if (left) Prefs.setDockLeftType(this, t);
-                    else Prefs.setDockRightType(this, t);
-                    // 本页的行标题是建行时写死的，改完重建整页最省事（滚动位置会被还原）
+    /**
+     * 一端的功能区：一个弹框选「关闭 / 快捷功能 / 时间 + 天气」。
+     * 以前是「开关」+「内容」两行，说的是同一件事，合并成一行少点一次。
+     */
+    private void pickPanelMode(final boolean left) {
+        OptionPicker.show(this, panelTitle("功能区", left), PANEL_MODE_LABELS,
+                PANEL_MODE_HINTS, panelMode(left), which -> {
+                    if (which == 0) {
+                        if (left) Prefs.setDockLeftEnabled(this, false);
+                        else Prefs.setDockRightEnabled(this, false);
+                    } else {
+                        int t = which == 2 ? Prefs.PANEL_CLOCK : Prefs.PANEL_SHORTCUT;
+                        if (left) {
+                            Prefs.setDockLeftEnabled(this, true);
+                            Prefs.setDockLeftType(this, t);
+                        } else {
+                            Prefs.setDockRightEnabled(this, true);
+                            Prefs.setDockRightType(this, t);
+                        }
+                        // 第一次切到「快捷功能」且一个图标都没有：先给一套能用的，
+                        // 否则这一端看着像没生效（图标全靠桌面长按加）
+                        if (t == Prefs.PANEL_SHORTCUT) {
+                            List<String> have = left ? Prefs.getDockLeft(this)
+                                    : Prefs.getDockRightIcons(this);
+                            if (have.isEmpty()) {
+                                List<String> d = new ArrayList<>();
+                                d.add(AppInfo.BACK_PKG);
+                                d.add(AppInfo.HOME_PKG);
+                                d.add(AppInfo.RECENTS_PKG);
+                                if (left) Prefs.setDockLeft(this, d);
+                                else Prefs.setDockRightIcons(this, d);
+                                toast("已放入默认图标：返回 / 主页 / 最近任务");
+                            }
+                        }
+                    }
+                    // 行标题是建行时写死的，改完重建整页最省事（滚动位置会被还原）
                     if (scrollView != null) pendingScrollY = scrollView.getScrollY();
                     recreate();
                 });
+    }
+
+    /** Dock 位置：底部横排 / 左侧竖排（选中值直接对应 Prefs.DOCK_SIDE_*） */
+    private static final String[] DOCK_SIDE_LABELS = {"底部（横向）", "左侧（竖向）"};
+    private static final String[] DOCK_SIDE_HINTS = {
+            "Dock 横放在屏幕底部，画中画在上方（默认）",
+            "Dock 竖放在屏幕左侧，画中画在右侧"};
+
+    private void pickDockSide() {
+        OptionPicker.show(this, "Dock 位置", DOCK_SIDE_LABELS, DOCK_SIDE_HINTS,
+                Prefs.getDockSide(this), which -> {
+                    Prefs.setDockSide(this, which);
+                    // 行标题是建行时写死的，改完重建整页（滚动位置会被还原）。
+                    // 桌面回到前台时由 applySettings() 检测变化并原地换布局。
+                    if (scrollView != null) pendingScrollY = scrollView.getScrollY();
+                    recreate();
+                });
+    }
+
+    /**
+     * 端名：「左（上）端」/「右（下）端」。
+     * Dock 竖排时左端其实在屏幕上方、右端在下方，所以把方向塞在「左/右」后面；
+     * 横排（底部 Dock）时左右就是左右，不加方向。
+     */
+    private String endLabel(boolean left) {
+        StringBuilder b = new StringBuilder(left ? "左" : "右");
+        if (Prefs.getDockSide(this) == Prefs.DOCK_SIDE_LEFT) b.append(left ? "（上）" : "（下）");
+        return b.append("端").toString();
+    }
+
+    /** 选择功能区时用的标题：竖排 →「左（上）端功能区」 */
+    private String panelTitle(String tail, boolean left) {
+        return endLabel(left) + tail;
     }
 
     /**

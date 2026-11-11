@@ -18,6 +18,20 @@
     </style>
 
     <!--
+      开机启动专用的桌面主题：给 HOME 窗口一块不透明底色。
+
+      桌面本体是透明窗口（windowShowWallpaper=true，透出系统壁纸）。开机时
+      窗口虽然已经创建，但首帧还没画完，底下 SystemUI 的「最近任务界面」会一直
+      透出来 —— 这就是"车机启动总是先显示最近任务，过几秒才进桌面"的根因，
+      启动慢只是把这段窗口拉长。换成实心底色后，系统的 starting window
+      （进程还没起来就能画）/ 窗口本身会立刻盖住它；首帧提交后再由
+      MainActivity.runBootWork() 把背景换回透明，恢复壁纸效果。
+    -->
+    <style name="Theme.PipDesk.Launcher" parent="Theme.PipDesk">
+        <item name="android:windowBackground">@color/boot_bg</item>
+    </style>
+
+    <!--
       玻璃对话框：
         · 窗口透明，底色由 Ui.glassWindow() 画（半透明 + 圆角 + Android 12+ 背景模糊）；
         · 继承 AppCompat 的深色 Alert 主题 → 标题/正文/列表项都是白字，深浅对比够。
