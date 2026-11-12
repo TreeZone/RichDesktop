@@ -741,15 +741,16 @@ public final class Voice {
             return;
         }
         if (now.equals(hotAliasStamp)) return;
-        boolean rebuild = hotAliasStamp != null && !hotAliasStamp.isEmpty();
         hotAliasStamp = now;
-        if (!rebuild) return;               // 首次启动：正常 load 就已经带上了
-        synchronized (lock) {
-            VoiceHotwords.invalidate();
-            if (asr != null) asr.release();
-            asr = null;
-        }
-        FileLog.append("VOICE 语音别名有更新 → 重建识别器，把新说法写进热词表");
+        /*
+         * 0.23.25 起识别模型换成 CTC（streaming-zipformer-small-ctc-zh-2025-04-01），
+         * 而 sherpa 的热词靠 ContextGraph 实现、只存在于 transducer 解码器里
+         * （见 VoiceAsr 类注释）。CTC 不读热词，所以别名变化**不再需要重建识别器**。
+         *
+         * 原来这里每次点候选学到新说法都会 release + reload：白白让下一次说话多等
+         * 1~2 秒加载。别名本身依然参与匹配层打分（VoiceIntent 的声母骨架/拼音），
+         * 那条路和识别器无关，不受影响。
+         */
     }
 
     /**

@@ -342,9 +342,10 @@ public class SettingsActivity extends AppCompatActivity {
         content.addView(micResult);
         note("· 语音只认「应用列表里真实存在的应用」，外加返回 / 主页 / 应用列表 / 息屏这几个内置指令。\n"
                 + "· 「打开高德」「导航」都能命中：名字模糊匹配 + 常用别名；听不准时弹候选。\n"
-                + "· 中文识别模型吐不出英文字母：说「打开 GPSBridge」会变成一串不相干的汉字，\n"
-                + "  这时会直接列出英文名应用，点一下或说「第一个」即可；点过的说法会写进\n"
-                + "  识别热词表，让这段发音的汉字输出逐渐收敛（不保证每次一样，所以候选常开）。\n"
+                + "· 中文识别模型吐不出英文字母：说「打开 GPSBridge」多半会变成一串不相干的汉字，\n"
+                + "  这时会直接说「找不到」，不会甩一屏无关应用出来。\n"
+                + "  点过的说法会存成别名，参与匹配打分（同音 / 声母骨架），\n"
+                + "  但不再写进解码器热词 —— 当前 CTC 识别模型没有热词通道。\n"
                 + "· 唤醒词完全跑在本地（3.3MB 模型），不联网；常驻约 1% 单核。\n"
                 + "· 唤醒词可以改成任意 2~6 个汉字：设置里改完立刻生效（汉字→拼音音素是本地换算的）。\n"
                 + "· 弹候选时**不念应用名，只问「要选第几个」**（念一串名字要十几秒，太拖）；\n"
@@ -1701,7 +1702,8 @@ public class SettingsActivity extends AppCompatActivity {
      * 弹框统一用 OptionPicker（设置页 Dock 位置 / 功能区那套基准样式）。
      *
      * 英文应用名每次识别出的汉字都可能不同，所以这里不提供「手写精确别名」——
-     * 在候选里点一次就自动学一条，比手敲更贴合真实发音；别名同时会进热词表。
+     * 在候选里点一次就自动学一条，比手敲更贴合真实发音。
+     * （0.23.25 起识别模型是 CTC，没有热词通道，别名只用于匹配打分。）
      */
     private void showVoiceAliasManager() {
         java.util.Map<String, java.util.Set<String>> map =
@@ -1729,7 +1731,7 @@ public class SettingsActivity extends AppCompatActivity {
         hints.add("删掉所有已学说法，重新学");
         OptionPicker.show(this, "语音别名（" + rows.size() + " 条）",
                 labels.toArray(new String[0]), hints.toArray(new String[0]), -1,
-                "点一条即删除。别名会同时写进识别热词表，让英文发音的汉字输出逐渐收敛。",
+                "点一条即删除。别名用于匹配打分（同音直通 / 声母骨架），不进解码器热词。",
                 which -> {
                     if (which == rows.size()) {
                         Prefs.clearVoiceAlias(this);

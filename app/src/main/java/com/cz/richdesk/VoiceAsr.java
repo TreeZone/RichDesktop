@@ -15,31 +15,44 @@ import java.util.List;
 /**
  * 离线中文识别（只在"已经开始听"之后才工作）。
  *
- * 模型：sherpa-onnx-streaming-zipformer-zh-14M（int8 共 24MB）。
- * 它的词表是 5539 个 token、其中 5508 个**单汉字** —— 一个英文字母都没有，
- * 所以它先天性念不了「YouTube」「Spotify」这种名字（这个限制改不了，
- * 只能靠 VoiceAliases 的谐音别名在匹配层兜住）。
+ * <h3>模型（0.23.25 起）：streaming-zipformer-small-ctc-zh-int8-2025-04-01</h3>
+ * 单文件 CTC（model.int8.onnx 25MB + tokens.txt），体积与旧的 14M 三件套（24MB）
+ * **基本持平**，但准确率上一个档。同一批真实音频上的实测对比：
  *
- * <h3>为什么没换更大的模型（0.23.24 实测结论）</h3>
- * 试过 streaming-zipformer-zh-int8-2025-06-30（encoder 154MB，icefall
- * multi_zh-hans zipformer-large）：准确率确实更高（把「全球金融**动荡**」
- * 识别对了，14M 会错成「动**量**」），但**词表只有 1687 个有效 token**，
- * 「酷、抖、哔、哩、驶」全都不在 —— 「酷狗音乐」「抖音」「哔哩哔哩」直接念不出来，
- * 而语音打开应用恰恰依赖这些品牌字。已回退。
- * **将来要换，词表汉字数必须 ≥5000**（中英双语那个 487MB 的包符合，但体积代价大）。
+ * <pre>
+ *   1.wav   旧 14M：全球金融「动量」  ← 错        新 CTC：全球金融「动荡」  ← 对
+ *   8k.wav  旧 14M：「身处的飞机分析」← 完全错     新 CTC：「深入的分析」   ← 对
+ * </pre>
+ * 而且新 CTC 的识别结果与 154MB 的 zipformer-large（multi_zh-hans）**完全一致**，
+ * 也就是说这个 25MB 模型已经把大模型的效果拿到了。
  *
- * 针对"识别率差"目前靠这几件事：
- *  1) 解码用 modified_beam_search（beam=4）：噪声里 greedy 会跳字。
- *  2) 本机应用名做热词偏置（VoiceHotwords），专有名词提升最明显。
- *  3) 录音侧：采样率对齐到 16k（ROM 可能给 48k）+ 系统降噪/自动增益，
- *     见 {@link VoiceMic}。**这一条才是 0.23.24 真正在修的东西** ——
- *     模型没换，但喂给模型的音频以前可能是错的（3 倍速失真）。
+ * <h3>为什么它不像上次那样缺字</h3>
+ * 上次的 multi_zh-hans 系列（154MB / 60MB 那个 transducer）用的是**完整汉字 BPE 词表**，
+ * 只有 1687~1741 个汉字 token，「酷、抖、哔、哩、驶」都没有 → 「酷狗音乐」「抖音」
+ * 直接念不出来。这个 small-ctc 的词表是**字节级 BPE**（token 形如 `▁ƌŕş`，
+ * 一个 token 是一串 UTF-8 字节），理论上能拼出任何汉字，**不存在缺字**。
+ *
+ * <h3>代价：不能用热词（明确接受）</h3>
+ * sherpa 的热词靠 ContextGraph 实现，而 ContextGraph **只存在于 transducer 解码器**
+ * （见 online-recognizer-transducer-impl.h；online-recognizer.cc 里 hotwords-file
+ * 也只允许配 modified_beam_search）。CTC 走的是另一条解码路径，完全不读热词。
+ *
+ * 所以这个版本**不再给识别器灌应用名热词** —— 留着只会白写文件、白重建识别器。
+ * 补偿手段在匹配层：同音整名给 96 分直通（pinyin:exact）、声母骨架、覆盖率门槛、
+ * 猜不中弹候选。换言之，专有名词的容错从"解码前偏置"挪到"解码后纠错"。
+ *
+ * <h3>还可能拖后腿的地方（已单独修，见 VoiceMic）</h3>
+ * 录音侧采样率对齐到 16k（ROM 可能给 48k，以前会变成 3 倍速花栗鼠音）+
+ * 系统降噪/自动增益。
  */
 final class VoiceAsr {
 
     private static final String TAG = "PipDesk";
     /** 束搜索宽度：4 是 sherpa 示例里精度/延迟的常用折中 */
     private static final int BEAM_SIZE = 4;
+    /** CTC 单文件模型（zipformer2-ctc） */
+    private static final String MODEL_FILE = "model.int8.onnx";
+    private static final String TOKENS_FILE = "tokens.txt";
 
     private final Context ctx;
     private OnlineRecognizer rec;
@@ -92,19 +105,16 @@ final class VoiceAsr {
         }
 
         String prefix = VoiceAssets.assetPrefix("asr");
-        boolean wantHotwords = Prefs.voiceHotwords(ctx);
 
-        boolean ok = tryLoad(prefix, wantHotwords);
-        // 带热词失败就退回无热词。sherpa 对热词校验很严（词里的字不在词表、
-        // 或者格式不规范都会让加载整个失败），而语音是整条链路 ——
-        // 宁可不偏置，也不能让识别器起不来。
-        if (!ok && wantHotwords) {
-            FileLog.append("VOICE 带热词加载失败，退回无热词配置（原因见上一条日志）");
-            ok = tryLoad(prefix, false);
-        }
+        /*
+         * 不再加热词（CTC 解码器根本没有热词通道，见类注释）。
+         * 原来这里会传 wantHotwords 并在失败时退回无热词 —— 那套是为 transducer 写的，
+         * 对 CTC 是空转：VoiceHotwords.ensure() 会白写一份热词文件，sherpa 却一个都不读。
+         */
+        boolean ok = tryLoad(prefix);
         if (!ok) {
             String alt = VoiceAssets.extract(ctx, "asr");
-            if (alt != null && tryLoad(alt, false)) {
+            if (alt != null && asrModelsOk(alt) && tryLoad(alt)) {
                 FileLog.append("VOICE 识别模型改从 filesDir 加载：" + alt);
                 ok = true;
             }
@@ -122,7 +132,7 @@ final class VoiceAsr {
         return false;
     }
 
-    private boolean tryLoad(String prefix, boolean withHotwords) {
+    private boolean tryLoad(String prefix) {
         long t0 = System.currentTimeMillis();
         try {
             /*
@@ -133,38 +143,27 @@ final class VoiceAsr {
              *   assets 相对路径 → assetManager 非 null；
              *   绝对路径       → assetManager 传 null（纯文件模式，OnlineRecognizer
              *                    构造器字节码 ifnull → newFromFile，null 合法）。
-             * 热词文件固定写在本机 filesDir（绝对路径），所以只要带热词，
-             * 模型也一并解到 filesDir，整条链路切纯文件模式。
-             *
-             * 注意顺序：先把 filesMode / 最终 prefix 定下来，**再**配四个模型路径 ——
-             * 上一版就是路径配完才切模式，结果 tokens 还是 'asr/tokens.txt'，
-             * newFromFile 按普通文件找不到，整个识别器建不起来。
+             * CTC 版没有热词文件（热词是 transducer 专属），所以正常情况下一直走
+             * assets 模式，不需要为了"热词文件是绝对路径"把模型解到 filesDir。
+             * filesDir 只在 assets 读取失败时作为兜底（见 load()）。
              */
             boolean filesMode = prefix.startsWith("/");
-            String hw = null;
-            if (withHotwords) {
-                hw = VoiceHotwords.ensure(ctx, hotwordNames);
-                if (hw != null && !filesMode) {
-                    String abs = VoiceAssets.extract(ctx, "asr");
-                    if (abs != null && asrModelsOk(abs)) {
-                        prefix = abs;
-                        filesMode = true;
-                    } else {
-                        FileLog.append("VOICE 模型解压不可用，本次不加热词（保持 assets 模式）");
-                        hw = null;
-                    }
-                }
-            }
 
             OnlineRecognizerConfig c = new OnlineRecognizerConfig();
             FeatureConfig f = c.getFeatConfig();
             f.setSampleRate(VoiceMic.SR);
             f.setFeatureDim(80);
             OnlineModelConfig m = c.getModelConfig();
-            m.getTransducer().setEncoder(prefix + "encoder.int8.onnx");
-            m.getTransducer().setDecoder(prefix + "decoder.onnx");
-            m.getTransducer().setJoiner(prefix + "joiner.int8.onnx");
-            m.setTokens(prefix + "tokens.txt");
+            // 单文件 CTC（zipformer2-ctc）：只有 model + tokens，没有 encoder/decoder/joiner。
+            // 换成旧的 transducer 写法会直接建不起来（三个路径全空）。
+            com.k2fsa.sherpa.onnx.OnlineZipformer2CtcModelConfig z = m.getZipformer2Ctc();
+            if (z == null) {                       // Kotlin data class 默认值不保证非 null，判一下更稳
+                z = new com.k2fsa.sherpa.onnx.OnlineZipformer2CtcModelConfig(prefix + MODEL_FILE);
+                m.setZipformer2Ctc(z);
+            } else {
+                z.setModel(prefix + MODEL_FILE);
+            }
+            m.setTokens(prefix + TOKENS_FILE);
             // 2 线程：这台机器核多但有画中画在跑，给 2 个核能把一句话的延迟压到 0.5s 内，
             // 再多开始和渲染抢 CPU，反而掉帧。
             // （0.23.24 试过 zipformer-large，那个才需要 4 线程；大模型因词表缺字已否决，
@@ -185,23 +184,6 @@ final class VoiceAsr {
             // 端点规则用默认值：说完 ~1.2s 静音就断句，单句上限 20s。
             // 车机噪声大时"说完不等"比"等太久"更讨人厌，所以不把静音阈值调长。
 
-            String hwDesc = "hotwords=off";
-            if (hw != null) {
-                /*
-                 * 【建模单元必须跟词表一致】当前 14M 模型是**单汉字词表**
-                 * （`怎 3` `么 4`），所以用 cjkchar。
-                 *
-                 * 0.23.24 曾换成 zipformer-large（词表是 BPE：`▁的 260`），那时必须
-                 * 改成 modelingUnit=bpe + bpeVocab=tokens.txt，否则裸单字查不到 id。
-                 * 但那个模型 1687 个 token 里连「酷/抖/哔/哩/驶」都没有，应用名念不出来，
-                 * 已否决回退。**将来再换模型，这一步要跟着词表一起改，不能只换文件。**
-                 */
-                m.setModelingUnit("cjkchar");
-                c.setHotwordsFile(hw);
-                c.setHotwordsScore(Prefs.voiceHotwordScore(ctx));
-                hwDesc = VoiceHotwords.summary(ctx);
-            }
-
             OnlineRecognizer r = filesMode
                     ? new OnlineRecognizer(null, c)
                     : new OnlineRecognizer(ctx.getAssets(), c);
@@ -212,23 +194,26 @@ final class VoiceAsr {
             String msg = "VOICE 识别模型加载完成 " + (loadedAt - t0) + "ms prefix=" + prefix
                     + (filesMode ? "（纯文件模式）" : "（assets 模式）")
                     + (Prefs.voiceBeam(ctx) ? " beam=" + BEAM_SIZE : " greedy")
-                    + " " + hwDesc;
+                    + " model=zipformer2-ctc hotwords=unsupported(CTC)";
             Log.i(TAG, msg);
             FileLog.append(msg);
             return true;
         } catch (Throwable t) {
-            Log.w(TAG, "asr load 失败 prefix=" + prefix + " hotwords=" + withHotwords, t);
-            FileLog.append("VOICE 识别模型加载失败(" + prefix + " hotwords=" + withHotwords
-                    + ") " + t);
+            Log.w(TAG, "asr load 失败 prefix=" + prefix, t);
+            FileLog.append("VOICE 识别模型加载失败(" + prefix + ") " + t);
             release();
             loadError = "识别模型加载失败：" + t;
             return false;
         }
     }
 
-    /** 纯文件模式前置校验：四个文件都得真在，否则 newFromFile 会整个建不起来 */
+    /**
+     * 纯文件模式前置校验：两个文件都得真在，否则 newFromFile 会整个建不起来。
+     * （CTC 单文件模型只有 model + tokens；旧 transducer 的 encoder/decoder/joiner
+     *   三件套已经不用了，别再按那份清单校验，否则永远是 false。）
+     */
     private static boolean asrModelsOk(String prefix) {
-        String[] names = {"encoder.int8.onnx", "decoder.onnx", "joiner.int8.onnx", "tokens.txt"};
+        String[] names = {MODEL_FILE, TOKENS_FILE};
         for (String n : names) {
             java.io.File fp = new java.io.File(prefix + n);
             if (!fp.isFile() || fp.length() <= 0) return false;
