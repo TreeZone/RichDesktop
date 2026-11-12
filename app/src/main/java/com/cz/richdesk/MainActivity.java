@@ -154,6 +154,9 @@ public class MainActivity extends AppCompatActivity
     /** 单画模式下连续点返回的次数：app 自己拦截 BACK 时的兜底（见 forceExitSingleIfStuck） */
     private volatile int singleBackCount;
     private volatile String singleBackForPkg;
+    /** 单画退出监视的在途标记（pkg@displayId），防止重复起线程做重复 dumpsys */
+    private String singleExitKey;
+    private volatile long singleExitAt;
 
     // 上次应用的配置，用于从设置页返回时做增量刷新
     private int appliedPaneCount = -1, appliedDpi = -1, appliedPipCorner = -1;
@@ -2751,7 +2754,18 @@ public class MainActivity extends AppCompatActivity
      */
     private void watchSingleExit(final String pkg, final int displayId) {
         if (displayId < 0) return;
+        // 同一个目标同时只允许一条监视线程。
+        // onResume、每次返回、布局恢复都会调到这里；以前每次都新起一条，于是同时有
+        // 2~3 条线程各自每 250ms 跑一次全量 dumpsys —— 越用越卡，且判据还会互相打架。
+        final String key = pkg + "@" + displayId;
+        synchronized (this) {
+            if (key.equals(singleExitKey)
+                    && SystemClock.elapsedRealtime() - singleExitAt < 12_000L) return;
+            singleExitKey = key;
+            singleExitAt = SystemClock.elapsedRealtime();
+        }
         new Thread(() -> {
+          try {
             /*
              * 【两段式】（用户实测："第一次点不显示，第二次才正常"，日志 09:41:58 现场抓到）
              *
@@ -2838,6 +2852,11 @@ public class MainActivity extends AppCompatActivity
                 });
                 return;
             }
+          } finally {
+            synchronized (MainActivity.this) {
+                if (key.equals(singleExitKey)) singleExitKey = null;
+            }
+          }
         }, "pipdesk-single-exit").start();
     }
 

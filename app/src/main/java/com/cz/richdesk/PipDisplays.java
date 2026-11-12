@@ -44,6 +44,21 @@ final class PipDisplays {
          * SurfaceFlinger 往队列里投帧投不进去，画面就会定格在最后一帧（正是卡死的样子）。
          */
         Surface surface;
+        /**
+         * 当前绑定这根 surface 的 pane 实例标识（每个 PipPane 构造时取一次，单调递增）。
+         *
+         * 为什么必须有它：桌面重建时新旧两个 MainActivity 会**同时**存在一小段时间
+         * （reapDuplicateInstances 只是让旧的 finish，onDestroy 是异步的）。槽位按
+         * "PipDesk-0/1/2" 复用，新旧实例的 pane 用同一个 key：
+         *   新实例 onCreate → bind() 接上新 Surface；
+         *   旧实例 onDestroy → pip.release() → detach(key) →
+         *       把**新实例刚接上**的 Surface setSurface(null) + release()。
+         * 结果新 TextureView 从此没有任何 producer，onSurfaceTextureAvailable 也不会再来，
+         * 画面永久停在最后一帧、frames 不再增长 —— 听诊器于是判"停帧"，每 1.2s 探一次、
+         * 每次新起一条线程 + 两次 binder 全校举，越跑越卡。这就是"运行一段时间变卡"的闭环。
+         * 带上 owner 之后，旧实例的 detach/release 会因为标识不匹配而直接跳过。
+         */
+        long owner;
     }
 
     private static final HashMap<String, Slot> SLOTS = new HashMap<>();
@@ -69,7 +84,7 @@ final class PipDisplays {
      * 换绑 surface：纹理的 buffer 尺寸先对齐屏的像素尺寸，再把 Surface 交给虚拟屏。
      * 这之后 SurfaceFlinger 会立刻开始把这块屏的图层合成到新的 TextureView 上。
      */
-    static void bind(Slot s, android.graphics.SurfaceTexture st, int w, int h) {
+    static void bind(Slot s, android.graphics.SurfaceTexture st, int w, int h, long owner) {
         if (s == null || s.vd == null || st == null) return;
         try {
             st.setDefaultBufferSize(w, h);
@@ -83,17 +98,37 @@ final class PipDisplays {
         }
         // 新 surface 装上之后再放旧的：VD 全程都有一份我们持有的强引用，
         // 不会出现"输出队列指向已释放 producer"导致整块屏不再出帧。
-        Surface old = s.surface;
-        s.surface = surface;
+        Surface old;
+        synchronized (PipDisplays.class) {
+            old = s.surface;
+            s.surface = surface;
+            s.owner = owner;      // 认主：从这一刻起只有这个 pane 能摘它
+        }
         if (old != null && old != surface) {
             try { old.release(); } catch (Throwable ignored) { }
         }
     }
 
-    /** pane 离开（Activity 销毁 / 关屏）：只解绑 surface，屏留着给下一次接 */
-    static synchronized void detach(String key) {
+    /** 登记新槽位并认主 */
+    static synchronized void putOwned(String key, Slot s, long owner) {
+        s.owner = owner;
+        SLOTS.put(key, s);
+    }
+
+    /**
+     * pane 离开（Activity 销毁 / 关屏）：只解绑 surface，屏留着给下一次接。
+     *
+     * **只有当前属主才能解绑** —— 否则重建期间旧实例的 onDestroy 会把新实例
+     * 刚接上的 surface 摘掉，画面永久停帧（见 {@link Slot#owner}）。
+     */
+    static synchronized void detach(String key, long owner) {
         Slot s = SLOTS.get(key);
         if (s == null || s.vd == null) return;
+        if (owner != 0 && s.owner != owner) {
+            // 不是自己的线，别动。旧实例退场时走到这里就是正确行为。
+            return;
+        }
+        s.owner = 0;
         try {
             s.vd.setSurface(null);
         } catch (Throwable ignored) { }
@@ -101,6 +136,25 @@ final class PipDisplays {
             try { s.surface.release(); } catch (Throwable ignored) { }
             s.surface = null;
         }
+    }
+
+    /** 兼容旧调用（无属主校验）：只给内部强制释放用，业务侧一律走带 owner 的版本 */
+    static synchronized void detach(String key) {
+        detach(key, 0);
+    }
+
+    /**
+     * 只有属主才能真销毁这块屏（减屏数 / 改渲染分辨率）。
+     * 旧 Activity 实例退场时不应该把新实例正在用的屏 release 掉。
+     */
+    static synchronized void releaseOwned(String key, long owner) {
+        Slot s = SLOTS.get(key);
+        if (s == null) return;
+        // 严格只释放自己认领的那块。owner==0（已被别人 detach 的空槽）也不动：
+        // 那块屏极可能正等着新实例接上，此时销毁会让 displayId 变化 → 屏内 task 掉回主屏。
+        // 真要减屏数请走 releaseFrom()/releaseAll()（它们是真·强制释放）。
+        if (s.owner != owner) return;
+        release(key);
     }
 
     /** 真正销毁一块屏（减屏数、强制重建时用）。注意：屏上的 task 会被系统丢回主屏 */

@@ -104,7 +104,12 @@ public final class PaneDoctor {
     /** 立刻唤醒巡检线程并进入快巡检窗口 */
     public static void kick(String why) {
         long now = SystemClock.uptimeMillis();
-        if (now >= fastUntil) Log.i(TAG, "快巡检启动：" + why);
+        // **已经在窗口里就不再续期**。原来每次音频回调都 fastUntil = now + 6s，
+        // 而播放状态变化在车机上很频繁（播放/暂停/切歌/焦点切换各算一次），
+        // 结果 200ms 一轮的快巡检被无限续期 = 探测永久常开，这是"越用越卡"的放大器。
+        // 6 秒足够覆盖"任务被拽走"那段关键期；还没稳住的，下一轮状态变化会重新 kick。
+        if (now < fastUntil) return;
+        Log.i(TAG, "快巡检启动：" + why);
         fastUntil = now + FAST_WINDOW_MS;
         fastWhy = why;
         synchronized (WAKE) {
@@ -294,27 +299,38 @@ public final class PaneDoctor {
                 long f = pane.frames();
                 long[] st = stall.get(i);
                 if (st == null) {
-                    stall.put(i, new long[]{f, now, 0L});
+                    // [帧数, 帧数最后变化时刻, 停帧时刻, 连续探测次数, 上次探测时刻]
+                    st = new long[]{f, now, 0L, 0L, 0L};
+                    stall.put(i, st);
                     continue;
                 }
-                if (f != st[0]) {          // 有新帧：清掉停帧标记
+                if (f != st[0]) {          // 有新帧：清掉停帧标记，退避归零
                     st[0] = f;
                     st[1] = now;
                     st[2] = 0L;
+                    st[3] = 0L;
+                    st[4] = 0L;
                     continue;
                 }
                 if (pane.pkg() == null) continue;                       // 空闲屏不算
                 if (!"ON".equals(pane.displayState())) continue;        // 屏被系统关了，另一类问题
                 if (st[2] == 0L && now - st[1] > STALL_MS) st[2] = now;  // 刚停住
                 if (st[2] == 0L) continue;
-                // 停帧期间持续探（按 PROBE_GAP_MS 节流），而不是"刚停住"那一刻只探一次：
+                // 停帧期间持续探，而不是"刚停住"那一刻只探一次：
                 // 现场顺序是先静止（activity 还活着）→ 焦点被判掉才把它 stop，
                 // 只判一次就正好错过后面才发生的 stop。
-                // 真正"拉回前台 / 重启"的频率由 PipPane 自己的闸门与升级策略控制。
-                Long lp = lastProbeAt.get(i);
-                long gap = fastMode() ? FAST_PERIOD_MS : PROBE_GAP_MS;
-                if (lp == null || now - lp >= gap) {
-                    lastProbeAt.put(i, now);
+                //
+                // 【必须退避】每次探测 = 一条新线程 + getRunningTasks 全校举 +
+                // getRunningAppProcesses 全校举。而**静态页面本来就不出帧**，会被永久
+                // 判成"停帧"：原来的固定 1.2 秒间隔等于常驻每秒给每块屏扫两遍全系统，
+                // 跑久了整机越来越卡。这里改成指数退避 1.2→2.4→4.8→9.6→19.2→30s，
+                // 一有帧就归零 —— 稳态负载从"每秒一次"降到"每 30 秒一次"。
+                int n = (int) Math.min(st[3], 5);
+                long base = fastMode() ? FAST_PERIOD_MS : PROBE_GAP_MS;
+                long gap = Math.min(base << n, 30_000L);
+                if (now - st[4] >= gap) {
+                    st[4] = now;
+                    st[3]++;
                     pane.probeAndRevive();
                 }
                 if (now - st[2] > 45_000L) continue;                    // 太久远的不算"一起"

@@ -159,6 +159,14 @@ public final class Voice {
     /** 最近一次 TTS 播报的文本与时刻：用来识别「自己刚说的话又被麦克风听回去」 */
     private volatile String lastSayText;
     private volatile long lastSayAt;
+    /**
+     * 上一帧是不是被播报守卫挡掉了。
+     *
+     * 播报期间我们**不往 ASR 里喂帧**（物理隔离）。那么守卫解除的那一帧必须先把
+     * 识别器重置一次：否则播报前的残留音频 + 播报后的第一句会被接成一句，
+     * 端点检测还会在中间多切一刀，吐出来的就是半截播报混着指令。
+     */
+    private volatile boolean speechGuardHeld;
     /** 本轮是否出现过「有用的文字」：3 秒没听清直接退出就看它 */
     private volatile boolean gotUsefulText;
     /** KWS 重建失败后的退避时刻：否则每 80ms 试一次，日志刷屏还费 CPU */
@@ -1063,6 +1071,32 @@ public final class Voice {
         lastPcmAt = SystemClock.elapsedRealtime();
         int st = state;
         if (st == S_LISTEN) {
+            // 【播报期物理隔离】只要我们自己还在出声（或刚说完），这一帧就直接不送 ASR。
+            //
+            // 以前是"先让 ASR 听、识别完再按文本比对过滤"——这条路必然漏：
+            //   · ASR 把播报识别成别的字 → 相似度不够，绕过去；
+            //   · 时间窗过期了才吐出字 → 守卫已经失效；
+            //   · 端点在播报中间切一刀 → 前半段被当指令，后半段又当一次指令。
+            // 漏一次就回一句"没找到…"，这句再被听回去 → 用户看到的自激循环。
+            // 不喂它，ASR 里就**根本不存在**这段音频，不需要任何事后判断。
+            if (withinSpeechGuard()) {
+                if (!speechGuardHeld) {
+                    speechGuardHeld = true;
+                    // 每轮播报只打一条：现场看日志就能确认"屏蔽真的生效了"，
+                    // 不用靠耳朵判断，也不会把音频线程刷爆。
+                    FileLog.append("VOICE 播报期屏蔽麦克风（本帧起不喂 ASR/KWS）");
+                }
+                partial = "";
+                return;
+            }
+            if (speechGuardHeld) {
+                // 守卫刚解除：丢掉播报前残留的流式上下文，从干净状态开始听
+                speechGuardHeld = false;
+                partial = "";
+                synchronized (lock) {
+                    if (asr != null) asr.begin();
+                }
+            }
             String t;
             synchronized (lock) {
                 if (asr == null) return;
@@ -1097,6 +1131,11 @@ public final class Voice {
             return;
         }
         if (st == S_WAKE && kws != null) {
+            // 播报期同样不喂唤醒词识别。
+            // 这是最隐蔽的一条自激回路：TTS 说「我在 / 要选第几个」→ 被 KWS 听成唤醒词
+            // → 又唤醒 → 又说「我在」→ 再被听回去……用户看到的就是"自己跟自己说话停不下来"。
+            // 唤醒词模型对短句尤其敏感，光靠 ASR 那层过滤根本挡不住。
+            if (withinSpeechGuard()) return;
             // 环形缓冲只为人声准备：静音段没必要存（KWS 本身必须连续喂，
             // 跳帧会把流式模型的上下文打断，唤醒词命中率会莫名其妙掉到 0）
             if (rms >= MIN_RMS) appendRing(buf, n);
@@ -1526,10 +1565,14 @@ public final class Voice {
         long elapsed = now - lastSayAt;
         String said = lastSayText;
         long est = 900L + 260L * (said == null ? 0 : said.length());
+        // 引擎自报"正在出声"最准，但它可能不回调（车机系统 TTS / 内置引擎的播放结束
+        // 回调都有丢失的现场）。所以**不能只信它**：估算时长本身就是硬下限 ——
+        // 以前这里回落到固定 1200ms，句子念 3 秒时后面 1.8 秒的播报照样被录进 ASR，
+        // 这就是"改了还是自说自听"的直接原因。
         try {
-            if (tts.isSpeaking() && elapsed < est + 3000L) return true;
+            if (tts.isSpeaking() && elapsed < est + 2500L) return true;
         } catch (Throwable ignored) { }
-        return elapsed < 1200L;
+        return elapsed < Math.max(1200L, est);
     }
 
     /**

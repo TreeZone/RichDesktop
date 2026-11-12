@@ -693,29 +693,63 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
      */
     public String topPkgOnDisplay(int displayId) {
         if (displayId < 0) return null;
-        String cmd = "dumpsys activity activities 2>/dev/null | awk -v h='Display #" + displayId
-                + " (activities' 'index($0,h)==1{inb=1;found=1;next}"
-                + " inb&&substr($0,1,9)==\"Display #\"{inb=0}"
-                + " inb&&/topResumedActivity/{print;printed=1;exit}"
-                + " END{if(!found)print \"" + TOP_UNKNOWN + "\";"
-                + " else if(!printed)print \"" + TOP_EMPTY + "\"}'";
-        String out;
+        long now = android.os.SystemClock.uptimeMillis();
+        // 缓存：一次 dumpsys 解析出**所有** display 的 top，1.2 秒内复用。
+        //
+        // 为什么必须缓存：单画退出检测原来每 250ms 调一次，每次 fork(sh+awk) 并让
+        // system_server 在 AMS 锁上遍历全部 activity/task（输出 1~2MB），
+        // 而且多个调用点（onResume / 每次返回 / 多处巡检）会并发跑 —— 常驻每秒
+        // 好几次全量 dumpsys，这是整机"越用越卡"的另一个直接来源。
+        synchronized (TOP_CACHE) {
+            if (topCacheAt != 0 && now - topCacheAt < TOP_CACHE_MS
+                    && TOP_CACHE.containsKey(displayId)) {
+                return TOP_CACHE.get(displayId);
+            }
+        }
+        // grep 只留两类行（输出几 KB，比全量 1~2MB 小两个数量级），解析放到 Java 里做
+        String dump;
         try {
-            out = Shell.capture(cmd);
+            dump = Shell.capture("dumpsys activity activities 2>/dev/null"
+                    + " | grep -E \"Display #|topResumedActivity\"");
         } catch (Throwable t) {
             return null;
         }
-        if (out == null) return null;
-        out = out.trim();
-        int nl = out.indexOf('\n');
-        if (nl > 0) out = out.substring(0, nl).trim();
-        if (out.equals(TOP_UNKNOWN)) return null;      // 段落没有 → displayId 可能过期，别动
-        if (out.equals(TOP_EMPTY)) return "";          // 有段落、没前台应用 = 这屏空着
-        java.util.regex.Matcher m = java.util.regex.Pattern
-                .compile("\\su\\d+\\s([A-Za-z0-9_.]+)/").matcher(out);
-        if (m.find()) return m.group(1);
-        return null;                                   // 命令失败/格式不认识 → 别动布局
+        if (dump == null) return null;
+        java.util.HashMap<Integer, String> fresh = new java.util.HashMap<>();
+        int cur = -1;
+        for (String raw : dump.split("\n")) {
+            String s = raw.trim();
+            if (s.startsWith("Display #")) {
+                int p = s.indexOf('#') + 1;
+                int e = p;
+                while (e < s.length() && Character.isDigit(s.charAt(e))) e++;
+                try {
+                    cur = Integer.parseInt(s.substring(p, e));
+                } catch (Throwable ignored) {
+                    cur = -1;
+                }
+                // 段落存在：先按"这屏空着"记，下面有 topResumedActivity 再覆盖
+                if (cur >= 0) fresh.put(cur, "");
+            } else if (cur >= 0 && s.contains("topResumedActivity")) {
+                java.util.regex.Matcher m = TOP_PAT.matcher(s);
+                if (m.find()) fresh.put(cur, m.group(1));
+            }
+        }
+        synchronized (TOP_CACHE) {
+            TOP_CACHE.clear();
+            TOP_CACHE.putAll(fresh);
+            topCacheAt = now;
+            // 段落不存在（displayId 过期）→ 返回 null，调用方不要据此改布局
+            return TOP_CACHE.containsKey(displayId) ? TOP_CACHE.get(displayId) : null;
+        }
     }
+
+    /** top 包名缓存：多块屏共用一次 dumpsys 的结果 */
+    private static final long TOP_CACHE_MS = 1_200L;
+    private static final java.util.Map<Integer, String> TOP_CACHE = new java.util.HashMap<>();
+    private static volatile long topCacheAt;
+    private static final java.util.regex.Pattern TOP_PAT =
+            java.util.regex.Pattern.compile("\\su\\d+\\s([A-Za-z0-9_.]+)/");
 
     /** 恢复单画前的布局（不在单画布局时什么都不做）。 */
     public void restoreSingleLayout() {

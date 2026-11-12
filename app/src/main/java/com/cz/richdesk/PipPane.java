@@ -104,6 +104,15 @@ public class PipPane {
     /** 被折叠隐藏（权重 0）：整块不参与触摸，但虚拟屏与 TextureView 都留着，恢复是热的 */
     private boolean collapsed;
 
+    /**
+     * 本实例的属主标识：虚拟屏槽位按 "PipDesk-N" 复用，重建期间新旧两个 Activity
+     * 会抢同一个槽位。带上它之后，旧实例退场时的 detach/release 才能被识别出来并跳过，
+     * 不会把新实例刚接上的 Surface 摘掉（详见 {@link PipDisplays.Slot#owner}）。
+     */
+    private static final java.util.concurrent.atomic.AtomicLong OWNER_SEQ =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final long ownerToken = OWNER_SEQ.incrementAndGet();
+
     public PipPane(Context ctx, int index, int dpi, int cornerDp, Callback cb) {
         this.app = ctx.getApplicationContext();
         this.dm = (DisplayManager) app.getSystemService(Context.DISPLAY_SERVICE);
@@ -745,7 +754,7 @@ public class PipPane {
                 // 不是这次算出来的 w/h —— resize 没成功时两者并不相等。
                 displayW = reuse.w;
                 displayH = reuse.h;
-                PipDisplays.bind(reuse, st, displayW, displayH);
+                PipDisplays.bind(reuse, st, displayW, displayH, ownerToken);
                 Log.i(TAG, "pane " + index + " 复用 display=" + displayId + " "
                         + displayW + "x" + displayH + " dpi=" + reuse.dpi + "（只换 surface，不动 task）");
                 // 焦点锚：屏内应用重建窗口时，这块屏也得有个可聚焦窗口顶着，
@@ -803,7 +812,7 @@ public class PipPane {
             s.w = w;
             s.h = h;
             s.dpi = dpi;
-            PipDisplays.put(key(), s);
+            PipDisplays.putOwned(key(), s, ownerToken);
             ignoreOrientationRequest(displayId);
             syncAnchor();
         }
@@ -863,7 +872,7 @@ public class PipPane {
      * **新 displayId** 的屏，而应用 task 还在旧 id 上 —— 新屏永远空白 = 卡死。
      */
     private void releaseDisplay() {
-        PipDisplays.detach(key());
+        PipDisplays.detach(key(), ownerToken);
         vd = null;
         displayId = -1;
         displayW = displayH = 0;
@@ -878,7 +887,8 @@ public class PipPane {
     private void destroyDisplay() {
         boolean hadApp = livePkg != null || pkg != null;
         livePkg = null;
-        PipDisplays.release(key());
+        // 带属主：旧实例退场时不能把新实例正在用的屏 release 掉
+        PipDisplays.releaseOwned(key(), ownerToken);
         vd = null;
         displayId = -1;
         displayW = displayH = 0;
@@ -1202,6 +1212,16 @@ public class PipPane {
     private volatile long lastMoveAt;
     private volatile int moveTries;
 
+    /**
+     * 探测在途闸门。
+     *
+     * 听诊器判"停帧"后会按 1.2 秒（快巡检 200ms）持续调 probeAndRevive，而每次探测
+     * 都要 new Thread + getRunningTasks 全校举 + getRunningAppProcesses 全校举。
+     * 静态页面本来就不出帧，等于**常驻**每秒给每块屏起一条线程、扫两遍全系统 task，
+     * 跑久了必然把整机拖慢。有了这道闸门，上一次探测没跑完就绝不再起新的。
+     */
+    private volatile boolean probing;
+
     /** 「task 跑到另一块虚拟屏」的节流：这是重复桌面实例的特征，处理方式是回收实例而不是搬 task */
     private static final long FOREIGN_GAP_MS = 3_000L;
     private volatile long lastForeignAt;
@@ -1243,6 +1263,7 @@ public class PipPane {
         if (fullscreened) return;                                  // 应用在主屏全屏，本屏本该是空的
         // 现场观察开关（/data/local/tmp/pipdesk_observe 存在即生效）：
         // 只记录不动作，用来区分「画面真的停了」和「我们误判后自己把它杀了重建」。
+        if (probing) return;                                       // 上一次探测还没跑完
         if (observeOnly()) {
             final long n = android.os.SystemClock.uptimeMillis();
             if (n - lastObserveLogAt > 2000) {
@@ -1257,8 +1278,10 @@ public class PipPane {
             }
             return;
         }
+        probing = true;
         new Thread(() -> {
-            final int[] st = taskState(keep);
+            try {
+                final int[] st = taskState(keep);
             if (st == null) return;                                // 状态读不到：宁可不救，别乱拉
             if (st[0] != disp) {                                   // 跑到别的屏
                 final long now = android.os.SystemClock.uptimeMillis();
@@ -1338,6 +1361,9 @@ public class PipPane {
                     restartApp();
                 }, 3000);
             });
+            } finally {
+                probing = false;          // 无论正常返回还是提前 return，闸门都要放开
+            }
         }, "pipdesk-revive").start();
     }
 

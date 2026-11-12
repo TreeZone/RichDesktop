@@ -133,12 +133,20 @@ public final class FileLog {
      * 触发的调用会在主线程等磁盘。现在统一丢后台，调用方零等待。
      */
     private static final java.util.concurrent.ExecutorService IO =
-            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "pipdesk-filelog-io");
-                t.setDaemon(true);
-                t.setPriority(Thread.MIN_PRIORITY);
-                return t;
-            });
+            new java.util.concurrent.ThreadPoolExecutor(
+                    1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+                    // 必须**有界**：原来用 newSingleThreadExecutor → LinkedBlockingQueue 无上限，
+                    // 日志产生速度一旦超过磁盘（车机 /sdcard 走 FUSE，每行 flush 更慢），
+                    // 队列只进不出，内存随时间线单调上涨 —— 表现就是"跑一段时间越来越卡"。
+                    // 满了丢最旧的：日志是排障用的，不能反过来拖垮桌面。
+                    new java.util.concurrent.ArrayBlockingQueue<>(256),
+                    r -> {
+                        Thread t = new Thread(r, "pipdesk-filelog-io");
+                        t.setDaemon(true);
+                        t.setPriority(Thread.MIN_PRIORITY);
+                        return t;
+                    },
+                    new java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy());
 
     /**
      * 追加一段多行文本（看门狗 dump 堆栈用）。与 logcat 抓取线程并行写入，
