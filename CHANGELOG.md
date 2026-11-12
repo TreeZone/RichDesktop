@@ -1,0 +1,119 @@
+# 更新记录
+
+记录每个版本「改了什么、为什么改、实测结论」。只看结论请看每节开头的加粗行。
+
+> **稳定基线：0.23.17 / vc161** —— 内置 TTS、语音共存、画中画与打开方式都已实测通过，
+> 后续以这一版为回滚点。
+
+---
+
+## 0.23.17 / vc161 — 内置 TTS 回到标贝 matcha（稳定版）
+
+**一句话：换回第一个语音模型，吐字清楚、时长正常，实测可交付。**
+
+- 模型：`matcha-icefall-zh-baker`（标贝中文单女声）+ `vocos-22khz-univ.onnx` 声码器。
+- **关键 API**：matcha 必须走 `OfflineTtsModelConfig.setMatcha(OfflineTtsMatchaModelConfig)`。
+  走 `setVits` 那条路是不通的——`OfflineTtsVitsModelConfig` 根本没有 vocoder 字段（javap 已确认），
+  配 matcha 的结果就是「模型加载成功但一句不响」。
+- 资源：模型 73MB + 声码器 52MB + jieba 词典 13MB + lexicon 1.4MB + 3 个 fst，APK 180MB。
+- ruleFsts = `phone.fst,date.fst,number.fst`（逗号分隔，**phone 必须排第一**）。
+- `TTS_MODEL_TAG` → `matcha-baker-zh-v1`。**换模型必须同步改它**，否则手机上旧的解压目录
+  会被「文件已存在」逻辑跳过，变成旧模型配新参数（历史事故，见 0.23.13）。
+- 新增 `LocalTts.probe()` 启动自检：加载后立刻合成两句并写日志采样点数，静默无声不用盲听。
+- 实测判据（回归用）：
+
+  | 文本 | 采样点 | 时长 |
+  |---|---|---|
+  | 你好（2 字） | 12112 | 549ms |
+  | 导航已启动，请注意行车安全（13 字） | 62702 | 2843ms |
+
+  时长随字数近似线性增长（≈0.22s/字）才正常。
+
+## 0.23.16 / vc160 — 给 huayan 补拼音词典（已废弃）
+
+**一句话：能出声了，但吐字发糊，用户实测否决，不再走这条路。**
+
+- 用官方预生成 `lexicon-zh-g2pw.txt`（`tts-models` release，2MB / 68012 条，格式 `一 y i 4 _`，
+  由 `scripts/piper/generate_lexicon_zh.py` 生成），删掉已无用的 espeak-ng-data（省 18MB）。
+- 自检「你好」只有 3584 采样点 / 0.16 秒，明显偏短——音素与模型训练分布对不上。
+- **结论：v2.0.x 上的 piper 中文模型不要碰**，音素级偏差调 noiseScale/lengthScale 修不好。
+
+## 0.23.15 / vc159 — 内置 TTS 换 huayan（失败，完全无声）
+
+**一句话：引擎显示「就绪」但一句都不响，根因是 sherpa-onnx v2.0.0 删掉了 espeak-ng。**
+
+- 换 `vits-piper-zh_CN-huayan-medium`（63MB 模型 + 907B tokens），按旧文档配了
+  `setDataDir(espeak-ng-data)`、`setLexicon("")`，加载成功 `sr=22050`，然后全程无声。
+- 根因（下载 v2.0.1 源码确认）：`csrc/` 里已搜不到任何 `espeak-ng-data`，so 里只剩一条
+  `espeak-ng is no longer used` 的告警。`OfflineTtsVitsImpl::InitFrontend()` 在
+  `is_piper && lexicon 非空` 时才建 `Lexicon`；lexicon 为空只打一行日志
+  `"phoneme_codepoints is empty, no lexicon, and no frontend available"`，
+  然后**返回空 samples——不抛异常、不崩溃**。这就是「就绪但无声」的真相。
+- 附带坑：`Lexicon::InitLanguage` 在模型 metadata 的 language 为空时
+  `SHERPA_ONNX_EXIT(-1)` 直接杀进程。
+
+## 0.23.14 / vc158 — 内置 TTS 响度/亮度/延迟优化（保留 melo）
+
+- `LocalTts.play` 加**峰值归一化（到 0.85）+ 轻度预加重（系数 0.92）**：
+  响度拉满解决嘈杂环境听不清，提升高频让音色更亮、更有辨识度，之后 clamp 防削顶。
+- 打开设置页即后台加载模型，点试播即时出声。
+
+## 0.23.13 / vc157 — 修「选中内置女声直接闪退」
+
+- 根因：`VoiceAssets.extract` 有「文件已存在就跳过」逻辑。手机上还留着旧标贝模型的解压目录，
+  换 melo 后再点内置，拷贝被跳过 → 实际仍是旧模型，却用 melo 的配置去加载 → 原生层 abort。
+- 修复：加 `.modeltag` 指纹文件（`TTS_MODEL_TAG`），指纹不符就整个目录清掉重解。
+
+## 0.23.12 / vc156 — 内置 TTS 换 melo
+
+- 标贝 matcha 断句偶有句间停顿（"语音助理"被切开），换 `melo-tts-zh_en`
+  （CppJieba 分词 + 按词边界安排韵律）。`setDictDir(p+"dict")`，ruleFsts 含 new_heteronym。
+- `VoiceAssets.extract` 改为**递归解压**（melo 的 dict/ 子目录必须跟着解出来）。
+
+## 0.23.11 / vc155 — 设置合并 + 试播台词 + 断句优化
+
+## 0.23.10 / vc154 — 内置离线 TTS（matcha 首次引入）
+
+- 新增 `LocalTts.java`：sherpa matcha-icefall-zh-baker 标贝中文女声 + vocos 声码器。
+- 动机：系统 TTS 缺失或入口被关掉时语音回复完全没声，内置引擎不依赖系统。
+
+## 0.23.9 / vc153 — 英文应用名候选可翻页
+
+- 英文名 app 可能几十个，改成**收全部 + 稳定排序 + 每页 9 条翻页**，也能直接说名字检索。
+- 别名改存**声母骨架**（`Pinyin.initials`）只用于排序，上限 78 分、**永不静默执行**。
+
+## 0.23.8 / vc152 — 英文应用名识别口径
+
+- ASR 是纯中文模型（词表全汉字），英文名永远吐不出来 → **猜不中必弹候选**，不做「记一次别名」。
+- 点选过的汉字串写进 `VoiceHotwords` 让解码收敛，收敛是概率性的，兜底常开。
+
+## 0.23.7 / vc151 — 语音匹配误判 + 唤醒词残字
+
+- 车机上有互为子串的 app（「波点音乐」与「音乐」）→ 加覆盖率门槛（≥70%）+ 该档上限 72 分，
+  避免短名字靠「被说法包含」拿高分。
+- 同音错字（波/播）不算错：整名读音一致给 96 分 `pinyin:exact` 直接命中。
+- 唤醒词尾巴（小瑞/小雷/我在）同时从字幕和匹配文本里剥掉，共用 `VoiceIntent.cleanWake()`；
+  **不做单字前缀剥除**，避免误伤「小红书」。
+
+## 0.23.6 / vc150 — 语音共存架构改版
+
+**一句话：不再主动停采让麦。**
+
+- 车机 AudioPolicyService `allowCapture=1` 允许多路并发录音（百度、厂商 gocsdk、高德可同时开麦），
+  让路只会让自己的常驻唤醒词长时间失效。
+- 常驻音源固定 `MediaRecorder.AudioSource.MIC`（source 1）；`VOICE_RECOGNITION` 在这台车机上
+  常读到全 0 死寂。
+- 拿到死寂只做 `recycleMic()` 换 input 路由重开；让路仅作 HAL 真独占时的兜底。
+
+## 0.23.5 / vc149 — 修 0.23.4 两个实测 bug
+
+## 0.23.4 / vc148 — 打开方式口径 + 画中画位置绑定
+
+- 设置页 `open_mode` = **默认**打开方式（持久、管所有常规路径）；
+  应用页长按 = **临时**打开方式（只对本次生效，不写 Prefs、不写 pane_map、不建绑定）。
+- 「指定画中画位置」是**建立绑定**（持久），与临时打开区分。
+- 所有「选当前值」的选择器统一用 `OptionPicker`（标题 + 分隔线 + 当前项淡底 + 右侧 ✓ + Ripple）。
+
+## 0.23.2 ~ 0.23.3 — 画中画收尾
+
+- ASR native 崩溃熔断；单画首开「第一次不显示」看门狗修复。

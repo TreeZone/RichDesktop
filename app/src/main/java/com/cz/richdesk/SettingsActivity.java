@@ -319,13 +319,19 @@ public class SettingsActivity extends AppCompatActivity {
             Voice.get().reloadWake();     // 阈值变了：丢掉旧模型，下次起麦按新值加载
         }, v -> v + "%（越小越容易唤醒）");
         toggle("提示音", Prefs.voiceBeep(this), b -> Prefs.setVoiceBeep(this, b));
-        toggle("语音回复（执行后说「好的」等，用系统 TTS）", Prefs.voiceReply(this),
+        toggle("语音回复（执行后说「好的」等，音色在下面选）", Prefs.voiceReply(this),
                 b -> Prefs.setVoiceReply(this, b));
-        action("TTS 引擎：当前「" + ttsEngineLabel(Prefs.voiceTtsEngine(this)) + "」（点按更换）",
-                this::pickTtsEngine);
+        action("语音引擎：" + voiceEngineLabel(), this::pickVoiceEngine);
+        // 已选内置离线女声：打开设置页就后台预热模型，点试播不再等加载（消除「点击后等一下」）
+        if (Prefs.voiceTtsMode(this) == Prefs.TTS_LOCAL) Voice.get().preheatLocalTts(this);
         toggle("唤醒后把桌面拉到前台", Prefs.voiceBringFront(this),
                 b -> Prefs.setVoiceBringFront(this, b));
         action("麦克风自检（录 5 秒，正常说话）", this::runMicProbe);
+        int aliasCount = 0;
+        for (java.util.Set<String> s : Prefs.parseAlias(Prefs.voiceAliasRaw(this)).values()) {
+            aliasCount += s.size();
+        }
+        action("语音别名：" + aliasCount + " 条（点按查看 / 删除）", this::showVoiceAliasManager);
         micResult = new TextView(this);
         micResult.setTextSize(12);
         micResult.setLineSpacing(Ui.dp(this, 3), 1f);
@@ -335,13 +341,15 @@ public class SettingsActivity extends AppCompatActivity {
         micResult.setText("自检结果会显示在这里，录音同时存到日志目录 mic-selftest.wav。");
         content.addView(micResult);
         note("· 语音只认「应用列表里真实存在的应用」，外加返回 / 主页 / 应用列表 / 息屏这几个内置指令。\n"
-                + "· 「打开高德」「导航」都能命中：靠名字模糊匹配 + 常用别名；\n"
-                + "  听不准时弹候选，点一次就记成别名，下次同样的说法直接命中。\n"
+                + "· 「打开高德」「导航」都能命中：名字模糊匹配 + 常用别名；听不准时弹候选。\n"
+                + "· 中文识别模型吐不出英文字母：说「打开 GPSBridge」会变成一串不相干的汉字，\n"
+                + "  这时会直接列出英文名应用，点一下或说「第一个」即可；点过的说法会写进\n"
+                + "  识别热词表，让这段发音的汉字输出逐渐收敛（不保证每次一样，所以候选常开）。\n"
                 + "· 唤醒词完全跑在本地（3.3MB 模型），不联网；常驻约 1% 单核。\n"
                 + "· 唤醒词可以改成任意 2~6 个汉字：设置里改完立刻生效（汉字→拼音音素是本地换算的）。\n"
                 + "· 报候选列表时会**继续听**：直接说「第一个 / 第二个」就能选，不用伸手点。\n"
-                + "· 和百度地图「小度小度」共用麦克风：若发现小度失灵，先关掉这个开关复测，\n"
-                + "  说明车机 HAL 只肯放一路采集，那就只能改成点图标说话。");
+                + "· 车机 audio policy 允许多路并发录音：常驻唤醒词与高德 / 百度的语音助手\n"
+                + "  可以同时在线，不会主动停采让麦（只有真独占时才会短暂避让）。");
 
         // 画中画路由：活动画中画 + 每屏默认应用（替代原来的「多屏分配」：
         // 单应用固定屏位在长按图标里设置）
@@ -361,8 +369,9 @@ public class SettingsActivity extends AppCompatActivity {
 
         section("说明");
         note("· 画中画顺序固定：横排从左到右、竖排从上到下，依次是画中画 1/2/3。\n"
-                + "· 未指定屏位的应用在「活动画中画」打开（可在上面改，默认最后一屏）；\n"
-                + "  想让某个应用固定在某一屏：长按应用图标 →「指定画中画位置」。\n"
+                + "· 未绑定应用的「默认打开方式」在上面设置：活动画中画 / 全屏 / 单画中画；\n"
+                + "  应用页长按可以「临时」换一种打开方式，只对那一次生效，不改默认设置。\n"
+                + "  想让某个应用固定在某一屏：长按应用图标 →「指定画中画位置」（这是建立绑定，持久生效）。\n"
                 + "· 画中画默认应用：桌面启动时，空闲的屏会自动打开这里指定的应用。\n"
                 + "· 画中画为空时是玻璃态，点 Dock 图标即在其中打开。\n"
                 + "· 已经在画中画里的应用，再点一次图标只会回到首页，不会重开。\n"
@@ -554,8 +563,11 @@ public class SettingsActivity extends AppCompatActivity {
 
     /** 选遮罩期点亮屏幕需要的点击次数 */
     private void pickWakeTaps() {
-        GlassMenu.show(this, "息屏后亮屏方式",
-                new CharSequence[]{"单击亮屏", "双击亮屏（防误触）", "三击亮屏（更防误触）"},
+        // 与所有选择器一致：当前项淡底色 + ✓，行标题也显示当前值
+        OptionPicker.show(this, "息屏后亮屏方式",
+                new String[]{"单击亮屏", "双击亮屏（防误触）", "三击亮屏（更防误触）"},
+                new String[]{"点一下就亮，最省事", "默认，避免误触", "最不容易误触"},
+                Prefs.getWakeTaps(this) - 1,
                 which -> {
                     Prefs.setWakeTaps(this, which + 1);
                     // 行标题是构建时写死的，改完重建页面（保持滚动位置）才能立刻看到新值
@@ -695,7 +707,7 @@ public class SettingsActivity extends AppCompatActivity {
         paneDefaultsBox.removeAllViews();
         int n = Prefs.getPaneCount(this);
         int active = Prefs.getActivePane(this, n);   // 默认最后一屏
-        actionTo(paneDefaultsBox, "未指定屏位的应用打开方式：" + openModeLabel(),
+        actionTo(paneDefaultsBox, "默认打开方式：" + openModeLabel(),
                 () -> pickOpenMode());
         actionTo(paneDefaultsBox, "活动画中画：画中画 " + active,
                 () -> chooseActivePane(n));
@@ -710,9 +722,13 @@ public class SettingsActivity extends AppCompatActivity {
 
     /** 配置活动画中画（1..屏数，只有一个） */
     private void chooseActivePane(final int paneCount) {
-        PaneChooser.show(this, "活动画中画（未指定的应用在这里打开）",
-                paneCount, Prefs.getActivePane(this, paneCount), false, which ->
-                        Prefs.setActivePane(this, which));
+        PaneChooser.show(this, "活动画中画（未绑定的应用在这里打开）",
+                paneCount, Prefs.getActivePane(this, paneCount), false, which -> {
+                    Prefs.setActivePane(this, which);
+                    // 旧版选完不刷新，行上还显示旧值 → 用户看到的就是「改了不生效」
+                    rebuildPaneDefaults();
+                    toast("活动画中画已设为画中画 " + which);
+                });
     }
 
     private String openModeLabel() {
@@ -783,7 +799,19 @@ public class SettingsActivity extends AppCompatActivity {
         }
     }
 
-    private void pickTtsEngine() {
+    private String voiceEngineLabel() {
+        String sel = Prefs.voiceTtsSel(this);
+        if (Prefs.TTS_SEL_LOCAL.equals(sel)) return "内置离线女声";
+        if (Prefs.TTS_SEL_SYS.equals(sel)) return "跟随系统";
+        return ttsEngineLabel(sel);   // 第三方引擎：显示 app 名
+    }
+
+    /**
+     * 语音引擎：合并原来「回复音色」与「指定 TTS 引擎」两行为一行。
+     * 两个固定项（内置离线女声 / 跟随系统）+ 本机已安装的非默认第三方 TTS 引擎。
+     * 选完立刻试听。
+     */
+    private void pickVoiceEngine() {
         PackageManager pm = getPackageManager();
         String sysDefault = null;
         try {
@@ -791,10 +819,21 @@ public class SettingsActivity extends AppCompatActivity {
                     getContentResolver(), "tts_default_synth");
         } catch (Throwable ignored) {
         }
-        List<CharSequence> labels = new ArrayList<>();
-        final List<String> pkgs = new ArrayList<>();
-        final List<String> seen = new ArrayList<>();     // 本机所有引擎包名（判断"已卸载"用）
-        boolean hasDefaultRow = false;
+        final List<String> labels = new ArrayList<>();
+        final List<String> hints = new ArrayList<>();
+        final List<String> sels = new ArrayList<>();   // 存进 prefs 的值
+        final List<String> seen = new ArrayList<>();    // 已安装引擎包名
+
+        // 固定项 1：内置离线女声
+        labels.add("内置离线女声");
+        hints.add("标贝中文女声，完全离线、不依赖系统 TTS；约 129MB 模型，首次会解压一次");
+        sels.add(Prefs.TTS_SEL_LOCAL);
+        // 固定项 2：跟随系统
+        labels.add("跟随系统");
+        hints.add("跟随 ROM 的 TTS 设置；引擎不可用或设置入口被裁掉时自动改用内置");
+        sels.add(Prefs.TTS_SEL_SYS);
+
+        // 第三方：本机所有 TTS_SERVICE，排除系统默认那个（已由「跟随系统」覆盖，避免重复）
         try {
             List<ResolveInfo> ris = pm.queryIntentServices(
                     new Intent("android.intent.action.TTS_SERVICE"), 0);
@@ -802,56 +841,67 @@ public class SettingsActivity extends AppCompatActivity {
                 if (ri == null || ri.serviceInfo == null) continue;
                 String p = ri.serviceInfo.packageName;
                 boolean isDefault = ri.isDefault || p.equals(sysDefault);
+                if (isDefault) continue;
                 CharSequence lb = ri.loadLabel(pm);
                 String name = lb == null ? p : lb.toString();
                 seen.add(p);
-                if (isDefault && !hasDefaultRow) {
-                    labels.add(name + "（系统默认）");
-                    pkgs.add("");                    // 空串 = 跟随系统默认
-                    hasDefaultRow = true;
-                } else {
-                    labels.add(name);
-                    pkgs.add(p);
-                }
+                labels.add(name);
+                hints.add(null);
+                sels.add(p);
             }
         } catch (Throwable ignored) {
         }
-        if (!hasDefaultRow) {
-            labels.add(0, "跟随系统默认（本机没有默认引擎）");
-            pkgs.add(0, "");
-        }
-        String cur = Prefs.voiceTtsEngine(this);
-        // 标出当前选中的那个：之前菜单里没有任何标记，用户选完再打开根本看不出选的是谁
-        for (int i = 0; i < pkgs.size(); i++) {
-            if (pkgs.get(i).equals(cur)) {
-                labels.set(i, "✓ " + labels.get(i));
+
+        String cur = Prefs.voiceTtsSel(this);
+        int curIdx = 0;
+        for (int i = 0; i < sels.size(); i++) {
+            if (sels.get(i).equals(cur)) {
+                curIdx = i;
                 break;
             }
         }
-        if (!cur.isEmpty() && !seen.contains(cur) && !pkgs.contains(cur)) {
-            labels.add("当前所选引擎已卸载（点这里回退默认）");
-            pkgs.add("");
+        // 当前选的第三方引擎已被卸载：补一行回退「跟随系统」
+        if (!Prefs.TTS_SEL_LOCAL.equals(cur) && !Prefs.TTS_SEL_SYS.equals(cur)
+                && !seen.contains(cur)) {
+            labels.add("当前所选引擎已卸载（点这里回退「跟随系统」）");
+            hints.add(null);
+            sels.add(Prefs.TTS_SEL_SYS);
+            curIdx = labels.size() - 1;
         }
-        GlassMenu.show(this, "TTS 引擎（回复的音色）",
-                labels.toArray(new CharSequence[0]),
-                "只列出本机已安装的 TTS 引擎。「系统默认」就是系统设置里当前选中的那个；"
-                        + "想换音色，装一个新的 TTS 引擎（如讯飞语记）后回到本页重新打开即可看到。",
+
+        OptionPicker.show(this, "语音引擎",
+                labels.toArray(new String[0]),
+                hints.toArray(new String[0]),
+                curIdx,
+                "内置离线女声完全离线；想用其他音色，装一个第三方 TTS 引擎（如讯飞语记）后重新打开本页即可看到。",
                 which -> {
-                    if (which < 0 || which >= pkgs.size()) return;
-                    String p = pkgs.get(which);
-                    Prefs.setVoiceTtsEngine(this, p);
+                    if (which < 0 || which >= sels.size()) return;
+                    String sel = sels.get(which);
+                    Prefs.setVoiceTtsSel(this, sel);
                     Voice.get().onTtsEngineChanged();
-                    toast("已选 " + labels.get(which));
+                    toast("已选「" + labels.get(which) + "」");
+                    recreateKeepScroll();
                     Voice.get().previewReply();
                 });
     }
 
+    /**
+     * 未绑定应用的「默认」打开方式（持久、全局）。
+     * 应用页长按里选的是「临时」方式，只对那一次打开生效，见 MainActivity.openPipTemp。
+     * 样式统一走 OptionPicker（= Dock 位置 / 功能区那套：当前项淡底色 + ✓）。
+     */
     private void pickOpenMode() {
-        GlassMenu.show(this, "未指定屏位的应用打开方式",
-                new CharSequence[]{"活动画中画（原行为）", "全屏打开", "单画中画（临时单屏布局）"},
+        final String[] labels = {"活动画中画", "全屏打开", "单画中画"};
+        final String[] hints = {
+                "在「活动画中画」那一块里打开（默认）",
+                "整个屏幕打开这个应用",
+                "额外单独建一个画中画显示，主页上的画中画不受影响"};
+        OptionPicker.show(this, "默认打开方式", labels, hints,
+                Prefs.getOpenMode(this),
+                "这是「默认」方式，管单击图标等常规打开；应用页长按可临时换一种，只对那一次生效。",
                 which -> {
                     Prefs.setOpenMode(this, which);
-                    toast("已改为「" + openModeLabel() + "」打开");
+                    toast("默认打开方式已改为「" + openModeLabel() + "」");
                     rebuildPaneDefaults();
                 });
     }
@@ -1644,6 +1694,54 @@ public class SettingsActivity extends AppCompatActivity {
         }
     };
     private TextView toastView;
+
+    /**
+     * 语音别名管理：列出学过的说法，点一条删除，或清空全部。
+     * 弹框统一用 OptionPicker（设置页 Dock 位置 / 功能区那套基准样式）。
+     *
+     * 英文应用名每次识别出的汉字都可能不同，所以这里不提供「手写精确别名」——
+     * 在候选里点一次就自动学一条，比手敲更贴合真实发音；别名同时会进热词表。
+     */
+    private void showVoiceAliasManager() {
+        java.util.Map<String, java.util.Set<String>> map =
+                Prefs.parseAlias(Prefs.voiceAliasRaw(this));
+        final java.util.List<String[]> rows = new ArrayList<>();
+        for (java.util.Map.Entry<String, java.util.Set<String>> e : map.entrySet()) {
+            for (String phrase : e.getValue()) rows.add(new String[]{e.getKey(), phrase});
+        }
+        java.util.List<String> labels = new ArrayList<>();
+        java.util.List<String> hints = new ArrayList<>();
+        for (String[] row : rows) {
+            labels.add("「" + row[1] + "」");
+            hints.add("→ " + row[0]);
+        }
+        if (rows.isEmpty()) {
+            OptionPicker.show(this, "语音别名（0 条）",
+                    new String[]{"还没有学过的说法"},
+                    new String[]{"听不准时点一次候选，会自动记一条"},
+                    -1,
+                    "中文识别模型吐不出英文字母；第一次说英文应用，要在候选里点一次。",
+                    null);
+            return;
+        }
+        labels.add("清空全部（" + rows.size() + " 条）");
+        hints.add("删掉所有已学说法，重新学");
+        OptionPicker.show(this, "语音别名（" + rows.size() + " 条）",
+                labels.toArray(new String[0]), hints.toArray(new String[0]), -1,
+                "点一条即删除。别名会同时写进识别热词表，让英文发音的汉字输出逐渐收敛。",
+                which -> {
+                    if (which == rows.size()) {
+                        Prefs.clearVoiceAlias(this);
+                        toast("已清空全部语音别名");
+                    } else if (which >= 0 && which < rows.size()) {
+                        Prefs.removeVoiceAlias(this, rows.get(which)[0], rows.get(which)[1]);
+                        toast("已删除「" + rows.get(which)[1] + "」");
+                    } else {
+                        return;
+                    }
+                    recreateKeepScroll();     // 行标题里的条数要立刻更新
+                });
+    }
 
     /**
      * 窗口内浮层提示（替代系统 Toast）。

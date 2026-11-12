@@ -40,8 +40,8 @@ android {
         applicationId "com.cz.richdesk"
         minSdk 28
         targetSdk 30
-        versionCode 145
-        versionName "0.23.1"
+        versionCode 161
+        versionName "0.23.17"
 
         // 语音链路只带 arm64：sherpa-onnx 的 onnxruntime.so 占 21MB，
         // 四个 ABI 全打进去 APK 会直接翻倍。车机是 arm64，够用。
@@ -78,6 +78,15 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
+    }
+
+    /*
+     * 模型资源（onnx 声学/声码模型、fst 文本正则化、txt 词典）不压缩存储。
+     * 这些都是已压缩的二进制或文本，aapt2 再压几乎压不掉，反而拖慢构建、制造内存峰值；
+     * sherpa 原生层走 extract→绝对路径读，不压缩让首次解压拷贝更快。
+     */
+    aaptOptions {
+        noCompress 'onnx', 'fst', 'txt'
     }
 
     /*

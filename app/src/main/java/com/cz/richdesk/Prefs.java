@@ -883,14 +883,48 @@ public class Prefs {
         sp(c).edit().putBoolean("voice_reply", on).apply();
     }
 
-    /** TTS 引擎包名（"" = 跟随系统默认）。用户装了第三方 TTS 可以在这里指定音色 */
-    public static String voiceTtsEngine(Context c) {
-        String s = sp(c).getString("voice_tts_engine", "");
-        return s == null ? "" : s;
+    /** 语音引擎的三种来源（数据统一存在 voice_tts_sel 这一个键里） */
+    public static final int TTS_SYS = 0;       // 系统默认（不可用时自动降级内置）
+    public static final int TTS_LOCAL = 1;     // 内置离线女声（LocalTts）
+    public static final int TTS_CUSTOM = 2;    // 第三方 TTS 引擎包名
+
+    /** voice_tts_sel 的取值：local=内置离线女声 / sys=跟随系统 / 其余为第三方引擎包名 */
+    public static final String TTS_SEL_LOCAL = "local";
+    public static final String TTS_SEL_SYS = "sys";
+
+    /**
+     * 当前语音引擎选择（单一真相，合并「回复音色」与「指定 TTS 引擎」两行为一行）。
+     * 首次从旧的 voice_tts_mode / voice_tts_engine 迁移并写回新键；之后只认新键。
+     * 默认「跟随系统」，系统引擎不可用时 VoiceTts 会自动改用内置，不会哑掉。
+     */
+    public static String voiceTtsSel(Context c) {
+        String s = sp(c).getString("voice_tts_sel", null);
+        if (s != null) return s;
+        int m = sp(c).getInt("voice_tts_mode", TTS_SYS);
+        String eng = sp(c).getString("voice_tts_engine", "");
+        String sel = (m == TTS_LOCAL) ? TTS_SEL_LOCAL
+                : (eng != null && !eng.isEmpty()) ? eng : TTS_SEL_SYS;
+        setVoiceTtsSel(c, sel);
+        return sel;
     }
 
-    public static void setVoiceTtsEngine(Context c, String pkg) {
-        sp(c).edit().putString("voice_tts_engine", pkg == null ? "" : pkg).apply();
+    public static void setVoiceTtsSel(Context c, String sel) {
+        sp(c).edit().putString("voice_tts_sel",
+                (sel == null || sel.isEmpty()) ? TTS_SEL_SYS : sel).apply();
+    }
+
+    /** 解析出 VoiceTts 需要的 mode（数据统一来自 voiceTtsSel） */
+    public static int voiceTtsMode(Context c) {
+        String sel = voiceTtsSel(c);
+        if (TTS_SEL_LOCAL.equals(sel)) return TTS_LOCAL;
+        if (TTS_SEL_SYS.equals(sel)) return TTS_SYS;
+        return TTS_CUSTOM;       // 其余都是第三方引擎包名
+    }
+
+    /** 解析出第三方引擎包名（local / sys 返回空串） */
+    public static String voiceTtsEngine(Context c) {
+        String sel = voiceTtsSel(c);
+        return (TTS_SEL_LOCAL.equals(sel) || TTS_SEL_SYS.equals(sel)) ? "" : sel;
     }
 
     /**
@@ -935,8 +969,11 @@ public class Prefs {
 
     /**
      * 用户教给语音的别名：「包名=别名1|别名2;包名=别名3」。
-     * 识别结果匹配不到应用时会弹候选卡片，用户点一下就把当时的说法记进来，
-     * 下次同样的说法直接命中 —— 关键词匹配靠这个越用越准，不需要任何模型。
+     * 识别结果匹配不到应用时会弹候选卡片，用户点一下就把当时的说法记进来。
+     *
+     * 注意：英文应用名的 ASR 汉字输出**每次都不一样**，所以这些别名不再被当作
+     * 「下次精确命中」的钥匙，而是两种用途：①转声母骨架做候选排序；
+     * ②写进识别热词表，让解码逐渐收敛到学过的写法（见 Voice.syncHotwordAliases）。
      */
     public static String voiceAliasRaw(Context c) {
         String s = sp(c).getString("voice_alias", "");
@@ -960,7 +997,26 @@ public class Prefs {
             set = new java.util.LinkedHashSet<>();
             map.put(pkg, set);
         }
-        set.add(p);
+        set.add(p);                 // 同一个 app 累积多条，不是覆盖 —— 每次发音吐的字不一样
+        writeVoiceAlias(c, map);
+    }
+
+    /** 删掉某一条已学说法（设置页别名管理用） */
+    public static void removeVoiceAlias(Context c, String pkg, String phrase) {
+        java.util.Map<String, java.util.Set<String>> map = parseAlias(voiceAliasRaw(c));
+        java.util.Set<String> set = map.get(pkg);
+        if (set == null) return;
+        set.remove(phrase);
+        if (set.isEmpty()) map.remove(pkg);
+        writeVoiceAlias(c, map);
+    }
+
+    public static void clearVoiceAlias(Context c) {
+        sp(c).edit().putString("voice_alias", "").apply();
+    }
+
+    private static void writeVoiceAlias(Context c,
+                                        java.util.Map<String, java.util.Set<String>> map) {
         StringBuilder sb = new StringBuilder();
         for (java.util.Map.Entry<String, java.util.Set<String>> e : map.entrySet()) {
             if (sb.length() > 0) sb.append(';');

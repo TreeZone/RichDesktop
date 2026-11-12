@@ -65,6 +65,59 @@ final class Pinyin {
         return out;
     }
 
+    /**
+     * 声母骨架：把汉字串转成「每个音节的首字母」序列。
+     *
+     * 为什么需要它：中文 ASR 听英文时，是把英文音素用读音相近的汉字拼出来，
+     * **同一个人每次吐的汉字都不一样**（gpsbridge 这次「吉普斯布里奇」、
+     * 下次「基皮埃斯布里奇」）。整串汉字 / 整串拼音都匹配不上，但两者的
+     * 声母骨架都是 j-p-s-b-l-q —— 音节切分的漂移被零声母跳过吸收掉了。
+     *
+     * 实现复用 ICU 的链式转写（Han-Latin 输出按字带空格 "ji pu si bu li qi"），
+     * 每段取首字母即可：zh/ch/sh 的首字母天然就是 z/c/s，等于自动折叠了翘舌。
+     * 再补一层 r→l：这台车机的 ASR 常把「瑞」听成「雷」（r/l 混）。
+     *
+     * 它**只用于候选排序**，不作为直接执行的依据（见 VoiceIntent.skeletonScore）。
+     * ICU 没给音节分隔时会退化成很短的串，那种情况直接返回空串让上层忽略，不帮倒忙。
+     */
+    static synchronized String initials(String s) {
+        if (s == null || s.isEmpty()) return "";
+        String out = s;
+        if (!broken && init()) {
+            try {
+                for (Transliterator t : chain) {
+                    if (t != null) out = t.transliterate(out);
+                }
+            } catch (Throwable ignored) {
+                out = s;
+            }
+        }
+        StringBuilder b = new StringBuilder();
+        int i = 0;
+        while (i < out.length()) {
+            char c = deTone(out.charAt(i));
+            if (c >= 'A' && c <= 'Z') c = (char) (c + 32);
+            if (c >= 'a' && c <= 'z') {
+                char first = c;
+                i++;
+                while (i < out.length()) {           // 跳过这个音节剩下的字母
+                    char n = deTone(out.charAt(i));
+                    if (n >= 'A' && n <= 'Z') n = (char) (n + 32);
+                    if (n >= 'a' && n <= 'z') i++;
+                    else break;
+                }
+                // 零声母音节（a/e/o 起头）最不稳定，这次有下次没有，直接不算
+                if (first == 'a' || first == 'e' || first == 'o') continue;
+                if (first == 'r') first = 'l';        // 小瑞 → 小雷
+                b.append(first);
+            } else {
+                i++;                                  // 空格 / 标点 / 数字都当分隔符
+            }
+        }
+        // 退化保护：没有音节分隔时整串会被当成 1 个音节，骨架没有区分力
+        return b.length() >= 3 ? b.toString() : "";
+    }
+
     /** 去掉所有非字母数字字符并转小写："ku gou yin le" → "kugouyinle" */
     private static String squeeze(String s) {
         StringBuilder b = new StringBuilder(s.length());

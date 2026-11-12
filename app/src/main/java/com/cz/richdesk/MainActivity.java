@@ -151,6 +151,9 @@ public class MainActivity extends AppCompatActivity
     }
     /** 语音候选列表的弹窗（说「第一个」时要能收掉它） */
     private android.app.Dialog voiceCandMenu;
+    /** 单画模式下连续点返回的次数：app 自己拦截 BACK 时的兜底（见 forceExitSingleIfStuck） */
+    private volatile int singleBackCount;
+    private volatile String singleBackForPkg;
 
     // 上次应用的配置，用于从设置页返回时做增量刷新
     private int appliedPaneCount = -1, appliedDpi = -1, appliedPipCorner = -1;
@@ -532,11 +535,22 @@ public class MainActivity extends AppCompatActivity
         }
 
         // 调试钩子：无手指时直接在画中画里开一个应用，验证虚拟屏链路
-        //   --es debug_voice 1 → 直接触发一次聆听（自测超时用）
+        //   --es debug_voice 1 [--ei debug_voice_at 毫秒] → 触发一次聆听；
+        //   延时给足（如 6000）可让应用列表先就绪，验证热词表加载路径
         if (dbgIntent != null && dbgIntent.hasExtra("debug_voice")) {
             dbgIntent.removeExtra("debug_voice");
+            final long vDelay = dbgIntent.getIntExtra("debug_voice_at", 900);
+            dbgIntent.removeExtra("debug_voice_at");
             new android.os.Handler(android.os.Looper.getMainLooper())
-                    .postDelayed(() -> Voice.get().listenOnce(), 900);
+                    .postDelayed(() -> Voice.get().listenOnce(), vDelay);
+        }
+        //   --ei debug_mode 0/1/2 → 临时设置「打开方式」（0 活动画中画 1 全屏 2 单画），
+        //   配合 debug_open 自动化验证单画链路
+        if (dbgIntent != null && dbgIntent.hasExtra("debug_mode")) {
+            final int mode = dbgIntent.getIntExtra("debug_mode", 0);
+            dbgIntent.removeExtra("debug_mode");
+            Prefs.setOpenMode(this, mode);
+            Log.i("PipDesk", "debug_mode 打开方式=" + mode);
         }
         //   --es debug_open <包名> [--ei debug_open_pane 0]
         if (dbgIntent != null && dbgIntent.hasExtra("debug_open")) {
@@ -551,12 +565,6 @@ public class MainActivity extends AppCompatActivity
         }
 
         // 调试钩子：先开一个应用，等一下再模拟点一次「返回」（验证单画收尾）
-        //   --es debug_voice 1 → 直接触发一次聆听（自测超时用）
-        if (dbgIntent != null && dbgIntent.hasExtra("debug_voice")) {
-            dbgIntent.removeExtra("debug_voice");
-            new android.os.Handler(android.os.Looper.getMainLooper())
-                    .postDelayed(() -> Voice.get().listenOnce(), 900);
-        }
         //   --es debug_open <包名> [--ei debug_open_pane 0] --ei debug_back_at 4000
         if (dbgIntent != null && dbgIntent.getIntExtra("debug_back_at", 0) > 0) {
             final int at = dbgIntent.getIntExtra("debug_back_at", 0);
@@ -1991,19 +1999,16 @@ public class MainActivity extends AppCompatActivity
      * "只看不摸"的死画面：点按没反应、滑动被宿主当成翻页/拖拽。
      * 现在由 PipManager.Listener.onPaneCreated 回调进来补绑。
      */
+    /** 屏内 app 的系统长按约 500ms；画中画菜单要等「超长按」才出，先把它让出来 */
+    private static final long PANE_SUPER_LONG_MS = 1200L;
+    private static final float PANE_SUPER_LONG_SLOP_DP = 14f;
+
     private void bindPaneGesture(final PipPane pane) {
         if (pane == null || pane.root == null) return;
-        // 长按已接管：这次手势剩下的 MOVE/UP 一律不转发（否则松手会在屏内应用里点一下）
+        // 超长按已接管：这次手势剩下的 MOVE/UP 一律不转发（否则松手会在屏内应用里点一下）
         final boolean[] consumed = new boolean[1];
         final GestureDetector gd = new GestureDetector(this,
                 new GestureDetector.SimpleOnGestureListener() {
-                    @Override
-                    public void onLongPress(MotionEvent e) {
-                        consumed[0] = true;
-                        pip.cancelTouch();     // 给屏内应用补 CANCEL，掐断它的按压
-                        showPaneMenu(pane);
-                    }
-
                     /** 空白的画中画：单击直接弹应用列表（需求 2） */
                     @Override
                     public boolean onSingleTapUp(MotionEvent e) {
@@ -2013,6 +2018,19 @@ public class MainActivity extends AppCompatActivity
                         return true;
                     }
                 });
+        // 【需求一.4】画中画内长按优先显示 app 自己的长按效果，超长按才弹画中画菜单。
+        // 计时期间所有事件照常 pip.dispatch 给屏内 app —— 旧版 GestureDetector.onLongPress
+        // 500ms 就 cancelTouch 掐断它，方向正好相反。单画专用屏走的是同一套（onPaneCreated）。
+        final Runnable[] superLong = new Runnable[1];
+        final Runnable cancelSuperLong = () -> {
+            if (superLong[0] != null) {
+                pane.root.removeCallbacks(superLong[0]);
+                superLong[0] = null;
+            }
+        };
+        final float superSlopPx = android.util.TypedValue.applyDimension(
+                android.util.TypedValue.COMPLEX_UNIT_DIP, PANE_SUPER_LONG_SLOP_DP,
+                getResources().getDisplayMetrics());
         final float[] gst = new float[5];   // 0,1=起手坐标 2=最大位移 3=帧数 4=按下时刻
         pane.root.setOnTouchListener((v, e) -> {
             if (!pane.isInteractive()) {
@@ -2029,6 +2047,16 @@ public class MainActivity extends AppCompatActivity
                 gst[2] = 0;
                 gst[3] = 0;
                 gst[4] = android.os.SystemClock.uptimeMillis();
+                cancelSuperLong.run();          // 幂等：新手势开始前先清掉上一轮计时
+                Runnable fire = () -> {
+                    superLong[0] = null;
+                    consumed[0] = true;
+                    pip.cancelTouch();          // 到点才掐断屏内 app 的按压
+                    FileLog.append("画中画 " + pane.index + " 超长按 → 弹画中画菜单");
+                    showPaneMenu(pane);
+                };
+                superLong[0] = fire;
+                pane.root.postDelayed(fire, PANE_SUPER_LONG_MS);
                 // 轨迹日志只在排查模式（/sdcard/pipdesk_verbose）下输出：
                 // 每次按下都要拼长字符串 + getLocationOnScreen，再加上
                 // Watchdog.touch 里的时间戳格式化，正常使用纯属白烧 CPU/IO。
@@ -2050,8 +2078,11 @@ public class MainActivity extends AppCompatActivity
                 float d = (float) Math.hypot(e.getX() - gst[0], e.getY() - gst[1]);
                 if (d > gst[2]) gst[2] = d;
                 gst[3]++;
+                // 明显在拖动/滑动：不是超长按，取消计时，事件继续照常给屏内 app
+                if (d > superSlopPx) cancelSuperLong.run();
             } else if (e.getActionMasked() == MotionEvent.ACTION_UP
                     || e.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+                cancelSuperLong.run();     // 抬手即取消：只有一直按住才会弹画中画菜单
                 // 宿主手指的真实轨迹：与注入侧日志对照，能区分是手指漂移还是转发丢失
                 if (PipDebug.VERBOSE) {
                     PipDebug.log("pane " + pane.index
@@ -2271,19 +2302,39 @@ public class MainActivity extends AppCompatActivity
      *     （活动画中画【默认】/ 单画中画 / 全屏）。**打开动作本身不写入任何绑定**，
      *     所以它下次点开还是按设置走，不会因为"开过一次"就被钉在某块屏上。
      */
+    /** 常规打开（单击图标 / Dock / 语音 / 自动拉起）：按设置页的「默认打开方式」 */
     private void openPip(String pkg, int preferred) {
+        openPip(pkg, preferred, Prefs.getOpenMode(this), false);
+    }
+
+    /**
+     * 应用页长按：临时按指定方式打开这一次。
+     * 不写 Prefs、不写 pane_map / pane_default_N、不建立任何绑定关系；
+     * 下一次点开仍回到设置页的默认方式。只对未绑定应用适用
+     * （已绑定应用走绑定屏位，菜单里也不会给出点了没反应的临时项）。
+     */
+    private void openPipTemp(String pkg, int mode) {
+        if (pip != null && pip.isAssigned(pkg)) {
+            toast("这个应用已绑定画中画位置，临时打开方式不适用");
+            return;
+        }
+        openPip(pkg, 0, mode, true);
+    }
+
+    private void openPip(String pkg, int preferred, int mode, boolean temp) {
         if (pkg == null) return;
         boolean bound = pip.isAssigned(pkg);
-        int mode = Prefs.getOpenMode(this);
         FileLog.append("打开 " + pkg + " 显式屏位=" + preferred
                 + " 绑定屏位=" + (bound ? pip.paneOfPkg(pkg) + 1 : 0)
                 + " 打开方式=" + (mode == Prefs.OPEN_SINGLE ? "单画"
                 : mode == Prefs.OPEN_FULLSCREEN ? "全屏" : "活动画中画")
+                + (temp ? "（临时）" : "（默认）")
                 + " 单画布局=" + pip.inSingleMode());
         if (preferred <= 0 && !bound) {
             if (mode == Prefs.OPEN_SINGLE) {
                 // 单画用独立的虚拟屏，主页画中画一个都不碰（返回时零闪烁，见 PipManager.openSingle）
                 pip.openSingle(pkg);
+                resetSingleBackCounter();   // 新一轮单画：返回计数从头开始
                 if (pager.getCurrentPage() != 0) pager.setCurrentPageSmooth(0);
                 return;
             }
@@ -2309,6 +2360,7 @@ public class MainActivity extends AppCompatActivity
         // 幂等：已在跑的应用由 PipPane.open 自己判断（同一 pkg 先校验 task 是否还活着）。
         // 不能因为"记着这个 pkg"就整段跳过 —— 应用被「返回」退掉后 pkg 还记着，跳过就变成"点了没反应"。
         pip.open(pkg, preferred);
+        resetSingleBackCounter();   // 切换/重新打开应用：单画返回计数从头开始
         // 刚在某个屏上打开了应用 → 那块屏成为返回键的目标（用户的心理预期就是"返回到刚开的那个"）
         int idx = pip.indexOfPkg(pkg);
         if (idx >= 0) lastActivePane = pip.pane(idx);
@@ -2464,21 +2516,28 @@ public class MainActivity extends AppCompatActivity
 
     @Override
     public void onVoiceCandidates(String phrase, List<AppInfo> cands) {
-        if (cands == null || cands.isEmpty()) return;
+        // 先无条件收掉上一张：cands 为空代表语音侧说了「都不是」要取消，
+        // 旧版这里直接 return，卡片会一直挂在屏幕上。
         if (voiceCandMenu != null) {
             voiceCandMenu.dismiss();
             voiceCandMenu = null;
         }
-        List<String> items = new ArrayList<>(cands.size() + 1);
+        if (cands == null || cands.isEmpty()) return;
+        List<String> items = new ArrayList<>(cands.size() + 2);
         for (AppInfo a : cands) items.add(a.label);
         items.add("都不是");
-        voiceCandMenu = GlassMenu.show(this, "「" + phrase + "」是哪个？说「第一个」也行", items, which -> {
+        items.add("下一页 ›");
+        voiceCandMenu = GlassMenu.show(this, "「" + phrase + "」是哪个？说序号 / 说名字也行", items, which -> {
             voiceCandMenu = null;
-            if (which < 0 || which >= cands.size()) return;
+            if (which == cands.size() + 1) {      // 翻页：完整候选按 9 个一页，列表和序号一起换
+                Voice.get().flipPickPage(1);
+                return;
+            }
+            if (which < 0 || which >= cands.size()) return;   // 「都不是」：静默取消
             AppInfo pick = cands.get(which);
-            // 用户点过就记住这个说法：下一次同样的发音直接命中，不用再选
             Prefs.addVoiceAlias(this, pick.pkg, phrase);
-            FileLog.append("VOICE 学到别名 \"" + phrase + "\" → " + pick.label);
+            FileLog.append("VOICE 学到别名 \"" + phrase + "\" → " + pick.label
+                    + "（本页第 " + (which + 1) + " 个）");
             openPip(pick.pkg, 0);
         });
     }
@@ -2560,7 +2619,9 @@ public class MainActivity extends AppCompatActivity
             // 单画临时布局：这一下返回可能把「临时应用」弄走（退出、或只是退到后台）。
             // 两种情况下这块屏的前台都会换人，而用户下一步想看的是原来的双画/三画。
             if (pip != null && pip.inSingleMode()) {
-                watchSingleExitIfNeeded();
+                // 【bug 2】有些 app（万能遥控等）自己消费 BACK，按多少次都不退出。
+                // 连续几次仍赖在前台就强制恢复原布局，别把用户卡在单画里。
+                if (!forceExitSingleIfStuck()) watchSingleExitIfNeeded();
             } else if (pkg != null) {
                 // 普通画中画：应用被真按退出后这块屏就空了，得把画面清掉 ——
                 // 否则纹理停在最后一帧，用户会以为"返回键没反应"
@@ -2600,13 +2661,72 @@ public class MainActivity extends AppCompatActivity
                 final String nowTop = top;
                 runOnUiThread(() -> {
                     if (pane.pkg() == null || !pkg.equals(pane.pkg())) return;
-                    FileLog.append("画中画 " + pkg + " 已退出（现在 "
-                            + (nowTop.isEmpty() ? "空屏" : nowTop) + "）→ 清空这块屏");
-                    pane.close();
+                    // 【bug 1】按返回后前台换人，不一定是「应用真退出了」：
+                    // PipPane.open() 换应用时旧 task 留在栈底，返回露出的常常就是这块屏
+                    // 原来的常驻/默认应用（日志实测 com.cz.gps / com.baidu.naviauto）。
+                    // 旧版一律 pane.close()，连同栈底一起清空，且 openDefaults() 只在启动时跑，
+                    // 于是「双画布局恢复了，但活动画中画里的 app 没显示回来」。
+                    final int slot = pane.index + 1;
+                    String base = Prefs.getDefaultApp(MainActivity.this, slot);
+                    if (base == null) base = pane.basePkg();
+                    if (base == null || base.equals(pkg)) {
+                        FileLog.append("画中画 " + pkg + " 已退出（现在 "
+                                + (nowTop.isEmpty() ? "空屏" : nowTop) + "）→ 无基准应用，清空这块屏");
+                        pane.close();
+                        return;
+                    }
+                    if (nowTop.equals(base)) {
+                        // 前台已经是基准应用：只把记录对齐，别重开、别清屏（零闪烁）
+                        FileLog.append("画中画 " + pkg + " 返回后露出基准应用 " + base
+                                + " → 对齐记录，保持显示");
+                        pane.adoptForeground(base);
+                    } else {
+                        // 空屏 / 换成无关应用：把基准应用重新拉回这块屏
+                        FileLog.append("画中画 " + pkg + " 已退出（现在 "
+                                + (nowTop.isEmpty() ? "空屏" : nowTop) + "）→ 恢复基准应用 " + base);
+                        if (pip != null) pip.open(base, slot);
+                    }
                 });
                 return;
             }
         }, "pipdesk-pane-exit").start();
+    }
+
+    /**
+     * 【bug 2 兜底】单画模式下连续点返回，临时应用却始终不退出时，强制恢复原布局。
+     *
+     * 为什么需要：watchSingleExit 只在每次 sendBack 之后起一个约 790ms 的一次性线程，
+     * 判据是「前台还是不是这个 pkg」。万能遥控这类 app 自己消费 BACK（或返回栈不 finish），
+     * top 一直是它 → 每次都被判成「应用内返回，保持单画」，按十次也不会恢复。
+     * 小米社区按 1~2 次就变空屏，走正常 watchSingleExit 分支，不会碰到这个兜底。
+     *
+     * 保留「应用内返回（详情→列表）不恢复布局」的语义：只有连续 3 次返回都没让
+     * top 变化才出手。restoreSingleAfterExit() 自带 singleMode 保护，重复调用幂等。
+     *
+     * @return true = 已强制恢复布局，调用方不必再起 watchSingleExit 线程
+     */
+    private void resetSingleBackCounter() {
+        singleBackCount = 0;
+        singleBackForPkg = null;
+    }
+
+    private boolean forceExitSingleIfStuck() {
+        if (pip == null || !pip.inSingleMode()) return false;
+        final String cur = pip.singleAppPkg();
+        if (cur == null) return false;
+        if (!cur.equals(singleBackForPkg)) {
+            singleBackForPkg = cur;      // 换了临时应用：计数从头开始
+            singleBackCount = 0;
+        }
+        singleBackCount++;
+        if (singleBackCount < 3) return false;
+        singleBackCount = 0;
+        FileLog.append("单画 " + cur + " 连续 3 次返回仍在前台 → 强制恢复原布局");
+        if (pip.inSingleMode()) {
+            pip.restoreSingleAfterExit();   // 只恢复布局，单画屏留着复用，不做冷启动
+            toast("已退出单画");
+        }
+        return true;
     }
 
     /** 单画布局中时，盯一下单画专用屏的前台应用有没有换人 */
@@ -2632,6 +2752,62 @@ public class MainActivity extends AppCompatActivity
     private void watchSingleExit(final String pkg, final int displayId) {
         if (displayId < 0) return;
         new Thread(() -> {
+            /*
+             * 【两段式】（用户实测："第一次点不显示，第二次才正常"，日志 09:41:58 现场抓到）
+             *
+             * 首次单画打开时应用刚被 force-stop 重启，头几百毫秒这块屏没帧、
+             * topResumedActivity 是空的 —— 旧版直接把"空屏"判成"已退出"，
+             * 单画布局刚摆好就被撤回双画，应用起来了用户也看不见。
+             * （0.23.2 的第一版护栏用"帧数超过打开时刻基线"防这个，但虚拟屏建好时
+             *   会吐一帧空帧，frames 立刻超过基线，护栏被穿透 —— 手机上复现。）
+             *
+             * 所以判据改为**状态机**：只有确认应用真的到过前台（top==pkg）之后，
+             * "空屏 / 换成别的应用"才算退出；应用还没出现过时，空屏是正常的启动
+             * 空窗，继续等；10 秒还没出现过就放弃监视、不动布局
+             * （PipPane.firstOpenWatchdog 会兜底重新拉起）。
+             */
+            long deadline = android.os.SystemClock.elapsedRealtime() + 10_000L;
+            boolean everForeground = false;
+            while (true) {
+                if (isDestroyed() || pip == null) return;
+                if (!pip.inSingleMode() || !pkg.equals(pip.singleAppPkg())) return;
+                String top;
+                try {
+                    top = pip.topPkgOnDisplay(displayId);
+                } catch (Throwable t) {
+                    return;                     // 读不到就别乱动布局
+                }
+                if (top != null) {
+                    if (top.equals(pkg)) {
+                        everForeground = true;
+                        break;                  // 到过前台了：进入退出采样
+                    }
+                    if (!top.isEmpty() && everForeground) {
+                        // 应用出现过、现在前台是别的应用：真退出
+                        final String nowTop = top;
+                        runOnUiThread(() -> {
+                            if (pip == null || !pip.inSingleMode()) return;
+                            if (!pkg.equals(pip.singleAppPkg())) return;
+                            FileLog.append("单画临时应用 " + pkg + " 已不在前台（现在 "
+                                    + nowTop + "）→ 恢复原布局");
+                            pip.restoreSingleAfterExit();
+                        });
+                        return;
+                    }
+                    // 空屏（启动空窗）或别的应用但本应用还没出现过：继续等
+                }
+                if (android.os.SystemClock.elapsedRealtime() > deadline) break;
+                try {
+                    Thread.sleep(250);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
+            if (!everForeground) {
+                FileLog.append("单画退出检测：" + pkg
+                        + " 10s 未到过前台，放弃监视（不动布局，等首开看门狗兜底）");
+                return;
+            }
             // 采样：返回键刚下发时这块屏的前台可能还没换人，所以从 80ms 起密集看几次。
             // **第一次读到换了人就恢复**，不再要求连续两次 ——
             // 判据是「这块屏的前台还是不是那个临时应用」，应用内部返回（详情→列表）
@@ -2764,16 +2940,33 @@ public class MainActivity extends AppCompatActivity
 
     @Override
     public void onAppLongClick(AppInfo app) {
-        OverlayMenu.show(this, app.label,
-                new CharSequence[]{"画中画打开", "全屏打开", "指定画中画位置", "绑定到 Dock"},
-                which -> {
-                    switch (which) {
-                        case 0: openPip(app.pkg, 0); break;
-                        case 1: pip.launchFullScreen(app.pkg); break;
-                        case 2: showPaneAssignDialog(app.pkg); break;
-                        default: addToDock(app.pkg); break;
-                    }
-                });
+        // 口径：这里选的都是「临时」打开方式（只对本次生效，不写配置、不建绑定）；
+        // 设置页那个才是「默认」方式。两者用菜单文案明确区分，别和「指定画中画位置」
+        // （建立持久绑定）混在一起。
+        // 已绑定应用不参与打开方式路由，菜单里就不摆点了没反应的临时项。
+        final boolean bound = pip != null && pip.isAssigned(app.pkg);
+        final CharSequence[] items = bound
+                ? new CharSequence[]{"在绑定的画中画打开", "全屏打开", "指定画中画位置", "绑定到 Dock"}
+                : new CharSequence[]{"临时：活动画中画打开", "临时：全屏打开", "临时：单画中画打开",
+                        "指定画中画位置", "绑定到 Dock"};
+        OverlayMenu.show(this, app.label, items, which -> {
+            if (bound) {
+                switch (which) {
+                    case 0: openPip(app.pkg, 0); break;
+                    case 1: pip.launchFullScreen(app.pkg); break;
+                    case 2: showPaneAssignDialog(app.pkg); break;
+                    default: addToDock(app.pkg); break;
+                }
+                return;
+            }
+            switch (which) {
+                case 0: openPipTemp(app.pkg, Prefs.OPEN_ACTIVE); break;
+                case 1: openPipTemp(app.pkg, Prefs.OPEN_FULLSCREEN); break;
+                case 2: openPipTemp(app.pkg, Prefs.OPEN_SINGLE); break;
+                case 3: showPaneAssignDialog(app.pkg); break;
+                default: addToDock(app.pkg); break;
+            }
+        });
     }
 
     @Override

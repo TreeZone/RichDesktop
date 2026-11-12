@@ -18,9 +18,17 @@ import android.widget.TextView;
 /**
  * 通用「单选」弹框：标题 + 分隔线 + 若干选项，当前项淡底色 + 右侧 ✓。
  *
- * 外观与长按图标的操作菜单（{@link GlassMenu}）完全一致：同一个
- * {@link Ui#glassWindow(Dialog, Context, boolean)} 紧凑版（宽度上限 300dp），
- * 同样的标题样式、行高与行反馈 —— 用户要求"两个弹框大小一样"。
+ * 【全 App 弹框样式的唯一基准】设置页「Dock 位置 / 功能区」用的就是这一套，
+ * 用户要求所有「选择当前值」的弹框都向它对齐：
+ *   · Dialog(Ui.dialogContext) + FEATURE_NO_TITLE + Ui.glassWindow 紧凑版（宽 ≤300dp）
+ *   · 标题 20sp 加粗 + 一条分隔线
+ *   · 行：主标题 15sp + 可选 12sp 说明；当前项淡底色 + 右侧 ✓；统一 Ripple 反馈
+ *   · 超高时压到屏高 82%，内部 ScrollView 滚动
+ * 以前 PaneChooser 自绘「描边阴影 + ✓」、GlassMenu「只有 Ripple 没有选中态」、
+ * 还有用 "✓ " 字符串前缀凑选中效果的，全部并到这里，去掉那几种异类表现。
+ *
+ * 操作菜单（点了就执行、没有「当前值」概念）仍用 GlassMenu / OverlayMenu，
+ * 它们的标题/行高/玻璃窗口本来就是同一套视觉基线，不强行加对勾。
  *
  * 不用 AlertDialog：它的宽度走系统主题（很宽），且自定义 view 超高不会自己滚。
  */
@@ -36,6 +44,14 @@ public class OptionPicker {
     public static Dialog show(final Context ctx, final String title,
                               final String[] labels, final String[] hints,
                               final int current, final OnPicked cb) {
+        return show(ctx, title, labels, hints, current, null, cb);
+    }
+
+    /** 带底部说明文字的版本（列表下一条分隔线 + 12sp 提示色小字） */
+    public static Dialog show(final Context ctx, final String title,
+                              final String[] labels, final String[] hints,
+                              final int current, final CharSequence footer, final OnPicked cb) {
+        if (ctx == null || labels == null || labels.length == 0) return null;
         final Dialog d = new Dialog(Ui.dialogContext(ctx));
         d.requestWindowFeature(Window.FEATURE_NO_TITLE);   // 去掉空标题栏，标题才贴得上沿
 
@@ -72,7 +88,8 @@ public class OptionPicker {
         list.setOrientation(LinearLayout.VERTICAL);
         list.setPadding(0, Ui.dp(ctx, 2), 0, 0);
 
-        final int cur = Math.max(0, Math.min(labels.length - 1, current));
+        // current < 0 =「没有当前值」的操作列表（例如「点一条删除」），不标 ✓
+        final int cur = current < 0 ? -1 : Math.min(labels.length - 1, current);
 
         for (int i = 0; i < labels.length; i++) {
             final int which = i;
@@ -128,6 +145,21 @@ public class OptionPicker {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         root.addView(sv, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        if (footer != null && footer.length() > 0) {
+            View line2 = new View(ctx);
+            line2.setBackgroundColor(Ui.dark ? 0x26FFFFFF : 0x1A000000);
+            root.addView(line2, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, Ui.dp(ctx, 1))));
+            TextView note = new TextView(ctx);
+            note.setText(footer);
+            note.setTextSize(12);
+            note.setTextColor(Ui.tintHint());
+            int fp = Ui.dp(ctx, 16);
+            note.setPadding(fp, Ui.dp(ctx, 10), fp, Ui.dp(ctx, 4));
+            root.addView(note, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        }
 
         d.setContentView(root);
         d.setCanceledOnTouchOutside(true);

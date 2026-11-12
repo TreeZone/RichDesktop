@@ -85,6 +85,13 @@ public class PipPane {
     private long gapOver100Win;
     /** 这块屏上当前跑着的应用：换应用时必须清屏，否则旧应用的 task 还留在栈里会串台 */
     private String livePkg;
+    /**
+     * 这块屏的「基准应用」：被一个临时应用顶掉之前，屏上常驻的那个。
+     * 按返回露出栈底时用它把 pkg/livePkg 对齐（见 adoptForeground），
+     * 而不是把整块屏 close 成空态 —— 用户实测「活动画中画里的 app 没显示回来」就是这么丢的。
+     * 只在第一次换应用时确立，后续不覆盖；屏被主动 close 时清空。
+     */
+    private String basePkg;
     /** 应用被「全屏打开」搬去主屏了：回到桌面时要搬回本屏继续显示 */
     private boolean fullscreened;
     /**
@@ -159,7 +166,10 @@ public class PipPane {
                 surfaceReady = true;
                 surfaceW = w;
                 surfaceH = h;
-                if (pkg != null && vd == null) recreateNow();
+                if (pkg != null && vd == null) {
+                    FileLog.append("surface 就绪(" + w + "x" + h + ") → 补建屏 " + pkg);
+                    recreateNow();
+                }
             }
 
             @Override
@@ -380,6 +390,11 @@ public class PipPane {
         loading.setVisibility(View.GONE);
     }
 
+    /** 这块屏被临时应用顶掉之前的常驻应用（可能为 null） */
+    public String basePkg() {
+        return basePkg;
+    }
+
     public boolean isBusy() {
         return pkg != null;
     }
@@ -472,6 +487,13 @@ public class PipPane {
         main.removeCallbacks(hideLoading);
 
         final String stale = livePkg;
+        // 记下被临时顶掉的常驻应用：按返回露出它时，watchPaneExit 要把它显示回来，
+        // 而不是 pane.close() 清空整块屏。只在首次确立，恢复基准应用时不要被覆盖。
+        if (basePkg == null && stale != null && !stale.equals(targetPkg)) {
+            basePkg = stale;
+            android.util.Log.i(TAG, "pane " + index + " 基准应用=" + basePkg
+                    + "（临时换成 " + targetPkg + "）");
+        }
         if (vd != null && displayId >= 0) {
             if (livePkg == null || livePkg.equals(targetPkg)) {
                 livePkg = targetPkg;
@@ -551,6 +573,7 @@ public class PipPane {
         String p = pkg;
         pkg = null;
         livePkg = null;
+        basePkg = null;      // 主动清空这块屏：不再有「要显示回来的」基准应用
         main.removeCallbacks(hideLoading);
         loading.setVisibility(View.GONE);
         hint.setVisibility(View.VISIBLE);
@@ -614,7 +637,11 @@ public class PipPane {
             boolean stopped = forceStop(p);
             Log.i(TAG, "pane " + index + " force-stop " + p + " ok=" + stopped);
             main.postDelayed(() -> {
-                if (!p.equals(pkg) || displayId < 0) return;
+                if (!p.equals(pkg) || displayId < 0) {
+                    FileLog.append("relaunchAfterStop 放弃：" + p
+                            + " pkg=" + pkg + " display=" + displayId);
+                    return;
+                }
                 livePkg = p;
                 launchOn(p, displayId);
                 ensureOnDisplay(p, displayId);
@@ -891,6 +918,49 @@ public class PipPane {
 
     private final Runnable recreateTask = this::recreateNow;
 
+    /** surface 是否已就绪（单画首开链路的状态可见性用） */
+    boolean isSurfaceReady() {
+        return surfaceReady;
+    }
+
+    /**
+     * 单画首开看门狗。
+     *
+     * 「点图标第一次，单画不显示，第二次才正常」的链路是：
+     *   open（surface 未就绪，挂起）→ onSurfaceTextureAvailable → recreateNow
+     *   → 200ms 后 createDisplay → relaunchAfterStop（force-stop → 300ms → launchOn）
+     * 五步里任何一环的守护条件不满足就**静默 return**，用户看到的就是"点了没反应"，
+     * 而第二次点的时候 surface/屏多半已就绪，走的是直通路径，所以"第二次才正常"。
+     * 这里在 openSingle 后 3 秒做一次体检：没建屏就重建，建了屏没出帧就补一次拉起；
+     * 全链路状态落日志，再复现时日志直接给出断点。
+     */
+    void firstOpenWatchdog(String target) {
+        if (target == null || !target.equals(pkg)) return;
+        boolean displayOk = vd != null && displayId >= 0;
+        FileLog.append("单画看门狗：" + target + " surface=" + surfaceReady
+                + " display=" + displayId + " 帧数=" + frames
+                + " 纹理=" + texture.getWidth() + "x" + texture.getHeight()
+                + " loading可见=" + (loading.getVisibility() == View.VISIBLE));
+        if (!displayOk) {
+            if (!surfaceReady && texture.isAvailable()) {
+                surfaceReady = true;
+                surfaceW = Math.max(1, texture.getWidth());
+                surfaceH = Math.max(1, texture.getHeight());
+            }
+            FileLog.append("单画看门狗：虚拟屏未建成 → 重新走建屏+启动");
+            recreateNow();
+            return;
+        }
+        if (frames == 0) {
+            // 屏在但应用没出帧：不做 force-stop（应用可能只是冷启动慢），补一次拉到前台
+            FileLog.append("单画看门狗：屏在但无帧 → 补一次 launchOn");
+            launchOn(target, displayId);
+            ensureOnDisplay(target, displayId);
+            showContentAfter(800);
+        }
+    }
+
+
     private void scheduleRecreate() {
         main.removeCallbacks(recreateTask);
         main.postDelayed(recreateTask, 250);
@@ -908,11 +978,21 @@ public class PipPane {
         final String keep = pkg;
         // 旧屏不再需要：真释放（不带 clearDisplayApp —— 空白页在新屏上没意义）
         destroyDisplay();
-        if (keep == null || !surfaceReady) return;
+        if (keep == null || !surfaceReady) {
+            FileLog.append("recreateNow(" + keep + ") 挂起：surface=" + surfaceReady);
+            return;
+        }
         main.postDelayed(() -> {
-            if (!keep.equals(pkg) || !surfaceReady) return;
+            if (!keep.equals(pkg) || !surfaceReady) {
+                FileLog.append("recreateNow 延迟任务放弃：" + keep
+                        + " pkg=" + pkg + " surface=" + surfaceReady);
+                return;
+            }
             createDisplay();
-            if (displayId < 0) return;
+            if (displayId < 0) {
+                FileLog.append("recreateNow 建屏失败（" + keep + "），本轮不再重试");
+                return;
+            }
             livePkg = keep;
             relaunchAfterStop(keep, 300);
         }, 200);

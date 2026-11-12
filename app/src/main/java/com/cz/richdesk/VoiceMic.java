@@ -68,8 +68,16 @@ public final class VoiceMic {
      * 详见 {@link #silentMs()}。
      */
     private volatile long silentSince;
-    /** 采集音源。独占时换一路重试（见 Voice.recycleMic），不同 source 走不同 input */
-    private volatile int source = MediaRecorder.AudioSource.VOICE_RECOGNITION;
+    /**
+     * 采集音源。**默认 MIC（source=1）**，与这台车机上的原生语音 app 保持一致：
+     * 车机日志 `LSPosed_20261112_080306/full.log` 里百度地图 `MapVoiceProcess` 用
+     * `AudioRecord: set(): inputSource 1` 常驻监听，同时厂商 `/system_tw/bin/gocsdk`
+     * 也在录音，AudioPolicyService 逐次 `+source = 1, allowCapture=1` 放行并发。
+     * 旧默认值 VOICE_RECOGNITION 是另一条 input 路由，在这台车机上常读到全 0 死寂，
+     * 正是「常驻唤醒词听着听着就聋了」的高发原因。
+     * 拿不到数据时由 Voice.recycleMic() 换到另一条路由试，仍保留 setSource() 便于回调。
+     */
+    private volatile int source = MediaRecorder.AudioSource.MIC;
 
     public VoiceMic(Sink sink) {
         this.sink = sink;

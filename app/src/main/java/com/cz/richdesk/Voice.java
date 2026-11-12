@@ -38,22 +38,27 @@ public final class Voice {
     /** 唤醒词的参考底噪门限：低于它不喂 KWS，省 CPU（KWS 自己也会判静音） */
     private static final int MIN_RMS = 60;
     /**
-     * 连续这么久采样全为死寂（峰值 ≈ 0）就认定麦克风被别的应用占了，重开一次。
+     * 连续这么久采样全为死寂（峰值 ≈ 0）就换一条 input 路由重开一次。
      *
-     * 1.2 秒的依据：这是"用户喊唤醒词"的时间尺度。独占发生时越早恢复越好，
+     * 1.2 秒的依据：这是"用户喊唤醒词"的时间尺度。死寂越早恢复越好，
      * 而正常说话不可能连续 1.2 秒一个非零采样都没有（真实麦克风有底噪）。
+     * 注意：**死寂不等于"被别人占了"** —— 车机 AudioPolicyService allowCapture=1
+     * 允许并发录音（百度 MapVoiceProcess + 厂商 gocsdk 同时开麦），
+     * 所以这里只做 recycleMic，绝不停采让路。
      */
     private static final long SILENT_RECOVER_MS = 1_200L;
     /**
-     * 让路后等对方收工的耐心上限。
+     * 让路兜底的等待上限。**只在 HAL 真单路独占、且两条路由反复重开都拿不到数据时**才会走到。
      *
-     * 「小度小度」是一次对话：唤醒 → 对话几秒 → 录音停止。这种我们让路，
-     * 对方一停立刻收回，两家的唤醒词互不干扰。
-     * 但如果对方是**常驻监听**（语音服务 7×24 抓着 input 不放），一直让下去
-     * 我们就永远聋了 —— 所以超过这个时长就温和地收回试一次（探测）：
-     * 若 HAL 其实支持并发，探测直接成功；若真单路独占，1.2 秒死寂后会再次让路。
+     * 常态（并发）根本不进入让路态；真独占时短暂让出 5 秒让对方把一轮对话说完，
+     * 到点探测收回。原值 15 秒会让"三个助手都要能用"变成长时间失聪，缩短到 5 秒。
      */
-    private static final long YIELD_WATCHDOG_MS = 15_000L;
+    private static final long YIELD_WATCHDOG_MS = 5_000L;
+    /**
+     * 连续换路由重开这么多次仍死寂，且 getActiveRecordingConfigurations 明确查到别的录音方，
+     * 才判定这台 HAL 是单路独占、进入让路兜底。避免偶发一次死寂就误判成"被抢"。
+     */
+    private static final int YIELD_AFTER_RECYCLES = 4;
     /** 重开麦克风的退避起点 / 上限：连续失败时翻倍，封顶后一直以这个节奏后台重试 */
     private static final long MIC_RETRY_MIN_MS = 1_200L;
     private static final long MIC_RETRY_MAX_MS = 15_000L;
@@ -72,18 +77,21 @@ public final class Voice {
     /** 自我回采最多容忍几次：超过就不是回采了，别再无限续命 */
     private static final int MAX_ECHO_HITS = 2;
     /**
-     * 收工阈值：**这么久还没识别出文字**就退出，不看音量。
+     * 【需求二.3】收工阈值：开始聆听后**这么久还没识别出有用的文字**就判「没听清」直接退出。
      *
      * 之前按 RMS 判"静音"：车机里环境噪音常年高于底噪门限（空调、胎噪、音乐），
-     * RMS 一直算"有声音"，于是永远不超时，只能干等到 12 秒上限 ——
-     * 用户感受就是"没说话它也在那儿一直收"。改成以 ASR 有没有吐出字为准：
-     * 噪音再大，模型出不了字，3 秒就收。
-     * 同理，已经出过字但 3 秒没有新字也收（正常一句话中间不会停这么久，
-     * 端点检测 1.2 秒就会先断句，这里只是兜底）。
+     * RMS 一直算"有声音"，于是永远不超时。改成以 ASR 有没有吐出**有用**的字为准：
+     * 唤醒词、TTS「我在」的自我回采、空串都不算有用文字。
+     * 旧值是 2500ms 且从 TTS 念完（+1100ms）才开始算，实际要 3.6 秒才收，
+     * 而且超时走 finish() →「没听清，再说一遍」+ 1.2 秒延迟收尾，不是「直接退出」。
+     * 现在：本轮一个有用字都没出现过 → 满 3 秒直接 cancelListening() 退出；
+     * 已经出过字但 3 秒没有新字 → 视为说完，走 finish() 提交执行。
      */
-    private static final long NO_TEXT_TIMEOUT_MS = 2_500L;
+    private static final long NO_TEXT_TIMEOUT_MS = 3_000L;
     /** 报完候选后再给多久说「第几个」（比普通聆听短一点，别让卡片一直挂着） */
     private static final long PICK_WAIT_MS = 8_000L;
+    /** 候选每页条数：语音序号只到 9，多了靠翻页；列表本身不截断 */
+    private static final int PICK_PAGE_SIZE = 9;
     /** 环形缓冲时长：覆盖 ASR 加载那 1~2 秒 + 说话前的犹豫 */
     private static final int RING_MS = 2500;
 
@@ -121,6 +129,8 @@ public final class Voice {
     private VoiceMic mic;
     private VoiceKws kws;
     private VoiceAsr asr;
+    /** 上一次建识别器时用到的别名快照；变了就要重建识别器刷新热词表 */
+    private String hotAliasStamp;
     private final VoiceTts tts = new VoiceTts();
     private ToneGenerator tone;
 
@@ -140,6 +150,8 @@ public final class Voice {
     private volatile long listenSince;
     /** 本轮把识别结果当成「自我回采」丢掉的次数 */
     private int echoHits;
+    /** 本轮是否出现过「有用的文字」：3 秒没听清直接退出就看它 */
+    private volatile boolean gotUsefulText;
     /** KWS 重建失败后的退避时刻：否则每 80ms 试一次，日志刷屏还费 CPU */
     private volatile long kwsRetryAt;
     /** 最后一次收到 PCM 的时刻：用来发现"麦克风开着但没有数据" */
@@ -169,6 +181,8 @@ public final class Voice {
 
     /** 「您要说哪个？」之后继续听下一条：候选列表 + 原说法 + 是否在等序号 */
     private volatile boolean awaitingPick;
+    /** 候选当前页（0 起）：完整列表不截断，序号是「本页序号 + 页偏移」 */
+    private volatile int pickPage;
     private volatile List<AppInfo> pickCands;
     private volatile String pickPhrase = "";
 
@@ -306,6 +320,7 @@ public final class Voice {
         awaitingPick = false;
         pickCands = null;
         partial = "";
+        gotUsefulText = false;
         cooldownUntil = 0;
         ringLen = 0;
         synchronized (lock) {
@@ -320,6 +335,7 @@ public final class Voice {
         // 用户主动改了设置（比如换了唤醒词）：把熔断标记清掉，值得再试一次
         try {
             new File(ctx.getFilesDir(), "voice/kws.load").delete();
+            new File(ctx.getFilesDir(), "voice/asr.load").delete();
         } catch (Throwable ignored) {
         }
         // 唤醒词可能刚被改过，同步给匹配层（否则新词在识别结果里剥不掉）
@@ -405,34 +421,53 @@ public final class Voice {
                     }
                 }
 
-                // 被独占的两种形态：
-                //   a) read 照常返回、内容全是死寂（HAL 只给一路，后来者拿全 0）；
-                //   b) 2.5 秒没有任何回调（上面已处理）。
-                // 现在的恢复分两路，先看**有没有人在录音**再决定礼让还是抢回：
-                //   - 有明确占用者（getActiveRecordingConfigurations 查得到）→ 让路：
-                //     停我们的采，对方结束的瞬间自动收回。两家的唤醒词互不干扰，
-                //     也不会出现"我们把小度抢聋"的反向事故。
-                //   - 没有任何录音方却收到死寂 → 这是 HAL 选路问题，等是等不回来的，
-                //     只能 recycleMic 重新 open 让 AudioFlinger 重选。
+                // 拿到死寂数据的处理（2.5 秒完全没回调由上面的断流分支处理）。
+                // 【并发模型】车机日志 `LSPosed_20261112_080306/full.log` 证明
+                // AudioPolicyService 逐次 `+source = 1, allowCapture=1` 放行并发录音：
+                // 百度 MapVoiceProcess 与厂商 gocsdk 能同时开麦，小度和小德可同时被唤醒。
+                // 所以「别的 app 正在录音」是常态，**绝不能据此停采** —— 那会让我们自己的
+                // 唤醒词长时间失效。默认动作只有换 input 路由重开，麦克风全程不关。
+                // 仅当「两条路由反复重开都拿不到数据 + 确实查到别的录音方」才判定这台
+                // HAL 是单路独占，短暂让路兜底。
+                if (yielded && now >= yieldWatchAt) {
+                    // 让路态的 watchdog 必须独立在这里：旧版写在 dead>SILENT_RECOVER_MS
+                    // 分支里，但 mic==null 时 dead 恒为 0，那段永远进不去，兜底形同虚设。
+                    FileLog.append("VOICE 让路已 " + (now - yieldSince) / 1000
+                            + "s → 探测性收回麦克风");
+                    yielded = false;      // 交给下面的「无麦重试」实际开麦
+                    yieldWatchAt = now + YIELD_WATCHDOG_MS;
+                }
+                // 没麦、也没在让路：watchdog 收回失败 / reclaim 失败 / 别的路径把 mic 丢了，
+                // 都要后台退避重试，否则常驻会永久失聪（旧版这里是个死角）。
+                if (mic == null && !yielded && now >= micRetryAt
+                        && (state == S_WAKE || state == S_LISTEN || state == S_LOADING)) {
+                    boolean ok;
+                    synchronized (lock) { ok = ensureMic(); }
+                    if (!ok) {
+                        micRetryAt = now + micRetryGap;
+                        micRetryGap = Math.min(micRetryGap * 2, MIC_RETRY_MAX_MS);
+                        FileLog.append("VOICE 无麦重试失败：" + lastError
+                                + "，" + micRetryGap + "ms 后再试");
+                    }
+                }
                 if ((mic != null || yielded) && now >= micRetryAt
                         && (state == S_WAKE || state == S_LISTEN || state == S_LOADING)) {
                     long dead = mic == null ? 0 : mic.silentMs();
                     if (dead > SILENT_RECOVER_MS) {
-                        java.util.List<android.media.AudioRecordingConfiguration> others = otherRecorders();
-                        if (!others.isEmpty()) {
-                            if (!yielded) {
-                                yieldMic(describeRecorders(others));
-                            } else if (now >= yieldWatchAt) {
-                                // 让路超时还没等到对方收工：像常驻监听，温和探测一次
-                                FileLog.append("VOICE 让路已 " + (now - yieldSince) / 1000
-                                        + "s 对方仍录音 → 探测性收回");
-                                yielded = false;
-                                synchronized (lock) { ensureMic(); }
-                                yieldWatchAt = now + YIELD_WATCHDOG_MS;
-                                // 若探测拿到的仍是死寂（真独占），1.2s 后这里会再次让路
+                        if (!yielded) {
+                            if (micTries >= YIELD_AFTER_RECYCLES) {
+                                java.util.List<android.media.AudioRecordingConfiguration> others =
+                                        otherRecorders();
+                                if (!others.isEmpty()) {
+                                    // 两条路由反复重开仍死寂 + 明确有占用者 → 判定真单路独占
+                                    yieldMic(describeRecorders(others));
+                                    micTries = 0;
+                                } else {
+                                    recycleMic("连续 " + dead + "ms 死寂，换 input 路由重开");
+                                }
+                            } else {
+                                recycleMic("连续 " + dead + "ms 死寂 → 换 input 路由重开（不让麦，并发常驻）");
                             }
-                        } else {
-                            recycleMic("连续 " + dead + "ms 采样全为死寂（无其他录音方，疑似 HAL 选路）");
                         }
                         try { Thread.sleep(80); } catch (InterruptedException ie) { break; }
                         continue;
@@ -467,11 +502,26 @@ public final class Voice {
                     // 环境噪音大时 RMS 一直超门限，按音量判就永远不会超时；
                     // 而只要识别结果不变（停在同一串字上），也说明人已经说完了。
                     long anchor = hasText ? Math.max(listenAnchor, lastTextAt) : listenAnchor;
-                    if (now - anchor >= NO_TEXT_TIMEOUT_MS) {
-                        FileLog.append("VOICE " + (now - anchor) + "ms 没有新的识别文字"
-                                + (hasText ? "（停在「" + cur + "」）" : "（环境噪音？）")
-                                + " → 自动收工");
-                        finish(cur, true);
+                    // 本轮一个有用字都没出现过 → 从 listenSince 起算满 3 秒就退出，
+                    // 不受 endpoint 重置 anchor / 噪音乱码续命的影响。
+                    boolean noUsefulYet = !gotUsefulText;
+                    boolean timedOut = noUsefulYet
+                            ? (now - listenSince >= NO_TEXT_TIMEOUT_MS)
+                            : (now - anchor >= NO_TEXT_TIMEOUT_MS);
+                    if (timedOut) {
+                        FileLog.append("VOICE " + (noUsefulYet
+                                ? (now - listenSince) + "ms 没有任何有用文字 → 没听清，直接退出"
+                                : (now - anchor) + "ms 没有新的有用文字 → 收工")
+                                + (hasText ? "（停在「" + cur + "」）" : "（环境噪音？）"));
+                        if (noUsefulYet) {
+                            // 【需求二.3】没听清就立刻退出这一轮，不再走 finish() 的
+                            // 「没听清，再说一遍」+ endUtterance(1200) 延迟收尾链
+                            cancelListening();
+                            say("没听清");
+                            pushState("没听清", null);
+                        } else {
+                            finish(cur, true);
+                        }
                     } else if (now > deadline) {
                         // 到点没等到断句：有字就认，没字就当没听清
                         finish(cur, true);
@@ -544,7 +594,7 @@ public final class Voice {
         // 等「第几个」的窗口比普通聆听长一点（PICK_WAIT_MS 是报完候选才开始算）
         boolean hasText = partial != null && !partial.isEmpty();
         long cap = (st == S_LISTEN && awaitingPick)
-                ? PICK_WAIT_MS + 2_000L
+                ? PICK_WAIT_MS + 4_000L      // 候选多时 TTS 报读更久，别把列表提前收掉
                 : (hasText ? HARD_MAX_MS + 1_000L : HARD_MAX_MS);
         if (now - since <= cap) return false;
         FileLog.append("VOICE 本轮已 " + (now - since) + "ms 超过上限（state=" + st
@@ -639,14 +689,55 @@ public final class Voice {
         for (AppInfo a : as) {
             if (a != null && a.label != null && !a.label.isEmpty()) out.add(a.label);
         }
+        // 把「用户点选过的说法」也灌进热词表。这些串是 ASR 自己吐过的汉字，
+        // 必然都在 tokens.txt 里；作为 cjkchar 热词做解码偏置，等于告诉识别器
+        // 「这段发音优先走这条汉字路径」。中文模型听英文每次吐的字都不同，
+        // 热词把它往学过的几种写法上拉，输出才会逐渐收敛 ——
+        // 这是别名在英文场景下真正起作用的途径，而不是靠精确字符串命中。
+        java.util.Map<String, java.util.Set<String>> learned =
+                Prefs.parseAlias(Prefs.voiceAliasRaw(ctx));
+        for (java.util.Set<String> set : learned.values()) {
+            for (String x : set) {
+                if (x != null && x.length() >= 2) out.add(x);
+            }
+        }
         return out;
     }
 
     /**
-     * 让路：检测到其他应用正在录音（典型是小度），主动停掉我们的采集，
-     * 把 input 完整留给对方。注册了录音回调，对方一停 reclaimReq 就会置位，
-     * 控制循环在 ~80ms 内收回麦克风 —— 小度的对话结束后，「你好小瑞」几乎无感恢复。
+     * 别名变了 → 重建识别器，让新的热词表生效。
      *
+     * sherpa 是在构造 OnlineRecognizer 时读 hotwords 文件的，加载完再改不生效。
+     * 所以这里 release + 置 null，下面的 ensureAsr() 会带着新的 appLabels()
+     * 重新 load（beginListen 里本来就有 isReady/load 分支，不用另写加载）。
+     */
+    private void syncHotwordAliases() {
+        String now;
+        try {
+            now = Prefs.voiceAliasRaw(ctx);
+        } catch (Throwable t) {
+            return;
+        }
+        if (now.equals(hotAliasStamp)) return;
+        boolean rebuild = hotAliasStamp != null && !hotAliasStamp.isEmpty();
+        hotAliasStamp = now;
+        if (!rebuild) return;               // 首次启动：正常 load 就已经带上了
+        synchronized (lock) {
+            VoiceHotwords.invalidate();
+            if (asr != null) asr.release();
+            asr = null;
+        }
+        FileLog.append("VOICE 语音别名有更新 → 重建识别器，把新说法写进热词表");
+    }
+
+    /**
+     * 让路【兜底，常态不走】：只在「两条 input 路由反复重开都拿不到数据，且明确查到
+     * 别的录音方」时才调用，说明这台 HAL 真是单路独占。主动停掉我们的采集，
+     * 把 input 完整留给对方。注册了录音回调，对方一停 reclaimReq 就会置位，
+     * 控制循环在 ~80ms 内收回麦克风；没等到也有 watchdog 探测收回。
+     *
+     * 车机常态是**并发录音**（百度 MapVoiceProcess / 厂商 gocsdk / 高德可同时开麦），
+     * 那时绝不能停采 —— 停了就等于我们自己的唤醒词长时间失效。
      * KWS / ASR 模型都保留着，只是没有 PCM 可喂，收回后立即可用。
      */
     private void yieldMic(String who) {
@@ -665,9 +756,10 @@ public final class Voice {
         yieldWatchAt = now + YIELD_WATCHDOG_MS;
         lastPcmAt = now;      // 麦克风没了，别让"2.5s 没 PCM"断流分支乱报
         registerRecCb();
-        FileLog.append("VOICE 麦克风让路：" + who + " 正在录音 → 停采待命，对方结束后自动收回"
+        FileLog.append("VOICE 麦克风让路【真独占兜底】：" + who
+                + " 正在录音且两条路由都取不到数据 → 短暂停采，对方结束后自动收回"
                 + "（" + YIELD_WATCHDOG_MS / 1000 + "s 后仍未结束则探测收回）");
-        pushState("麦克风被 " + who + " 占用，结束后自动恢复", null);
+        pushState("麦克风被 " + who + " 独占，短暂让路后自动恢复", null);
     }
 
     /**
@@ -780,14 +872,15 @@ public final class Voice {
      * 这种状态**等不回来**：必须 release 再重新 open，让 AudioFlinger 重新选路、
      * 重新分配 input。这是那条路里唯一能自己恢复的动作。
      *
-     * 换 source 重试：VOICE_RECOGNITION 与 MIC 在 audio policy 里是两条不同的
-     * input 路由，一条被独占时另一条常常还能开。每两次换一次。
+     * 换 source 重试：MIC 与 VOICE_RECOGNITION 在 audio policy 里是两条不同的
+     * input 路由，一条拿不到数据时另一条常常还能开。默认音源已是 MIC，
+     * 所以每次重开交替切到另一条，保证每轮都真的换了路由。
      *
      * @return 是否成功重新开起来
      */
     private boolean recycleMic(String why) {
         micTries++;
-        int src = ((micTries / 2) % 2 == 0)
+        int src = ((micTries % 2) == 1)
                 ? android.media.MediaRecorder.AudioSource.VOICE_RECOGNITION
                 : android.media.MediaRecorder.AudioSource.MIC;
         boolean ok;
@@ -830,32 +923,37 @@ public final class Voice {
         // 否则 S_LOADING 用的是上一轮的时间戳，或者干脆没人管
         listenSince = SystemClock.elapsedRealtime();
         echoHits = 0;
+        gotUsefulText = false;
         state = S_LOADING;
         pushState("准备聆听…", null);
         partial = "";
 
         // 上一轮收工时麦克风可能正被别人占着（读到的是死寂数据）。不先处理，
         // 这一轮从头到尾都是白听 —— 用户看到的就是"点了语音图标却没反应"。
-        // 用户主动要点语音：结束让路态，全力以赴开麦
+        // 用户主动要点语音：结束让路态，全力以赴开麦。
+        // 【P0 修复】yieldMic() 会把 mic.stop() 并置 null；而下面的 wakeMode 分支
+        // 原本没有 ensureMic()（只有非常驻 PTT 分支有），旧版这里只清 yielded 标志、
+        // 不重新开麦 → 常驻下让过一次路之后，唤醒/点语音助手整轮零 PCM，
+        // 用户看到的就是「常驻唤醒词不让权限、一直听不到声音」。
         yielded = false;
-        if (mic != null && mic.silentMs() > 600) {
-            // 有明确占用者（小度还在对话）→ 试一次收回，收不回就明说，别白听一轮；
-            // 没有占用者的死寂 → 纯 HAL 选路问题，recycleMic 能救。
-            java.util.List<android.media.AudioRecordingConfiguration> others = otherRecorders();
-            if (!others.isEmpty()) {
-                String who = describeRecorders(others);
-                recycleMic("聆听前发现被占用：" + who);
-                try { Thread.sleep(300); } catch (InterruptedException ie) { return; }
-                if (mic != null && mic.silentMs() > 250) {
-                    lastError = "麦克风被 " + who + " 占用";
-                    state = wakeMode ? S_WAKE : S_OFF;
-                    pushState("麦克风被 " + who + " 占用，等它结束后再试", null);
-                    idleSince = SystemClock.elapsedRealtime();
-                    return;
-                }
-            } else {
-                recycleMic("聆听前发现麦克风已 " + mic.silentMs() + "ms 无信号");
+        // 上一轮点候选学到的说法要在这轮开始前写进热词表（会重建识别器）
+        syncHotwordAliases();
+        synchronized (lock) {
+            if (!ensureMic()) {
+                state = wakeMode ? S_WAKE : S_OFF;
+                pushState("麦克风不可用：" + lastError, null);
+                return;
             }
+        }
+        if (mic != null && mic.silentMs() > 600) {
+            // 别的应用在录音是车机常态（AudioPolicyService allowCapture=1 允许并发），
+            // **不能因为查到别人就放弃本轮聆听** —— 旧版会显示「麦克风被 X 占用，等它
+            // 结束后再试」然后 return，等于常驻唤醒被别人一句话挡在门外。
+            // 只处理「我们自己拿不到数据」：换一条 input 路由重开，然后照常往下走。
+            // 这里刻意不再用 silentMs() 二次判定：新 AudioRecord 启动时 silentSince 初值
+            // 就是「当前静音」，车内安静时 300ms 后 silentMs 必然 >250，会把正常聆听误杀。
+            // 真没数据由控制循环的「2.5 秒无 PCM」断流分支兜底。
+            recycleMic("聆听前麦克风已 " + mic.silentMs() + "ms 无信号 → 换 input 路由重开");
         }
 
         if (!wakeMode) {
@@ -902,7 +1000,9 @@ public final class Voice {
 
         // 开始聆听的提示：能用 TTS 就说「我在」，比一声「滴」自然；
         // 语音回复关着或引擎不可用，退回原来的提示音。
-        boolean spoken = Prefs.voiceReply(ctx) && !tts.isBroken();
+        // 用 canSpeakNow 而不是 !isBroken：内置引擎首次要解压 129MB 模型，
+        // 没就绪时别挂一句延迟的「我在」，直接退回提示音更干净
+        boolean spoken = Prefs.voiceReply(ctx) && tts.canSpeakNow();
         if (spoken) {
             say("我在");
         } else {
@@ -914,9 +1014,9 @@ public final class Voice {
         awaitingPick = false;
         pickCands = null;
         deadline = now + LISTEN_MAX_MS;
-        // 「我在」要念 ~1 秒，这段时间麦克风在收自己的声音，不该算进"没说话"。
-        // 所以 3 秒无字超时从 TTS 念完之后才开始计（否则用户刚被唤醒就超时了）。
-        listenAnchor = now + (spoken ? 1100 : 0);
+        // 【需求二.3】3 秒从「开始聆听」起算，不再等 TTS「我在」念完才计时。
+        // 回采的「我在」由 usefulText() 判为无用字，既不会算成指令，也不会把超时续掉。
+        listenAnchor = now;
         lastTextAt = listenAnchor;
         idleSince = deadline;
         pushState("请说指令", null);
@@ -953,14 +1053,23 @@ public final class Voice {
             }
             String prev = partial == null ? "" : partial;
             partial = t == null ? "" : t;
+            // 用户实测：喊「你好小瑞」唤醒后，唤醒词的尾巴（小瑞，或 ASR 听成的小雷）
+            // 会被识别进字幕显示出来。虽然 parse() 里剥得掉、执行没错，但看着脏，
+            // 而且这几个字会被当成「有用文字」把 3 秒超时一直续掉。
+            // 显示和判据都用清洗后的文本，识别原文仍留在 partial 里供排障。
+            String shown = VoiceIntent.cleanWake(partial);
+            String prevShown = VoiceIntent.cleanWake(prev);
             long now = SystemClock.elapsedRealtime();
-            // **只有字幕真的变了**才重置超时计时。
-            // 踩过的坑：原来是「只要字幕非空就续命」，于是噪音偶尔吐出一个字之后，
-            // 计时器每帧都被刷新，3 秒超时永远不成立，卡片就一直挂着不退出。
-            if (!partial.isEmpty() && !partial.equals(prev)) lastTextAt = now;
+            // **只有字幕真的变了、且是有用的文字**才重置超时计时。
+            // 踩过的坑：原来是「只要字幕非空就续命」，噪音偶尔吐一个字就把计时器
+            // 每帧刷新，3 秒超时永远不成立；TTS「我在」的自我回采也会续命。
+            if (!shown.isEmpty() && !shown.equals(prevShown) && usefulText(shown)) {
+                lastTextAt = now;
+                gotUsefulText = true;
+            }
             if (now - lastUiPush > 260) {          // 字幕别推太密，省 UI 线程
                 lastUiPush = now;
-                pushState("请说指令", partial);
+                pushState("请说指令", shown);
             }
             return;
         }
@@ -1019,11 +1128,17 @@ public final class Voice {
      */
     private void finish(String text, boolean hardTimeout) {
         String t = text == null ? "" : text.trim();
-        FileLog.append("VOICE 识别\"" + t + "\"" + (hardTimeout ? "（超时收工）" : ""));
+        // 剥掉唤醒词尾巴（含同音错字）后的文本，专供显示 / 序号选择 / 回采判定。
+        // 匹配仍传原文 t —— VoiceIntent.parse() 内部也走 cleanWake，且日志能保留原始识别串。
+        final String shown = VoiceIntent.cleanWake(t);
+        FileLog.append("VOICE 识别\"" + t + "\""
+                + (shown.equals(t) ? "" : " 清洗后=\"" + shown + "\"")
+                + (hardTimeout ? "（超时收工）" : ""));
 
-        // 自我回采：开始聆听时 TTS 说的「我在」可能被麦克风录进去。
-        // 它不是指令 —— 重置识别器继续听，别回一句「没找到我在」。
-        if (isEcho(t) && echoHits < MAX_ECHO_HITS) {
+        // 自我回采：开始聆听时 TTS 说的「我在」可能被麦克风录进去；
+        // 唤醒词尾巴（小瑞 / 小雷）同理。都不是指令 —— 重置识别器继续听。
+        // 注意别把「一个字都没识别到」也当回采：那种情况应走下面的「没听清」。
+        if ((isEcho(t) || (!t.isEmpty() && shown.isEmpty())) && echoHits < MAX_ECHO_HITS) {
             echoHits++;
             FileLog.append("VOICE 忽略自我回采「" + t + "」（第 " + echoHits + " 次）");
             state = S_LISTEN;
@@ -1041,24 +1156,49 @@ public final class Voice {
         // 「您要说哪个？」之后继续听：用户说「第一个 / 第二个 / 选二」就能直接选。
         // 说了别的内容则当作新指令继续往下走（候选作废）。
         if (awaitingPick && pickCands != null && !pickCands.isEmpty()) {
-            int idx = VoiceIntent.parsePick(t, pickCands.size());
-            if (idx >= 0) {
-                AppInfo pick = pickCands.get(idx);
+            // 候选里没有想要的：说一句「都不是 / 不对 / 取消」就能收掉，
+            // 不必等 3 秒超时，也不用手去点「都不是」。
+            if (VoiceIntent.isPickCancel(shown)) {
                 awaitingPick = false;
                 pickCands = null;
                 beep(false);
-                say("好的，打开" + pick.label);
-                pushState("→ " + pick.label, t);
-                FileLog.append("VOICE 候选序号选第 " + (idx + 1) + " 个 → " + pick.label);
+                say("好的，取消");
+                pushState("已取消", shown);
                 ui.post(() -> {
                     Host hh = host;
-                    if (hh != null) {
-                        hh.onVoiceCandidatesPicked(pickPhrase, pick);
-                        hh.onVoiceAction(pick.pkg);
-                    }
+                    if (hh != null) hh.onVoiceCandidates(pickPhrase, null);
                 });
-                endUtterance(700);
+                endUtterance(600);
                 return;
+            }
+            // 候选可能几十个：说「下一页 / 上一页」翻页，列表和序号一起换一批
+            int page = VoiceIntent.parsePage(shown);
+            if (page != 0) {
+                flipPickPage(page);
+                return;                       // announcePickPage 已重置计时并继续听
+            }
+
+            int pageCount = Math.min(PICK_PAGE_SIZE,
+                    pickCands.size() - pickPage * PICK_PAGE_SIZE);
+            int idx = VoiceIntent.parsePick(shown, pageCount);
+            if (idx >= 0) {
+                int abs = pickPage * PICK_PAGE_SIZE + idx;
+                if (abs >= 0 && abs < pickCands.size()) {
+                    AppInfo pick = pickCands.get(abs);
+                    FileLog.append("VOICE 候选序号选第 " + (abs + 1) + " 个 → " + pick.label);
+                    commitPick(pick, shown);
+                    return;
+                }
+            } else {
+                // 不报序号、直接把名字说出来：在**完整候选**里再匹配一次，
+                // 这样排在后面的 app 不用一直翻页也能选中。
+                int byName = VoiceIntent.pickByText(shown, pickCands, aliasMap());
+                if (byName >= 0) {
+                    AppInfo pick = pickCands.get(byName);
+                    FileLog.append("VOICE 候选说名字选中 → " + pick.label);
+                    commitPick(pick, shown);
+                    return;
+                }
             }
             awaitingPick = false;
             pickCands = null;
@@ -1068,15 +1208,7 @@ public final class Voice {
 
         Host h = host;
         List<AppInfo> apps = h == null ? null : h.apps();
-        Map<String, Set<String>> alias = VoiceIntent.builtinAliases(apps);
-        Map<String, Set<String>> user = Prefs.parseAlias(Prefs.voiceAliasRaw(ctx));
-        for (Map.Entry<String, Set<String>> e : user.entrySet()) {
-            Set<String> set = alias.get(e.getKey());
-            if (set == null) alias.put(e.getKey(), e.getValue());
-            else set.addAll(e.getValue());
-        }
-
-        final VoiceIntent.Result r = VoiceIntent.parse(t, apps, alias);
+        final VoiceIntent.Result r = VoiceIntent.parse(t, apps, aliasMap());
         FileLog.append("VOICE 判定 " + VoiceIntent.describe(r) + "（说法=\"" + r.text + "\"）");
 
         if (r.kind == VoiceIntent.APP || r.kind == VoiceIntent.CMD) {
@@ -1084,54 +1216,124 @@ public final class Voice {
             final String label = r.label;
             beep(false);
             say(r.kind == VoiceIntent.APP ? "好的，打开" + label : "好的");
-            pushState("→ " + label, t);
+            pushState("→ " + label, shown);
             ui.post(() -> {
                 Host hh = host;
                 if (hh != null) hh.onVoiceAction(pkg);
             });
             endUtterance(700);
         } else if (r.kind == VoiceIntent.AMBIGUOUS && !r.candidates.isEmpty()) {
-            final List<AppInfo> c = new java.util.ArrayList<>(r.candidates);
-            final String phrase = r.text;
-            // 报候选的同时**继续听**：说完「您要说哪个？」用户直接接「第一个」就行，
-            // 不用伸手去点（车机上伸手点列表本来就危险）。列表同时弹出来，两条路都能走。
+            // 报候选的同时**继续听**：说序号、直接说名字、或点列表都行。
+            // 完整列表留在 pickCands；announcePickPage 只把当前页（9 条）交给 UI 和 TTS。
             awaitingPick = true;
-            pickCands = c;
-            pickPhrase = phrase;
-            StringBuilder sb = new StringBuilder("您要说哪个？");
-            for (int i = 0; i < c.size() && i < 3; i++) {
-                sb.append(i == 0 ? "第一个" : (i == 1 ? "，第二个" : "，第三个"))
-                        .append(c.get(i).label);
-            }
-            say(sb.toString());
-            pushState("说「第一个」/「第二个」，或直接点", t);
-            ui.post(() -> {
-                Host hh = host;
-                if (hh != null) hh.onVoiceCandidates(phrase, c);
-            });
-            // 重新进入聆听态（不结束这一轮）
-            state = S_LISTEN;
-            partial = "";
-            synchronized (lock) {
-                if (asr != null) asr.begin();
-            }
-            long now = SystemClock.elapsedRealtime();
-            deadline = now + PICK_WAIT_MS;
-            // 提示语要念 1~2 秒，这段时间麦克风收的是自己，不计入"没说话"
-            listenAnchor = now + 1800;
-            lastTextAt = listenAnchor;
-            listenSince = now;
+            pickCands = new java.util.ArrayList<>(r.candidates);
+            pickPhrase = r.text;
+            pickPage = 0;
+            announcePickPage();
         } else {
-            say(t.isEmpty() ? "没听清，再说一遍" : "没找到「" + t + "」");
-            pushState(t.isEmpty() ? "没听清" : "没找到「" + t + "」", t);
+            say(shown.isEmpty() ? "没听清，再说一遍" : "没找到「" + shown + "」");
+            pushState(shown.isEmpty() ? "没听清" : "没找到「" + shown + "」", shown);
             endUtterance(1200);
         }
+    }
+
+    /** 内置别名 + 用户点选学到的别名，合并成一份给匹配层用 */
+    private Map<String, Set<String>> aliasMap() {
+        Host h = host;
+        List<AppInfo> apps = h == null ? null : h.apps();
+        Map<String, Set<String>> alias = VoiceIntent.builtinAliases(apps);
+        Map<String, Set<String>> user = Prefs.parseAlias(Prefs.voiceAliasRaw(ctx));
+        for (Map.Entry<String, Set<String>> e : user.entrySet()) {
+            Set<String> set = alias.get(e.getKey());
+            if (set == null) alias.put(e.getKey(), e.getValue());
+            else set.addAll(e.getValue());
+        }
+        return alias;
+    }
+
+    /** 候选最终选中：收尾、记别名、打开应用（序号选 / 说名字选 / 点击都走这里） */
+    private void commitPick(AppInfo pick, String shownText) {
+        awaitingPick = false;
+        pickCands = null;
+        beep(false);
+        say("好的，打开" + pick.label);
+        pushState("→ " + pick.label, shownText);
+        ui.post(() -> {
+            Host hh = host;
+            if (hh != null) {
+                hh.onVoiceCandidatesPicked(pickPhrase, pick);
+                hh.onVoiceAction(pick.pkg);
+            }
+        });
+        endUtterance(700);
+    }
+
+    /**
+     * 报读当前页候选 + 弹出当前页菜单 + 重置这一轮的聆听计时。
+     *
+     * 完整列表留在 pickCands（可能有几十个英文名应用），UI 和语音只看当前页 9 条；
+     * 说「下一页」翻页，或直接说出名字在完整列表里搜 —— 数量不再有上限。
+     */
+    private void announcePickPage() {
+        if (pickCands == null || pickCands.isEmpty()) return;
+        int total = pickCands.size();
+        int pages = (total + PICK_PAGE_SIZE - 1) / PICK_PAGE_SIZE;
+        if (pickPage < 0) pickPage = 0;
+        if (pickPage >= pages) pickPage = pages - 1;
+        int from = pickPage * PICK_PAGE_SIZE;
+        int to = Math.min(total, from + PICK_PAGE_SIZE);
+        final List<AppInfo> page = new java.util.ArrayList<>(pickCands.subList(from, to));
+        final String phrase = pickPhrase;
+
+        StringBuilder sb = new StringBuilder("您要说哪个？");
+        // 只报前 5 个：9 个全念 TTS 要十几秒，会被硬闸收掉
+        String[] ord = {"第一个", "，第二个", "，第三个", "，第四个", "，第五个"};
+        for (int i = 0; i < page.size() && i < ord.length; i++) {
+            sb.append(ord[i]).append(page.get(i).label);
+        }
+        if (pages > 1) sb.append("。说「下一页」看更多");
+        say(sb.toString());
+        pushState("第 " + (pickPage + 1) + "/" + pages + " 页 · 说序号 / 说名字，或直接点", "");
+        ui.post(() -> {
+            Host hh = host;
+            if (hh != null) hh.onVoiceCandidates(phrase, page);
+        });
+        // 重新进入聆听态（不结束这一轮）
+        state = S_LISTEN;
+        partial = "";
+        synchronized (lock) {
+            if (asr != null) asr.begin();
+        }
+        long now = SystemClock.elapsedRealtime();
+        deadline = now + PICK_WAIT_MS;
+        // 提示语要念几秒，这段时间收的是自己的 TTS，不算进「3 秒没听清」
+        listenAnchor = now + Math.min(6000L, 1200L + 300L * sb.length());
+        lastTextAt = listenAnchor;
+        listenSince = now;
+    }
+
+    /** 翻页：语音说「下一页」，或点菜单里的「下一页」 */
+    void flipPickPage(int delta) {
+        if (!awaitingPick || pickCands == null || pickCands.isEmpty()) return;
+        int pages = (pickCands.size() + PICK_PAGE_SIZE - 1) / PICK_PAGE_SIZE;
+        if (pages <= 1) {
+            say("没有更多了");
+            return;
+        }
+        int next = pickPage + delta;
+        if (next < 0 || next >= pages) {
+            say(delta > 0 ? "已经是最后一页了" : "已经是第一页了");
+            return;
+        }
+        pickPage = next;
+        FileLog.append("VOICE 候选翻到第 " + (next + 1) + "/" + pages + " 页");
+        announcePickPage();      // 会重建菜单（Host 侧先 dismiss 旧的那张）
     }
 
     /** 系统引擎回一句话（设置里可关；引擎不存在时静默） */
     private void say(String s) {
         if (!Prefs.voiceReply(ctx)) return;
-        tts.ensure(ctx, Prefs.voiceTtsEngine(ctx));
+        tts.ensure(ctx, Prefs.voiceTtsMode(ctx), Prefs.voiceTtsEngine(ctx));
         tts.speak(s);
     }
 
@@ -1140,11 +1342,16 @@ public final class Voice {
         tts.reset();
     }
 
+    /** 设置页预热内置离线引擎：后台提前加载模型，点试播 / 首次说话不再等加载 */
+    public void preheatLocalTts(Context ctx) {
+        tts.ensure(ctx, Prefs.TTS_LOCAL, "");
+    }
+
     /** 设置里的「试听」：用当前引擎说一句，用户能立刻听到音色效果 */
     public void previewReply() {
         if (!Prefs.voiceReply(ctx)) return;
-        tts.ensure(ctx, Prefs.voiceTtsEngine(ctx));
-        tts.speak("我在，这是当前的回复音色");
+        tts.ensure(ctx, Prefs.voiceTtsMode(ctx), Prefs.voiceTtsEngine(ctx));
+        tts.speak("您好，我是你的语音助理。");
     }
 
     /** 这些短句只可能是我们自己（或对方接话）说的，不当指令处理 */
@@ -1159,6 +1366,18 @@ public final class Voice {
             if (n.equals(w)) return true;
         }
         return false;
+    }
+
+    /**
+     * 「有用的文字」：非空、不是语气词、不是 TTS「我在」这类自我回采。
+     * 3 秒没听清的判据用它，避免噪音乱码 / 自己的提示音把超时一直续掉。
+     */
+    private static boolean usefulText(String t) {
+        if (t == null) return false;
+        // 整句只有唤醒词尾巴（小瑞 / 小雷 / 我在）不算有用文字：
+        // 否则它会把「3 秒没听清直接退出」一直续掉，卡片挂着不收。
+        String n = VoiceIntent.cleanWake(t);
+        return !n.isEmpty() && !isEcho(t);
     }
 
     /** 收尾：回到等唤醒 / 关机 */

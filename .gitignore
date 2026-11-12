@@ -32,3 +32,6 @@ Thumbs.db
 
 # 助手工作目录（本地记忆/调试产物）
 .workbuddy/
+
+# 车机导出的 LSPosed 调试包（现场证据，不入库；需要时从车机重新导出）
+LSPosed_*/

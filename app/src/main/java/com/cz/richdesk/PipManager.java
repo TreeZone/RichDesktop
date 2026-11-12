@@ -200,6 +200,21 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     }
 
     /**
+     * 单画应用被拉起那一刻的帧数基线（PipPane.frames）。
+     *
+     * 退出检测的判据护栏：应用刚 force-stop 重启的头几百毫秒，这块屏既没帧、
+     * topResumedActivity 也是空的 —— 旧版直接把"空屏"当"已退出"，单画布局刚摆好
+     * 就被撤回双画，应用起来后用户也看不见（="第一次点不显示，第二次才正常"）。
+     * 帧数超过基线（应用真的画过东西）之前，退出检测不许动手。
+     */
+    private volatile long singleStartFrames = -1;
+
+    /** 这次单画打开时刻的帧数基线；-1 = 不在单画刚打开的窗口期 */
+    public long singleStartFrames() {
+        return singleStartFrames;
+    }
+
+    /**
      * 按容器方向重排版：横向 = 从左到右，纵向 = 从上到下。
      * 只在「逻辑顺序」上排，不摘挂视图（摘挂会销毁 TextureView 的 Surface，
      * 虚拟屏跟着重建 —— 调换顺序就成了一次整屏重启）。
@@ -585,11 +600,19 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         if (dup >= 0) panes.get(dup).close();
         sp.open(pkg);
         singleAppPkg = pkg;
-        // 视觉：只显示这一块屏（order 只放一个 → 没有分隔条、铺满；其余屏由 PaneBox 设为 INVISIBLE）
+        singleStartFrames = sp.frames();     // 退出检测的护栏基线（见字段注释）
+        // 视觉：只显示这一块屏（order 只放一个 → 没有分隔条、铺满；其余屏挪出画布）
         List<View> only = new ArrayList<>(1);
         only.add(sp.root);
         container.setOrder(only);
         container.setWeights(new float[]{1f});
+        // 首开体检：surface → 建屏 → 启动 这条链任何一环静默失败，用户看到的就是
+        // "点了没反应，第二次点才正常"。3 秒后没建屏/没出帧就补一次，全链路状态落日志。
+        final PipPane spWatch = sp;
+        final String pkgWatch = pkg;
+        container.postDelayed(() -> spWatch.firstOpenWatchdog(pkgWatch), 3000);
+        FileLog.append("单画打开 " + pkg + " surface=" + sp.isSurfaceReady()
+                + " display=" + sp.displayId());
         return -1;
     }
 
@@ -606,6 +629,7 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         if (!singleMode) return;
         singleMode = false;
         singleAppPkg = null;
+        singleStartFrames = -1;
         float[] saved = savedWeights;
         savedWeights = null;
         List<View> all = new ArrayList<>(panes.size());
