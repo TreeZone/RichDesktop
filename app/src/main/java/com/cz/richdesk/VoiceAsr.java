@@ -20,15 +20,20 @@ import java.util.List;
  * 所以它先天性念不了「YouTube」「Spotify」这种名字（这个限制改不了，
  * 只能靠 VoiceAliases 的谐音别名在匹配层兜住）。
  *
- * 针对"识别率差"做了三件事：
- *  1) 解码从 greedy_search 换成 modified_beam_search（beam=4）：噪声里 greedy 会跳字，
- *     「打开酷狗」掉成「打开酷」这种错，匹配层再宽容也救不回来。
- *  2) 把本机应用名做成热词表做上下文偏置（VoiceHotwords），专有名词识别率提升最明显。
- *  3) 热词加载失败自动退回无热词配置 —— 热词校验很严，不能因为一个生僻字
- *     把整条语音链路带死。
+ * <h3>为什么没换更大的模型（0.23.24 实测结论）</h3>
+ * 试过 streaming-zipformer-zh-int8-2025-06-30（encoder 154MB，icefall
+ * multi_zh-hans zipformer-large）：准确率确实更高（把「全球金融**动荡**」
+ * 识别对了，14M 会错成「动**量**」），但**词表只有 1687 个有效 token**，
+ * 「酷、抖、哔、哩、驶」全都不在 —— 「酷狗音乐」「抖音」「哔哩哔哩」直接念不出来，
+ * 而语音打开应用恰恰依赖这些品牌字。已回退。
+ * **将来要换，词表汉字数必须 ≥5000**（中英双语那个 487MB 的包符合，但体积代价大）。
  *
- * 要换更强的模型（比如中英双语的 stream-zipformer-bilingual-zh-en），
- * 把 assets/asr/ 下四个文件替换成同名文件即可，代码不用动。
+ * 针对"识别率差"目前靠这几件事：
+ *  1) 解码用 modified_beam_search（beam=4）：噪声里 greedy 会跳字。
+ *  2) 本机应用名做热词偏置（VoiceHotwords），专有名词提升最明显。
+ *  3) 录音侧：采样率对齐到 16k（ROM 可能给 48k）+ 系统降噪/自动增益，
+ *     见 {@link VoiceMic}。**这一条才是 0.23.24 真正在修的东西** ——
+ *     模型没换，但喂给模型的音频以前可能是错的（3 倍速失真）。
  */
 final class VoiceAsr {
 
@@ -162,6 +167,8 @@ final class VoiceAsr {
             m.setTokens(prefix + "tokens.txt");
             // 2 线程：这台机器核多但有画中画在跑，给 2 个核能把一句话的延迟压到 0.5s 内，
             // 再多开始和渲染抢 CPU，反而掉帧。
+            // （0.23.24 试过 zipformer-large，那个才需要 4 线程；大模型因词表缺字已否决，
+            //   见类注释，这里跟着回到 2。）
             m.setNumThreads(2);
             m.setProvider("cpu");
             m.setDebug(false);
@@ -180,7 +187,15 @@ final class VoiceAsr {
 
             String hwDesc = "hotwords=off";
             if (hw != null) {
-                // cjkchar 必须配：它告诉解码器"热词按单字切"，与 tokens.txt 的结构对应
+                /*
+                 * 【建模单元必须跟词表一致】当前 14M 模型是**单汉字词表**
+                 * （`怎 3` `么 4`），所以用 cjkchar。
+                 *
+                 * 0.23.24 曾换成 zipformer-large（词表是 BPE：`▁的 260`），那时必须
+                 * 改成 modelingUnit=bpe + bpeVocab=tokens.txt，否则裸单字查不到 id。
+                 * 但那个模型 1687 个 token 里连「酷/抖/哔/哩/驶」都没有，应用名念不出来，
+                 * 已否决回退。**将来再换模型，这一步要跟着词表一起改，不能只换文件。**
+                 */
                 m.setModelingUnit("cjkchar");
                 c.setHotwordsFile(hw);
                 c.setHotwordsScore(Prefs.voiceHotwordScore(ctx));

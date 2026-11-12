@@ -34,6 +34,20 @@ final class VoiceAssets {
 
     /** 当前内置 TTS 模型指纹：换了模型（标贝→melo→huayan→标贝）必须同步改这个字符串 */
     private static final String TTS_MODEL_TAG = "matcha-baker-zh-v1";
+    /**
+     * ASR 模型指纹。**必须和 TTS 分开**：
+     * 以前 extract() 对任何目录都用 TTS_MODEL_TAG 比较，于是换个 TTS 音色会把
+     * 识别模型的解压目录一起清掉重拷，反过来换 ASR 模型又会把 139MB 的 TTS 重解压一次
+     * （首次启动白等十几秒）。按目录各管各的指纹，互不牵连。
+     */
+    private static final String ASR_MODEL_TAG = "zh-zipformer-14m-2023-02-23-v1";
+    private static final String KWS_MODEL_TAG = "kws-zh-wenetspeech-v1";
+
+    private static String tagFor(String dir) {
+        if ("asr".equals(dir)) return ASR_MODEL_TAG;
+        if ("kws".equals(dir)) return KWS_MODEL_TAG;
+        return TTS_MODEL_TAG;
+    }
 
     private VoiceAssets() { }
 
@@ -50,8 +64,9 @@ final class VoiceAssets {
         try {
             File outDir = new File(c.getFilesDir(), "voice/" + dir);
             File tagFile = new File(outDir, ".modeltag");
+            final String tag = tagFor(dir);      // 按目录各管各的指纹，ASR/TTS 互不牵连
             // 指纹不符（首次 / 换模型 / 残留旧模型）→ 清掉整个目录再解压，避免新旧模型混用
-            if (!tagMatches(tagFile, TTS_MODEL_TAG)) {
+            if (!tagMatches(tagFile, tag)) {
                 if (outDir.exists()) {
                     FileLog.append("VOICE 模型指纹不符，清理旧目录 " + outDir);
                     deleteRecursively(outDir);
@@ -71,7 +86,7 @@ final class VoiceAssets {
                 FileLog.append("VOICE 模型解压失败：assets/" + dir + " 是空的");
                 return null;
             }
-            writeTag(tagFile, TTS_MODEL_TAG);
+            writeTag(tagFile, tag);
             String prefix = outDir.getAbsolutePath() + "/";
             FileLog.append("VOICE 模型已解压到 " + prefix
                     + "（" + (System.currentTimeMillis() - t0) + "ms，" + n + " 个文件）");

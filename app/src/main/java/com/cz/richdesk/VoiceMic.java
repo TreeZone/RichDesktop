@@ -58,6 +58,20 @@ public final class VoiceMic {
     private volatile boolean running;
     private volatile String error;
     private volatile int sampleRate = SR;
+    /**
+     * 实际采样率与模型要求(16k)不一致 → 需要在喂 ASR 前重采样。
+     *
+     * 为什么必须有这道：AudioRecord.Builder 只是"请求" 16k，ROM 完全可以给你
+     * 48000（很多车机 HAL 固定 48k）。而识别模型只认 16k —— 把 48k 的样本按 16k
+     * 喂进去，声音就是 3 倍速的"花栗鼠"，音调全错，识别结果必然一塌糊涂。
+     * 这个字段以前根本没有：sampleRate() 有定义、却没有任何调用者，
+     * 也就是说真出这种情况时，代码是"静默地按错的采样率送进去了"。
+     */
+    private volatile boolean needResample;
+    private volatile int realSr = SR;
+    /** 系统级降噪 / 自动增益（可用才启用，车机远场拾音全靠它俩） */
+    private android.media.audiofx.NoiseSuppressor ns;
+    private android.media.audiofx.AutomaticGainControl agc;
     /** 本次采集的 audio session id：录音配置列表里用它把自己排除掉 */
     private volatile int session;
     /**
@@ -164,8 +178,11 @@ public final class VoiceMic {
                 return false;
             }
             sampleRate = r.getSampleRate();          // ROM 可能改写采样率，记真实值
+            realSr = sampleRate;
+            needResample = sampleRate != SR;
             session = r.getAudioSessionId();
             rec = r;
+            enableEffects(session);
             // 保守起见先当"没有信号"：第一个真正有声的 chunk 会把它清掉。
             // 这样 HAL 开了却一直不回数据（read 阻塞）也能被 silentMs() 发现。
             silentSince = android.os.SystemClock.elapsedRealtime();
@@ -174,7 +191,10 @@ public final class VoiceMic {
             th.setDaemon(true);
             th.start();
             FileLog.append("VOICE 麦克风已开 source=" + sourceName(source)
-                    + " 请求=" + SR + " 实际=" + sampleRate + "Hz");
+                    + " 请求=" + SR + " 实际=" + sampleRate + "Hz"
+                    + (needResample ? "（与模型不一致 → 已启用重采样到 " + SR + "）" : "")
+                    + " 降噪=" + (ns != null && ns.getEnabled() ? "开" : "无")
+                    + " 自动增益=" + (agc != null && agc.getEnabled() ? "开" : "无"));
             return true;
         } catch (Throwable t) {
             error = "打开麦克风异常 " + t;
@@ -182,6 +202,69 @@ public final class VoiceMic {
             Log.e(TAG, "voice mic start", t);
             return false;
         }
+    }
+
+    /**
+     * 打开系统级降噪与自动增益。
+     *
+     * 车机是**远场拾音**（麦在顶棚/仪表台，人离 0.5~1m，还有空调与路噪），
+     * 不给 AGC 时说话声往往只有几百 LSB，模型的输入动态范围远低于训练分布；
+     * 不给 NS 时风噪/路噪会直接把字糊掉。这两个 effect 由系统提供、零体积成本，
+     * 个别 ROM 不支持就跳过（isAvailable 为 false 或 create 返回 null），不报错。
+     */
+    private void enableEffects(int sessionId) {
+        try {
+            if (android.media.audiofx.NoiseSuppressor.isAvailable()) {
+                ns = android.media.audiofx.NoiseSuppressor.create(sessionId);
+                if (ns != null) ns.setEnabled(true);
+            }
+        } catch (Throwable t) {
+            ns = null;
+        }
+        try {
+            if (android.media.audiofx.AutomaticGainControl.isAvailable()) {
+                agc = android.media.audiofx.AutomaticGainControl.create(sessionId);
+                if (agc != null) agc.setEnabled(true);
+            }
+        } catch (Throwable t) {
+            agc = null;
+        }
+    }
+
+    private void releaseEffects() {
+        try {
+            if (ns != null) ns.release();
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (agc != null) agc.release();
+        } catch (Throwable ignored) {
+        }
+        ns = null;
+        agc = null;
+    }
+
+    private static final short[] EMPTY = new short[0];
+
+    /**
+     * 线性插值把实际采样率的 PCM 转到 16k。
+     * 48k→16k 是整除关系，等价于 ideal 3:1 抽取；块间最多丢不到 1 个样本，
+     * 对识别没有影响（不要在块边界处做相位累积，那个更容易写错）。
+     */
+    private short[] resample(short[] in, int n) {
+        double step = (double) realSr / SR;
+        int outN = (int) (n / step);
+        if (outN <= 0) return EMPTY;
+        short[] out = new short[outN];
+        for (int i = 0; i < outN; i++) {
+            double pos = i * step;
+            int i0 = (int) pos;
+            if (i0 >= n) i0 = n - 1;
+            int i1 = i0 + 1 < n ? i0 + 1 : i0;
+            double f = pos - i0;
+            out[i] = (short) (in[i0] * (1 - f) + in[i1] * f + 0.5);
+        }
+        return out;
     }
 
     private void loop() {
@@ -229,13 +312,24 @@ public final class VoiceMic {
                 }
                 wasSilent = false;
             }
+            // 采样率守卫：ROM 给了非 16k（车机常见 48k）时必须转成模型要求的样子，
+            // 否则送进去的是 3 倍速音频，音调全错、识别必然崩。电平用原始数据算，
+            // 不受重采样影响。
+            short[] frame = buf;
+            int fn = n;
+            if (needResample) {
+                frame = resample(buf, n);
+                fn = frame.length;
+                if (fn <= 0) continue;
+            }
             try {
-                sink.onPcm(buf, n, rms);
+                sink.onPcm(frame, fn, rms);
             } catch (Throwable t) {
                 Log.e(TAG, "voice sink", t);
             }
         }
         running = false;
+        releaseEffects();
         // 停也在本线程：主线程调 stop() 只置标志 + 等它收尾
         try {
             if (rec != null) {
