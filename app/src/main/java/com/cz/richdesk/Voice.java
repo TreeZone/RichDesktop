@@ -1312,6 +1312,21 @@ public final class Voice {
                 if (hh != null) hh.onVoiceAction(pkg);
             });
             endUtterance(700);
+        } else if (r.kind == VoiceIntent.AMBIGUOUS && r.candidates.size() == 1
+                && r.score >= 60) {
+            // 只有一个候选、分数也够：没有"第几个"可选，问了也是白问（用户明确要求
+            // 「有多个备选时」才提示选第几个）。直接打开，别让用户为一个没有分支的
+            // 选择再操作一次。分数低于 60 的仍走候选，让用户确认，避免误开。
+            AppInfo only = r.candidates.get(0);
+            beep(false);
+            say("好的，打开" + only.label);
+            pushState("→ " + only.label, shown);
+            final String op = only.pkg;
+            ui.post(() -> {
+                Host hh = host;
+                if (hh != null) hh.onVoiceAction(op);
+            });
+            endUtterance(700);
         } else if (r.kind == VoiceIntent.AMBIGUOUS && !r.candidates.isEmpty()) {
             // 报候选的同时**继续听**：说序号、直接说名字、或点列表都行。
             // 完整列表留在 pickCands；announcePickPage 只把当前页（9 条）交给 UI 和 TTS。
@@ -1321,8 +1336,12 @@ public final class Voice {
             pickPage = 0;
             announcePickPage();
         } else {
-            say(shown.isEmpty() ? "没听清，再说一遍" : "没找到「" + shown + "」");
-            pushState(shown.isEmpty() ? "没听清" : "没找到「" + shown + "」", shown);
+            // 找不到就**直说找不到**，不弹候选、不列全部应用（用户明确要求）。
+            // 旧行为：匹配不到时把所有英文名应用塞进候选页，用户看到的是一屏
+            // 跟自己说法毫无关系的应用，还得逐页翻 —— 比一句"找不到"更差。
+            String miss = shown.isEmpty() ? "没听清，再说一遍" : "找不到" + shown + "这个应用";
+            say(miss);
+            pushState(shown.isEmpty() ? "没听清" : "找不到「" + shown + "」", shown);
             endUtterance(1200);
         }
     }
@@ -1377,12 +1396,11 @@ public final class Voice {
 
         // 只问序号，**不逐个念应用名**：念 5 个名字要十几秒，用户得干等着，
         // 还容易被硬闸收掉；名字在屏幕上的候选菜单里看得见，念出来是纯浪费。
-        StringBuilder sb = new StringBuilder("要选第几个？");
-        if (pages > 1) {
-            sb.append("共 ").append(total).append(" 个，说「下一页」看更多");
-        }
-        say(sb.toString());
-        pushState("第 " + (pickPage + 1) + "/" + pages + " 页 · 说序号 / 说名字，或直接点", "");
+        // 也**不报总数/页数**（用户明确要求）：一句短问就够，页数写在屏幕提示里。
+        say("要选第几个？");
+        pushState(pages > 1
+                ? "第 " + (pickPage + 1) + "/" + pages + " 页 · 说序号 / 说名字，或直接点"
+                : "说序号 / 说名字，或直接点", "");
         ui.post(() -> {
             Host hh = host;
             if (hh != null) hh.onVoiceCandidates(phrase, page);
@@ -1396,7 +1414,8 @@ public final class Voice {
         long now = SystemClock.elapsedRealtime();
         deadline = now + PICK_WAIT_MS;
         // 提示语要念几秒，这段时间收的是自己的 TTS，不算进「3 秒没听清」
-        listenAnchor = now + Math.min(6000L, 1200L + 300L * sb.length());
+        // 播报文本固定是「要选第几个？」(6 字)，估算≈3000ms；播报期本身也已物理隔离。
+        listenAnchor = now + 3000L;
         lastTextAt = listenAnchor;
         listenSince = now;
     }

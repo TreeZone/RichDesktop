@@ -496,6 +496,16 @@ public final class VoiceIntent {
             Set<String> al = aliases == null ? null : aliases.get(a.pkg);
             rel.put(a, al == null ? 0 : skeletonScore(q, al));
         }
+        // 【只收「沾边」的】以前这里无条件把 60 个英文名应用全塞进候选，
+        // 于是"打开某个根本不存在的应用"也会弹出几十条无关列表 —— 用户明确否决：
+        // 找不到就直说找不到，别把全部都列出来。
+        // 现在的门槛是骨架分 > 0（说法和该应用的别名声母骨架有一点对应）。
+        // 一个都不沾边 → 返回 0，上层回 NONE，直接播报"找不到"。
+        int kept = 0;
+        for (AppInfo a : latin) {
+            if (rel.get(a) > 0) kept++;
+        }
+        if (kept == 0) return 0;
         latin.sort((x, y) -> {
             int d = rel.get(y) - rel.get(x);
             if (d != 0) return d;
@@ -503,8 +513,10 @@ public final class VoiceIntent {
             String ny = y.label == null ? "" : y.label;
             return nx.compareToIgnoreCase(ny);
         });
-        out.addAll(latin);
-        return latin.size();
+        for (AppInfo a : latin) {
+            if (rel.get(a) > 0) out.add(a);
+        }
+        return kept;
     }
 
     /** 候选分页：+1 下一页 / -1 上一页 / 0 不是翻页指令 */
