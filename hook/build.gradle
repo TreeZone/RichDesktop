@@ -11,9 +11,12 @@ plugins {
  *   - 主应用以后换签名/改包名都不影响它，反过来也一样。
  *
  * 用法：gradle :hook:assembleDebug → 装进车机 → LSPosed 管理器里勾选模块、作用域选「系统框架」→ 软重启。
- * 想临时关掉某一条 hook，不用重装，改系统属性即可：
- *   setprop persist.pipdesk.hook.pause 0     # 关掉主补丁
- *   setprop persist.pipdesk.hook.focus 1     # 打开"拒绝清空 focusedApp"的实验分支
+ * 想临时关掉某一条 hook，不用重装，改系统属性即可（setprop 后立即生效，无需重启）：
+ *   persist.pipdesk.hook.focus  1   # 拦掉 setFocusedApp(null)，从源头保住焦点（首选）
+ *   persist.pipdesk.hook.pause  1   # 拦掉跨屏 pauseBackTasks（下游第二道闸）
+ *   persist.pipdesk.hook.task   1   # 拦掉跨屏 startPausingLocked（兜底，最接近核心，谨慎）
+ *   persist.pipdesk.hook.main   1   # 把主屏也纳入保护（默认 false，风险最高）
+ * 四个默认全 false = 只观察不改行为。
  */
 android {
     namespace 'com.cz.richdesk.hook'
@@ -23,8 +26,8 @@ android {
         applicationId "com.cz.richdesk.hook"
         minSdk 28
         targetSdk 30
-        versionCode 3
-        versionName "0.3"
+        versionCode 4
+        versionName "0.4"
     }
 
     signingConfigs {

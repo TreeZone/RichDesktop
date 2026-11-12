@@ -13,7 +13,7 @@
         <meta-data android:name="xposedmodule" android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="拦掉车机 ROM 里跨虚拟屏的 pauseBackTasks：点蓝牙播放时不再把其它画中画一起暂停（焦点与音频原样不动）" />
+            android:value="拦掉车机 ROM 的跨屏暂停与焦点清空：点蓝牙播放时不再把其它画中画一起暂停/丢焦点。默认观察模式，用 persist.pipdesk.hook.* 开关逐个启用" />
         <meta-data android:name="xposedminversion" android:value="93" />
         <meta-data android:name="xposedscope" android:value="android" />
     </application>

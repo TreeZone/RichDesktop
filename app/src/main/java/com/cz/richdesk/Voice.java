@@ -134,6 +134,12 @@ public final class Voice {
     private final VoiceTts tts = new VoiceTts();
     private ToneGenerator tone;
 
+    // ---- 音频焦点：唤醒后把正在放的音乐压下去，免得盖住说话和播报 ----
+    /** 语音会话期间持有 TRANSIENT 焦点；持有期间别家播放器会被系统要求暂停 */
+    private AudioManager am;
+    private android.media.AudioFocusRequest focusReq;
+    private volatile boolean focusHeld;
+
     private Thread control;
     private volatile boolean alive;
     private volatile boolean wakeMode;
@@ -150,6 +156,9 @@ public final class Voice {
     private volatile long listenSince;
     /** 本轮把识别结果当成「自我回采」丢掉的次数 */
     private int echoHits;
+    /** 最近一次 TTS 播报的文本与时刻：用来识别「自己刚说的话又被麦克风听回去」 */
+    private volatile String lastSayText;
+    private volatile long lastSayAt;
     /** 本轮是否出现过「有用的文字」：3 秒没听清直接退出就看它 */
     private volatile boolean gotUsefulText;
     /** KWS 重建失败后的退避时刻：否则每 80ms 试一次，日志刷屏还费 CPU */
@@ -252,6 +261,9 @@ public final class Voice {
     public void stop() {
         alive = false;
         listenReq = false;
+        // 语音整体停掉：立刻把音频焦点还回去，别让背景音乐一直停在那儿
+        ui.removeCallbacks(focusRelease);
+        abandonAudioFocus();
         final Thread t = control;
         control = null;
         wakeMode = false;
@@ -919,6 +931,9 @@ public final class Voice {
 
     /** 开始一次聆听：先把模型和麦克风准备好，再切状态（否则会漏掉开头） */
     private void beginListen() {
+        // 一进来就压住背景音乐：用户马上要说话，音乐还在响会同时干扰识别和播报。
+        // 拿到短暂独占焦点后，系统会让正在放歌的 app 暂停；收工时再放回去。
+        requestAudioFocus();
         // 一进来就计时：准备阶段（加载模型/开麦）也要算在硬闸里，
         // 否则 S_LOADING 用的是上一轮的时间戳，或者干脆没人管
         listenSince = SystemClock.elapsedRealtime();
@@ -1135,6 +1150,23 @@ public final class Voice {
                 + (shown.equals(t) ? "" : " 清洗后=\"" + shown + "\"")
                 + (hardTimeout ? "（超时收工）" : ""));
 
+        // TTS 播报回采：自己刚说的话被麦克风录回来了（「要选第几个？」最典型）。
+        // 整条丢掉：不当指令、不进入匹配、也不续命 —— 否则会去匹配应用名，
+        // 最后回一句「没找到「要选第几个」」，正是用户说的"把自己说的话又听回去了"。
+        if (isSayEcho(shown)) {
+            FileLog.append("VOICE 忽略播报回采「" + t + "」");
+            state = S_LISTEN;
+            synchronized (lock) {
+                if (asr != null) asr.begin();
+            }
+            long nowSay = SystemClock.elapsedRealtime();
+            deadline = nowSay + LISTEN_MAX_MS;
+            listenAnchor = nowSay + 400;    // 播报已经念完，不必再等尾音
+            lastTextAt = listenAnchor;
+            pushState("请说指令", "");
+            return;
+        }
+
         // 自我回采：开始聆听时 TTS 说的「我在」可能被麦克风录进去；
         // 唤醒词尾巴（小瑞 / 小雷）同理。都不是指令 —— 重置识别器继续听。
         // 注意别把「一个字都没识别到」也当回采：那种情况应走下面的「没听清」。
@@ -1285,13 +1317,12 @@ public final class Voice {
         final List<AppInfo> page = new java.util.ArrayList<>(pickCands.subList(from, to));
         final String phrase = pickPhrase;
 
-        StringBuilder sb = new StringBuilder("您要说哪个？");
-        // 只报前 5 个：9 个全念 TTS 要十几秒，会被硬闸收掉
-        String[] ord = {"第一个", "，第二个", "，第三个", "，第四个", "，第五个"};
-        for (int i = 0; i < page.size() && i < ord.length; i++) {
-            sb.append(ord[i]).append(page.get(i).label);
+        // 只问序号，**不逐个念应用名**：念 5 个名字要十几秒，用户得干等着，
+        // 还容易被硬闸收掉；名字在屏幕上的候选菜单里看得见，念出来是纯浪费。
+        StringBuilder sb = new StringBuilder("要选第几个？");
+        if (pages > 1) {
+            sb.append("共 ").append(total).append(" 个，说「下一页」看更多");
         }
-        if (pages > 1) sb.append("。说「下一页」看更多");
         say(sb.toString());
         pushState("第 " + (pickPage + 1) + "/" + pages + " 页 · 说序号 / 说名字，或直接点", "");
         ui.post(() -> {
@@ -1333,6 +1364,12 @@ public final class Voice {
     /** 系统引擎回一句话（设置里可关；引擎不存在时静默） */
     private void say(String s) {
         if (!Prefs.voiceReply(ctx)) return;
+        // 记下这一句：ASR 把它录回来时要靠它认出「这是我自己说的」
+        lastSayText = s;
+        lastSayAt = SystemClock.elapsedRealtime();
+        // 播报期间压住背景音乐，并把「释放焦点」重排到这句念完之后
+        requestAudioFocus();
+        releaseFocusWhenSpoken();
         tts.ensure(ctx, Prefs.voiceTtsMode(ctx), Prefs.voiceTtsEngine(ctx));
         tts.speak(s);
     }
@@ -1354,6 +1391,93 @@ public final class Voice {
         tts.speak("您好，我是你的语音助理。");
     }
 
+    // ------------------------------------------------------------ 音频焦点（压住背景音乐）
+
+    /**
+     * 申请一次短暂独占焦点：正在放歌的 app 会被系统要求暂停。
+     *
+     * 为什么要它：唤醒后用户要说话、我们要播报，音乐还在响就全糊在一起。
+     * 用「短暂独占」而不是自己去发暂停键：焦点是系统契约，abandon 之后播放器
+     * 会自己接着放，不会误伤别的 app，也不用管对方是什么播放器。
+     *
+     * 失败或对方不响应都不影响语音主流程，只记一行日志。
+     */
+    private void requestAudioFocus() {
+        if (ctx == null) return;
+        try {
+            if (focusHeld) return;
+            if (am == null) am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+            if (am == null) return;
+            if (focusReq == null) {
+                android.media.AudioAttributes attrs = new android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_ASSISTANT)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build();
+                focusReq = new android.media.AudioFocusRequest.Builder(
+                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                        .setAudioAttributes(attrs)
+                        // 明确要"暂停"而不是"把音量压低一点"
+                        .setWillPauseWhenDucked(true)
+                        .setOnAudioFocusChangeListener(
+                                new AudioManager.OnAudioFocusChangeListener() {
+                                    @Override
+                                    public void onAudioFocusChange(int change) {
+                                        // 我们不抢回来：语音是短会话，让系统按自己的规则调度
+                                    }
+                                })
+                        .build();
+            }
+            int r = am.requestAudioFocus(focusReq);
+            focusHeld = r == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+            FileLog.append("VOICE 音频焦点" + (focusHeld
+                    ? "已获得 → 背景音乐暂停"
+                    : "被拒（音乐不会暂停，可能是车机不响应焦点）"));
+        } catch (Throwable t) {
+            FileLog.append("VOICE 请求音频焦点失败（不影响语音）：" + t);
+        }
+    }
+
+    /** 放掉焦点：背景音乐自己恢复。多次调用无害 */
+    private void abandonAudioFocus() {
+        try {
+            if (am == null || focusReq == null || !focusHeld) return;
+            am.abandonAudioFocusRequest(focusReq);
+            focusHeld = false;
+            FileLog.append("VOICE 释放音频焦点 → 背景音乐恢复");
+        } catch (Throwable t) {
+            focusHeld = false;
+        }
+    }
+
+    /**
+     * 等「这一句播报」念完再放焦点。
+     *
+     * 不这么做就会出现：卡片关了、焦点立刻放开、音乐起来，把我们正在念的最后半句盖掉。
+     * 用 removeCallbacks 保证同一时刻只有一个待执行的释放任务，不会重复排。
+     */
+    private void releaseFocusWhenSpoken() {
+        if (!focusHeld) return;
+        try {
+            long now = SystemClock.elapsedRealtime();
+            String said = lastSayText;
+            long endAt = lastSayAt + 900L + 260L * (said == null ? 0 : said.length());
+            long delay = Math.max(0L, endAt - now) + 250L;   // 留一点尾音余量
+            if (delay > 8000L) delay = 8000L;                // 兜底：绝不永远不放
+            ui.removeCallbacks(focusRelease);
+            ui.postDelayed(focusRelease, delay);
+        } catch (Throwable t) {
+            abandonAudioFocus();                             // 算不出来就立刻放，别赖着
+        }
+    }
+
+    /** 释放任务的句柄，供 removeCallbacks 去重 */
+    private final Runnable focusRelease = new Runnable() {
+        @Override
+        public void run() {
+            abandonAudioFocus();
+        }
+    };
+
     /** 这些短句只可能是我们自己（或对方接话）说的，不当指令处理 */
     private static final String[] ECHO_WORDS = {
             "我在", "在", "我在呢", "我在这里", "我在这儿",
@@ -1366,6 +1490,38 @@ public final class Voice {
             if (n.equals(w)) return true;
         }
         return false;
+    }
+
+    /**
+     * 自己刚播报出去的那句话，被麦克风录回来了吗？
+     *
+     * 场景：播报「要选第几个？」→ 这句被自己的麦克风收进去 → ASR 识别成「要选第几个」
+     * → 以前会被当成用户指令，去匹配应用名，最后回一句「没找到「要选第几个」」。
+     *
+     * 两道门槛防止把真实指令一起吞掉：
+     *  · 长度门槛：识别结果比播报文本短太多就不算（「打开音乐」不会被
+     *    「好的，打开波点音乐」判成回采）；
+     *  · 覆盖率门槛：识别结果的汉字要有 75% 出现在播报文本里
+     *    （用户答「第一个」对「要选第几个」只覆盖 2/3 = 66%，不会被误吞）。
+     */
+    private boolean isSayEcho(String t) {
+        String said = lastSayText;
+        if (said == null || said.isEmpty() || t == null || t.isEmpty()) return false;
+        long dt = SystemClock.elapsedRealtime() - lastSayAt;
+        // 播报估算时长 + 600ms 缓冲：超过这个时间就不是「刚说完」了
+        if (dt > 1200L + 260L * said.length() + 600L) return false;
+
+        String a = VoiceIntent.normalize(t);
+        String b = VoiceIntent.normalize(said);
+        if (a.isEmpty() || b.isEmpty()) return false;
+        if (a.length() * 10 < b.length() * 6) return false;      // 长度差太多，不是同一句
+        if (b.contains(a) || a.contains(b)) return true;
+
+        int hit = 0;
+        for (int i = 0; i < a.length(); i++) {
+            if (b.indexOf(a.charAt(i)) >= 0) hit++;
+        }
+        return hit * 100 >= a.length() * 75;
     }
 
     /**
@@ -1399,6 +1555,9 @@ public final class Voice {
                 idleSince = SystemClock.elapsedRealtime();
                 pushState("语音待命", null);
             }
+            // 这一轮彻底收工：等最后一句播报念完再把音频焦点放回去，音乐才会接着放。
+            // 放在 state 切换之后，保证「播报完毕 + 卡片/状态收掉」两个条件都满足才恢复。
+            releaseFocusWhenSpoken();
         }, delayMs);
     }
 
@@ -1415,6 +1574,10 @@ public final class Voice {
     public void cancelListening() {
         int st = state;
         if (st != S_LISTEN && st != S_LOADING && st != S_THINK) return;
+        // 用户收工 = 立刻闭嘴：别把「要选第几个？」念完，更别继续念后面的
+        tts.stop();
+        // 播报已停，按「最后一句的估算时长」放焦点（若随后还要说「没听清」，say 会重排）
+        releaseFocusWhenSpoken();
         awaitingPick = false;
         pickCands = null;
         partial = "";

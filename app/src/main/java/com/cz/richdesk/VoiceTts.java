@@ -159,6 +159,23 @@ public final class VoiceTts {
         }
     }
 
+    /**
+     * 只停「当前正在念的这一句」，不销毁引擎、不释放模型。
+     * 用户点遮罩收掉收音框时用：立刻闭嘴，但下次说话还是秒出声。
+     */
+    public void stop() {
+        pending = null;
+        local.cancel();
+        synchronized (this) {
+            if (tts != null) {
+                try {
+                    tts.stop();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
     /** 换模式 / 换引擎后调用：丢掉旧系统实例，停掉内置朗读（不释放模型，切换更轻快） */
     public void reset() {
         local.cancel();
