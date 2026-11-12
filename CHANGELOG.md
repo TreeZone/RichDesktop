@@ -7,6 +7,57 @@
 
 ---
 
+## 0.23.26 / vc170 — 修 0.23.25 的崩溃：CTC 不能用 beam search
+
+**一句话：0.23.25 一点语音图标就闪退重启，根因是 CTC 模型走了 `modified_beam_search` —— sherpa 在 native 层直接 `exit(-1)`，Java 拦不住。CTC 只支持 greedy。**
+
+### 现场与根因
+
+用户实测：第一次点语音助手图标 → 桌面闪退重启；之后再点 → 收音框一闪就消失。
+
+第二条其实是熔断在挡：进程崩过之后 `voice/asr.load` 标记生效，90 秒内直接跳过识别模型，
+于是 `beginListen` 拿不到识别器，收音框立刻收起 —— 看着也像"闪退"。
+
+根因在 Python 侧复现出来了，sherpa 自己打印得明明白白：
+
+```
+online-recognizer-ctc-impl.h:313 InitDecoder
+Unsupported decoding method: modified_beam_search for streaming CTC models
+```
+
+这是个 `SHERPA_ONNX_LOGE` + `exit(-1)` —— **native 杀进程**，不是异常，`try/catch` 完全无效。
+
+为什么会在 0.23.25 才炸：`Prefs.voiceBeam()` **默认 true**，旧代码据此设
+`modified_beam_search`。14M transducer 时代这是对的（beam 抗跳字），换 CTC 后
+同一个开关就成了定时炸弹。
+
+### 修了什么
+
+1. **`VoiceAsr` 写死 `greedy_search`**，不再读 `Prefs.voiceBeam`。
+   CTC 没有自回归，beam 收益本来就小，greedy 足够。
+   注释里写清了「为什么不能改回去」，并在 `Prefs.voiceBeam` 上标了警告。
+2. **熔断标记带模型指纹**。原来标记是空文件、只看修改时间，于是换了模型之后
+   上一次模型的崩溃记录还会把新模型挡住（用户装完新版立刻测，会以为"还是坏的"）。
+   现在标记内容 = 当前 `ASR_MODEL_TAG`，不匹配就删除并继续加载。
+
+### 教训（写下来避免再犯）
+
+**换解码器类型时，除了模型文件、词表形态、配置入口，还要检查所有"解码参数"
+是否被新解码器支持。** 0.23.24 换 transducer 大模型时这些参数都通用，所以没暴露；
+CTC 只支持 greedy，而 beam 开关是全局默认开的。
+
+另外：native `exit(-1)` 不会给 Java 任何机会，**只能靠"配置前先确认支持"来防**，
+不能靠异常处理兜底。
+
+### 验证
+
+- dex 里 `modified_beam_search` 出现 **0 次**（说明代码里已无任何路径会传 beam）
+- `greedy_search` 出现 2 次（配置 + 日志）
+- `readTiny` / `asrTag` 等熔断逻辑已进包
+- APK 182MB，与 0.23.25 一致
+
+---
+
 ## 0.23.25 / vc169 — 识别模型换成 25MB CTC：**体积几乎不变，准确率追平 154MB 大模型**
 
 **一句话：找到一个「单文件 25MB、字节级词表、准确率等同大模型」的流式 CTC 模型，替换掉原来 24MB 的 14M transducer。APK 只长大 2MB。**

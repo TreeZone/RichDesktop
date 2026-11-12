@@ -52,6 +52,11 @@ final class VoiceAssets {
         return TTS_MODEL_TAG;
     }
 
+    /** 当前 ASR 模型指纹。崩溃熔断标记要拿它比对，换模型后旧标记自动作废 */
+    static String asrTag() {
+        return ASR_MODEL_TAG;
+    }
+
     private VoiceAssets() { }
 
     /** assets 前缀（sherpa 认的相对路径） */

@@ -48,8 +48,6 @@ import java.util.List;
 final class VoiceAsr {
 
     private static final String TAG = "PipDesk";
-    /** 束搜索宽度：4 是 sherpa 示例里精度/延迟的常用折中 */
-    private static final int BEAM_SIZE = 4;
     /** CTC 单文件模型（zipformer2-ctc） */
     private static final String MODEL_FILE = "model.int8.onnx";
     private static final String TOKENS_FILE = "tokens.txt";
@@ -86,21 +84,39 @@ final class VoiceAsr {
     /** 加载模型（1~2 秒，必须在后台线程，且别放在开机首帧路径上） */
     boolean load() {
         if (rec != null) return true;
-        // 熔断：sherpa 的路径错误是 **native 层 exit(-1)**，Java 拦不住、进程当场死
-        // （0.21.0 闪屏、0.23.1 点语音图标桌面重启，都是它）。标记在加载前写、
-        // 成功后删：一旦 90 秒内发生过加载期崩溃，就先跳过识别模型，保住桌面
-        // 不被"点一下语音图标 → 桌面重启"无限循环。改语音设置会清标记重试。
+        // 熔断：sherpa 的一些配置错误是 **native 层 exit(-1)**，Java 拦不住、进程当场死
+        // （0.21.0 闪屏、0.23.1 点语音图标桌面重启、0.23.25 的 CTC+beam，都是它）。
+        // 标记在加载前写、成功后删：一旦 90 秒内发生过加载期崩溃，就先跳过识别模型，
+        // 保住桌面不被"点一下语音图标 → 桌面重启"无限循环。
+        //
+        // 标记里要带**模型指纹**：否则换了模型（尤其修完崩溃换个能跑的）之后，
+        // 旧模型留下的崩溃记录还会把新模型挡在外面 —— 用户装完新版立刻测，
+        // 会发现"语音还是不能用"，其实是熔断在挡。
+        final String curTag = VoiceAssets.asrTag();
         java.io.File fuse = new java.io.File(ctx.getFilesDir(), "voice/asr.load");
-        if (fuse.isFile()
-                && System.currentTimeMillis() - fuse.lastModified() < 90_000L) {
-            loadError = "识别模型上次加载曾导致进程崩溃，90 秒内先跳过（改语音设置可立即重试）";
-            FileLog.append("VOICE " + loadError);
-            return false;
+        if (fuse.isFile()) {
+            String prevTag = readTiny(fuse);
+            boolean sameModel = prevTag != null && prevTag.equals(curTag);
+            boolean recent = System.currentTimeMillis() - fuse.lastModified() < 90_000L;
+            if (!sameModel) {
+                // 旧模型（或旧版本没写内容）的崩溃记录，对新模型无效
+                try {
+                    fuse.delete();
+                } catch (Throwable ignored) {
+                }
+                FileLog.append("VOICE 检测到旧模型的崩溃标记（" + prevTag + "），已作废");
+            } else if (recent) {
+                loadError = "识别模型上次加载曾导致进程崩溃，90 秒内先跳过（改语音设置可立即重试）";
+                FileLog.append("VOICE " + loadError);
+                return false;
+            }
         }
         try {
             java.io.File dir = fuse.getParentFile();
             if (dir != null && !dir.exists()) dir.mkdirs();
-            fuse.createNewFile();
+            java.io.FileOutputStream fo = new java.io.FileOutputStream(fuse);
+            fo.write(curTag.getBytes("UTF-8"));
+            fo.close();
         } catch (Throwable ignored) {
         }
 
@@ -172,13 +188,20 @@ final class VoiceAsr {
             m.setProvider("cpu");
             m.setDebug(false);
 
-            // 解码方式：beam 抗跳字，代价约 2 倍 CPU（14M 模型 2 线程仍然实时）
-            if (Prefs.voiceBeam(ctx)) {
-                c.setDecodingMethod("modified_beam_search");
-                c.setMaxActivePaths(BEAM_SIZE);
-            } else {
-                c.setDecodingMethod("greedy_search");
-            }
+            /*
+             * 【必须 greedy_search —— 这里出过一次严重事故，别改】
+             *
+             * streaming CTC 只支持 greedy_search。传 modified_beam_search 时 sherpa 在
+             * online-recognizer-ctc-impl.h 的 InitDecoder 里直接
+             *     SHERPA_ONNX_LOGE("Unsupported decoding method: modified_beam_search
+             *                      for streaming CTC models") + exit(-1)
+             * 也就是 **native 直接杀进程**，Java 的 try/catch 一点用都没有。
+             * 现象就是「第一次点语音图标 → 桌面闪退重启」。
+             *
+             * 0.23.25 第一次发布正是踩了这个：沿用 Prefs.voiceBeam（默认 true）走了
+             * beam，一点就崩。CTC 也没有自回归，beam 收益本来就小，greedy 足够。
+             */
+            c.setDecodingMethod("greedy_search");
 
             c.setEnableEndpoint(true);
             // 端点规则用默认值：说完 ~1.2s 静音就断句，单句上限 20s。
@@ -193,7 +216,7 @@ final class VoiceAsr {
             loadError = null;
             String msg = "VOICE 识别模型加载完成 " + (loadedAt - t0) + "ms prefix=" + prefix
                     + (filesMode ? "（纯文件模式）" : "（assets 模式）")
-                    + (Prefs.voiceBeam(ctx) ? " beam=" + BEAM_SIZE : " greedy")
+                    + " greedy"                       // CTC 只支持 greedy，别按 voiceBeam 走
                     + " model=zipformer2-ctc hotwords=unsupported(CTC)";
             Log.i(TAG, msg);
             FileLog.append(msg);
@@ -204,6 +227,30 @@ final class VoiceAsr {
             release();
             loadError = "识别模型加载失败：" + t;
             return false;
+        }
+    }
+
+    /**
+     * 读一个很小的文本文件（熔断标记，内容就是模型指纹）。
+     * 读不到 / 空文件 → null：老版本用 createNewFile() 写的是空文件，
+     * 那种一律当成"和当前模型不匹配"，正好把历史遗留标记作废。
+     */
+    private static String readTiny(java.io.File f) {
+        try {
+            if (!f.isFile() || f.length() <= 0 || f.length() > 512) return null;
+            byte[] buf = new byte[(int) f.length()];
+            java.io.FileInputStream in = new java.io.FileInputStream(f);
+            int off = 0;
+            while (off < buf.length) {
+                int r = in.read(buf, off, buf.length - off);
+                if (r <= 0) break;
+                off += r;
+            }
+            in.close();
+            String s = new String(buf, 0, off, "UTF-8").trim();
+            return s.isEmpty() ? null : s;
+        } catch (Throwable t) {
+            return null;
         }
     }
 

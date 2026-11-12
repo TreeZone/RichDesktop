@@ -928,12 +928,15 @@ public class Prefs {
     }
 
     /**
-     * 识别解码用束搜索（默认开）。
+     * 识别解码用束搜索。
      *
-     * greedy_search 在噪声里容易跳字：一句话掉一个关键字，「打开酷狗」就变成「打开酷」，
-     * 匹配层再宽容也救不回来。modified_beam_search（beam=4）明显更稳，
-     * 代价是解码 CPU 约 2 倍 —— 14M 的小模型开 2 线程仍然实时，所以默认开。
-     * 真遇到很老的车机嫌卡，可以在设置里关掉回到 greedy。
+     * <p><b>当前模型（0.23.25 起的 streaming CTC）绝对不能用这个开关</b>：
+     * CTC 只支持 greedy_search，传 modified_beam_search 会让 sherpa 在 native 层
+     * 直接 exit(-1)（见 VoiceAsr 里那段注释），表现为「点语音图标 → 桌面闪退重启」。
+     * VoiceAsr 已经写死 greedy，不再读这个值。
+     *
+     * <p>保留它只为将来换回 transducer 模型时的历史兼容（当年 14M 上
+     * modified_beam_search 确实更抗跳字）。换回 transducer 时记得同步改 VoiceAsr。
      */
     public static boolean voiceBeam(Context c) {
         return sp(c).getBoolean("voice_beam", true);
