@@ -2,6 +2,7 @@ package com.cz.richdesk;
 
 import android.content.Context;
 import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.util.Log;
 
 import java.util.Locale;
@@ -37,6 +38,18 @@ public final class VoiceTts {
 
     /** 系统引擎就绪前要补说的那句（init 期间用户指令可能已经执行完） */
     private volatile String pending;
+    /** 系统引擎此刻是否正在出声（由 UtteranceProgressListener 维护） */
+    private volatile boolean sysSpeaking;
+
+    /**
+     * 此刻是否正在出声。
+     * 语音侧用它做「播报期硬抑制」：只要我们在发声，麦克风收到的内容一律不算用户指令，
+     * 否则播报会被 ASR 听回去，再回一句，再被听回去 —— 自激循环停不下来。
+     */
+    public boolean isSpeaking() {
+        if (mode == Prefs.TTS_LOCAL || broken) return local.isSpeaking();
+        return sysSpeaking || local.isSpeaking();
+    }
 
     /** @param mode Prefs.TTS_SYS / TTS_LOCAL / TTS_CUSTOM */
     public void ensure(Context ctx, int mode, String engine) {
@@ -95,6 +108,26 @@ public final class VoiceTts {
             // 中文优先；引擎不支持中文时也照用（总比没有强）
             try {
                 tts.setLanguage(Locale.SIMPLIFIED_CHINESE);
+            } catch (Throwable ignored) {
+            }
+            // 用引擎自己的进度回调判断"有没有在出声"，比按字数估算准得多
+            try {
+                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                    @Override
+                    public void onStart(String utteranceId) {
+                        sysSpeaking = true;
+                    }
+
+                    @Override
+                    public void onDone(String utteranceId) {
+                        sysSpeaking = false;
+                    }
+
+                    @Override
+                    public void onError(String utteranceId) {
+                        sysSpeaking = false;
+                    }
+                });
             } catch (Throwable ignored) {
             }
             ready = true;
@@ -173,6 +206,7 @@ public final class VoiceTts {
                 } catch (Throwable ignored) {
                 }
             }
+            sysSpeaking = false;      // tts.stop() 不一定回调 onDone，这里直接清
         }
     }
 

@@ -70,6 +70,13 @@ final class LocalTts {
     private volatile boolean broken;
     private volatile boolean preparing;
     private volatile String pending;
+    /** 此刻是否正在出声：语音侧据此屏蔽「自己说的话被麦克风听回去」 */
+    private volatile boolean speaking;
+
+    /** 正在出声（含刚起播那一段）：播报期间收到的识别结果必须整条丢弃 */
+    boolean isSpeaking() {
+        return speaking;
+    }
 
     boolean isReady() {
         return ready;
@@ -242,6 +249,7 @@ final class LocalTts {
             pcm[i] = (short) (y * 32767f);
         }
         AudioTrack at = null;
+        speaking = true;          // 从这一刻起麦克风收到的是我们自己的声音
         try {
             int min = AudioTrack.getMinBufferSize(sr,
                     AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
@@ -283,6 +291,7 @@ final class LocalTts {
         } catch (Throwable e) {
             FileLog.append("VOICE 内置 TTS 播放失败：" + e);
         } finally {
+            speaking = false;
             if (at != null) {
                 try {
                     at.stop();

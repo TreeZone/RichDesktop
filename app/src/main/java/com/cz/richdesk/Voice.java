@@ -507,7 +507,9 @@ public final class Voice {
                     beginListen();
                 }
 
-                if (state == S_LISTEN) {
+                // 播报期间不判超时 / 不收工：我们自己正占着麦说话，这时候收到的文字必然
+                // 是自己的回音。让它照常走超时逻辑，会形成「收工 → 又被唤醒 → 再收工」的空转。
+                if (state == S_LISTEN && !withinSpeechGuard()) {
                     String cur = asr == null ? "" : asr.text();
                     boolean hasText = cur != null && !cur.trim().isEmpty();
                     // 判据是「字幕多久没变过」，不是「有没有声音」——
@@ -1150,18 +1152,35 @@ public final class Voice {
                 + (shown.equals(t) ? "" : " 清洗后=\"" + shown + "\"")
                 + (hardTimeout ? "（超时收工）" : ""));
 
-        // TTS 播报回采：自己刚说的话被麦克风录回来了（「要选第几个？」最典型）。
-        // 整条丢掉：不当指令、不进入匹配、也不续命 —— 否则会去匹配应用名，
-        // 最后回一句「没找到「要选第几个」」，正是用户说的"把自己说的话又听回去了"。
+        // 【播报期硬抑制】只要我们自己正在出声（或刚说完），麦克风收到的内容一律不算指令。
+        //
+        // 为什么不能只靠「文本相似度」：ASR 会把播报识别成别的字（「要选第几个」→「要学第几个」），
+        // 比对失效 → 当成指令 → 匹配不到 → 回一句 → 这句又被听回去 → 无限循环停不下来。
+        // 所以这里不看文本，只看「我们是不是在发声」，这是唯一可靠的判据。
+        if (withinSpeechGuard()) {
+            FileLog.append("VOICE 播报期抑制「" + t + "」（我们在出声，不算指令）");
+            state = S_LISTEN;
+            synchronized (lock) {
+                if (asr != null) asr.begin();
+            }
+            long nowG = SystemClock.elapsedRealtime();
+            deadline = nowG + LISTEN_MAX_MS;
+            listenAnchor = nowG + 300;
+            lastTextAt = listenAnchor;
+            pushState("请说指令", "");
+            return;
+        }
+
+        // 兜底：引擎没报状态、但确实是刚播报过的残片（ASR 延迟吐出）
         if (isSayEcho(shown)) {
-            FileLog.append("VOICE 忽略播报回采「" + t + "」");
+            FileLog.append("VOICE 忽略播报残片「" + t + "」");
             state = S_LISTEN;
             synchronized (lock) {
                 if (asr != null) asr.begin();
             }
             long nowSay = SystemClock.elapsedRealtime();
             deadline = nowSay + LISTEN_MAX_MS;
-            listenAnchor = nowSay + 400;    // 播报已经念完，不必再等尾音
+            listenAnchor = nowSay + 300;
             lastTextAt = listenAnchor;
             pushState("请说指令", "");
             return;
@@ -1490,6 +1509,27 @@ public final class Voice {
             if (n.equals(w)) return true;
         }
         return false;
+    }
+
+    /**
+     * 是否处于「我们自己正在出声」的屏蔽期 —— 播报期收到的识别结果一律丢弃。
+     *
+     * 判据两条：
+     *  1) 引擎报告正在出声（内置引擎看 AudioTrack 生命周期，系统引擎看
+     *     UtteranceProgressListener），且距最后一次 say 没超太久 ——
+     *     加超时是防止回调丢失把状态卡成"永久屏蔽"，那样用户说什么都没反应；
+     *  2) 刚说完不久（1.2 秒内）：盖住 TTS 尾音和 ASR 的延迟吐字。
+     */
+    private boolean withinSpeechGuard() {
+        if (lastSayAt == 0L) return false;   // 本轮还没说过话（也避免开机早期把 elapsed 误算成「刚说完」）
+        long now = SystemClock.elapsedRealtime();
+        long elapsed = now - lastSayAt;
+        String said = lastSayText;
+        long est = 900L + 260L * (said == null ? 0 : said.length());
+        try {
+            if (tts.isSpeaking() && elapsed < est + 3000L) return true;
+        } catch (Throwable ignored) { }
+        return elapsed < 1200L;
     }
 
     /**
