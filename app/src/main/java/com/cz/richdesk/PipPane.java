@@ -93,6 +93,21 @@ public class PipPane {
      */
     private boolean previewMode;
     private int previewW, previewH;
+    /**
+     * 松手后"等布局落定再退出预览"的标记。
+     *
+     * 不能在松手那一瞬间直接恢复 MATCH_PARENT：那一刻纹理尺寸会在一帧内从
+     * 「冻结尺寸」跳成「最终尺寸」，而 buffer 还是旧的 —— 这一帧就是用户看到的闪屏。
+     * 现在等 pane 的 layout 回调（尺寸已经是最终值）再退出，并且退出时先把纹理
+     * 布局设成**最终绝对尺寸**、同时把 scale 撤成 1（视觉大小前后完全一致），
+     * 新 buffer 到了之后再换回 MATCH_PARENT（数值相同，换回也不会有任何变化）。
+     */
+    private boolean pendingExitPreview;
+    private final Runnable pendingExitTask = new Runnable() {
+        @Override public void run() {
+            if (pendingExitPreview) finishExitPreview();
+        }
+    };
     /** 纹理出帧计数 / 最后一次出帧时刻：画面"冻结"的判断依据（重启日志里带上） */
     private long frames;
     /** 最后一帧的时刻（uptimeMillis），0 = 还没出过帧。跨线程读，必须 volatile */
@@ -159,6 +174,17 @@ public class PipPane {
         texture = new TextureView(ctx);
         texture.setOpaque(false);
         texture.setAlpha(0f);
+        // 预览期间纹理尺寸可能单独变化（松手恢复自动布局时 root 尺寸并没变，
+        // 所以 root 的监听器收不到）—— 缩放必须跟着它走，否则会有一帧错配。
+        texture.addOnLayoutChangeListener((v, l, t, r, b2, ol, ot, or, ob) -> {
+            if (!previewMode) return;
+            updatePreviewScale();
+            if (pendingExitPreview
+                    && texture.getWidth() == root.getWidth()
+                    && texture.getHeight() == root.getHeight()) {
+                finishExitPreview();
+            }
+        });
         root.addView(texture, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
@@ -380,27 +406,56 @@ public class PipPane {
             texture.setPivotY(0f);
             updatePreviewScale();
         } else {
-            previewMode = false;
-            texture.setScaleX(1f);
-            texture.setScaleY(1f);
-            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) texture.getLayoutParams();
-            lp.width = FrameLayout.LayoutParams.MATCH_PARENT;
-            lp.height = FrameLayout.LayoutParams.MATCH_PARENT;
-            lp.gravity = Gravity.NO_GRAVITY;
-            texture.setLayoutParams(lp);
-            // 布局跑完、尺寸定了再对齐虚拟屏（这是本次拖动唯一一次 resize）
-            scheduleSurfaceSize();
+            requestExitPreview();
         }
     }
 
-    /** 把冻结的纹理等比拉伸到 pane 当前大小（拖动预览用） */
+    /**
+     * 松手：切回自动布局，但**不马上撤缩放**。
+     *
+     * 之前在这里直接把 scale 设回 1，而布局要到下一帧才生效 —— 那一帧就是
+     * "纹理还是冻结尺寸、缩放已经没了"，画面突然缩小，也就是闪屏。
+     * 现在先切布局（尺寸会自己长到 pane 大小），缩放继续按"pane / 纹理实际尺寸"
+     * 归一化计算，两者在任何一帧都自洽，等尺寸追平再收尾。
+     */
+    private void requestExitPreview() {
+        pendingExitPreview = true;
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) texture.getLayoutParams();
+        lp.width = FrameLayout.LayoutParams.MATCH_PARENT;
+        lp.height = FrameLayout.LayoutParams.MATCH_PARENT;
+        lp.gravity = Gravity.NO_GRAVITY;
+        texture.setLayoutParams(lp);
+        root.removeCallbacks(pendingExitTask);
+        root.postDelayed(pendingExitTask, 300);       // 兜底：尺寸本来就相等时不会有 layout 回调
+    }
+
+    /** 纹理尺寸已追平 pane：此时 scale 天然就是 1，撤掉不会有任何可见变化 */
+    private void finishExitPreview() {
+        pendingExitPreview = false;
+        previewMode = false;
+        root.removeCallbacks(pendingExitTask);
+        texture.setScaleX(1f);
+        texture.setScaleY(1f);
+        // 整次拖动只在这里对齐一次 buffer 与虚拟屏
+        scheduleSurfaceSize();
+    }
+
+    /**
+     * 把纹理拉伸到 pane 当前大小（拖动预览用）。
+     *
+     * 缩放按「pane 尺寸 ÷ 纹理**实际**尺寸」算，而不是除以开始拖动时的冻结尺寸：
+     * 这样无论布局什么时候生效、纹理尺寸处在哪一帧的值，最终视觉大小永远等于 pane 大小，
+     * 松手切回自动布局的过渡期也不会跳（尺寸一变，缩放当帧就跟着重算）。
+     */
     private void updatePreviewScale() {
-        if (!previewMode || previewW <= 0 || previewH <= 0) return;
+        if (!previewMode) return;
         int rw = root.getWidth();
         int rh = root.getHeight();
-        if (rw <= 0 || rh <= 0) return;
-        texture.setScaleX(rw / (float) previewW);
-        texture.setScaleY(rh / (float) previewH);
+        int tw = texture.getWidth();
+        int th = texture.getHeight();
+        if (rw <= 0 || rh <= 0 || tw <= 0 || th <= 0) return;
+        texture.setScaleX(rw / (float) tw);
+        texture.setScaleY(rh / (float) th);
     }
 
     /** 把虚拟屏尺寸对齐到 TextureView 的当前尺寸（比例动画结束后也会直接调用） */
