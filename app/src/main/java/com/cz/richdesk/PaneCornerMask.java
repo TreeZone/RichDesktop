@@ -46,11 +46,17 @@ final class PaneCornerMask extends View {
 
     private BitmapShader shader;
     private Bitmap shaderBmp;
-    private int shaderW, shaderH;
+    private int shaderW, shaderH, shaderX, shaderY;
 
-    /** 四个角的形状（窗口绝对坐标），随位置/尺寸/半径变化重建 */
+    /**
+     * 四个角的形状，**View 局部坐标**（0,0 起）。
+     *
+     * 不能用窗口绝对坐标：onDraw 的 canvas 原点就在 View 左上角，
+     * 用窗口坐标会让整块遮罩平移 (x,y) —— 实际表现是"圆角画在 pane 内部的左上角"，
+     * 而 pane 真正的四角仍然是方的。第一版就是这么错的。
+     */
     private Path maskPath;
-    private int pathX = -1, pathY = -1, pathW = -1, pathH = -1, pathR = -1;
+    private int pathW = -1, pathH = -1, pathR = -1;
 
     /** 拿不到壁纸时回调一次（上层据此退回整块裁剪，避免四角是方的） */
     Runnable onUnavailable;
@@ -102,8 +108,8 @@ final class PaneCornerMask extends View {
         int x = loc[0], y = loc[1], w = getWidth(), h = getHeight();
         if (w <= 0 || h <= 0) return;
 
-        ensureShader(bmp, sw, sh);
-        ensureMask(x, y, w, h);
+        ensureShader(bmp, sw, sh, x, y);
+        ensureMask(w, h);
         if (maskPath == null) return;
 
         if (!loggedOnce) {
@@ -121,11 +127,10 @@ final class PaneCornerMask extends View {
      * 一次 {@code Path.op} 就得到全部四块，不用为每个角单独算角度和弧的起止点
      * （第一版手写 arcTo 的四个方向参数，很容易把某个角画到里面去）。
      */
-    private void ensureMask(int x, int y, int w, int h) {
-        if (maskPath != null && x == pathX && y == pathY
-                && w == pathW && h == pathH && radiusPx == pathR) return;
+    private void ensureMask(int w, int h) {
+        if (maskPath != null && w == pathW && h == pathH && radiusPx == pathR) return;
 
-        RectF rf = new RectF(x, y, x + w, y + h);
+        RectF rf = new RectF(0, 0, w, h);
         Path full = new Path();
         full.addRect(rf, Path.Direction.CW);
         Path round = new Path();
@@ -150,8 +155,6 @@ final class PaneCornerMask extends View {
             return;
         }
         maskPath = out;
-        pathX = x;
-        pathY = y;
         pathW = w;
         pathH = h;
         pathR = radiusPx;
@@ -163,19 +166,24 @@ final class PaneCornerMask extends View {
      * shader 的坐标就是**窗口坐标**：因为 Path 也是窗口坐标、canvas 不做任何变换，
      * 两者天然对齐 —— 这是第一版镜像方案栽过的地方。
      */
-    private void ensureShader(Bitmap bmp, int sw, int sh) {
-        if (shader != null && shaderBmp == bmp && shaderW == sw && shaderH == sh) return;
+    private void ensureShader(Bitmap bmp, int sw, int sh, int x, int y) {
+        if (shader != null && shaderBmp == bmp && shaderW == sw && shaderH == sh
+                && shaderX == x && shaderY == y) return;
         shader = new BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
         float scale = Math.max(sw / (float) bmp.getWidth(), sh / (float) bmp.getHeight());
         shaderMatrix.reset();
         shaderMatrix.setScale(scale, scale);
-        shaderMatrix.postTranslate((sw - bmp.getWidth() * scale) / 2f,
-                (sh - bmp.getHeight() * scale) / 2f);
+        // 最后减掉 pane 在窗口里的偏移：shader 的坐标要和 Path 一样是 View 局部坐标，
+        // 否则四角填的是"窗口别处"的壁纸，和周围对不上。
+        shaderMatrix.postTranslate((sw - bmp.getWidth() * scale) / 2f - x,
+                (sh - bmp.getHeight() * scale) / 2f - y);
         shader.setLocalMatrix(shaderMatrix);
         paint.setShader(shader);
         shaderBmp = bmp;
         shaderW = sw;
         shaderH = sh;
+        shaderX = x;
+        shaderY = y;
     }
 
     /** 遮罩完全是装饰层，不能挡触摸 */
