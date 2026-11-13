@@ -92,8 +92,21 @@ public final class Voice {
     private static final long PICK_WAIT_MS = 8_000L;
     /** 候选每页条数：语音序号只到 9，多了靠翻页；列表本身不截断 */
     private static final int PICK_PAGE_SIZE = 9;
-    /** 环形缓冲时长：覆盖 ASR 加载那 1~2 秒 + 说话前的犹豫 */
-    private static final int RING_MS = 2500;
+    /**
+     * 环形缓冲时长：**按真实时间**记（静音也占位），要能覆盖 ASR 加载的那几秒。
+     *
+     * 车机实测（双语 paraformer）识别模型加载 4.4 秒，唤醒后用户立刻说的那句
+     * 全在这段时间里，缓冲短了就把开头丢掉。6 秒 = 192KB，随便存。
+     */
+    private static final int RING_MS = 6000;
+    /**
+     * 唤醒点往前保留多少音频补喂给识别器。
+     *
+     * 唤醒词检出总比"最后一个字"晚 200~400ms，一点不留会把紧跟着的那个字切掉
+     * （车机上「打」被吃掉是高频错法）。300ms 实测不够，用 500ms；
+     * 多带出来的唤醒词尾巴由 VoiceIntent.cleanWake() 剥掉。
+     */
+    private static final int PRE_ROLL_MS = 500;
 
     public static final int S_OFF = 0;        // 没开麦克风
     public static final int S_WAKE = 1;       // 常驻等唤醒词
@@ -206,6 +219,8 @@ public final class Voice {
     private final short[] ring = new short[VoiceMic.SR * RING_MS / 1000];
     private int ringPos;
     private int ringLen;
+    /** 唤醒时刻（elapsedRealtime）：补录只喂这一时刻往后的音频，见 feedRing() */
+    private long wakeAt;
 
     private Voice() { }
 
@@ -1072,11 +1087,31 @@ public final class Voice {
     }
 
     /** 唤醒后补录环形缓冲 */
+    /**
+     * 把「唤醒前 500ms 到现在」的音频补喂给识别器。
+     *
+     * 为什么不能整段倒进去：环形缓冲在常驻状态原来只记 rms 超门限的帧，
+     * 它等价于「最近若干秒的**说话声**」，而不是「最近若干秒」。用户在唤醒前
+     * 正跟副驾说话时，那半句的尾巴就混在缓冲头部 → 识别结果前面挂一句无关的字
+     * （现场日志：唤醒补录 40000 样本（2500ms），"听到的"其实是上一句话）。
+     *
+     * 现在缓冲按真实时间记，长度按「唤醒时刻之后过了多久 + 500ms」算，
+     * 静音段照喂（识别器自己会跳过），但绝不会往前多带一句。
+     */
     private void feedRing() {
         if (asr == null || ringLen <= 0) return;
-        short[] tmp = new short[ringLen];
-        int start = (ringPos - ringLen + ring.length) % ring.length;
-        for (int i = 0; i < ringLen; i++) tmp[i] = ring[(start + i) % ring.length];
+        int pre = VoiceMic.SR * PRE_ROLL_MS / 1000;
+        long elapsed = wakeAt > 0
+                ? SystemClock.elapsedRealtime() - wakeAt : PRE_ROLL_MS;
+        long want = elapsed * VoiceMic.SR / 1000 + pre;
+        int feedLen = (int) Math.min(Math.min(want, ringLen), ring.length);
+        if (feedLen <= 0) {
+            ringLen = 0;
+            return;
+        }
+        short[] tmp = new short[feedLen];
+        int start = (ringPos - feedLen + ring.length) % ring.length;
+        for (int i = 0; i < feedLen; i++) tmp[i] = ring[(start + i) % ring.length];
         // 一次喂完容易让 zipformer 的 chunk 对齐错位，按 100ms 切片喂
         int chunk = VoiceMic.SR / 10;
         for (int off = 0; off < tmp.length; off += chunk) {
@@ -1085,7 +1120,9 @@ public final class Voice {
             System.arraycopy(tmp, off, part, 0, n);
             asr.accept(part, n);
         }
-        FileLog.append("VOICE 唤醒补录 " + ringLen + " 样本（" + (ringLen * 1000 / VoiceMic.SR) + "ms）");
+        FileLog.append("VOICE 唤醒补录 " + feedLen + " 样本（"
+                + (feedLen * 1000 / VoiceMic.SR) + "ms）"
+                + " 唤醒后 " + elapsed + "ms（只喂唤醒点往后，样本数接近 6000ms 就是异常）");
         ringLen = 0;
     }
 
@@ -1160,9 +1197,11 @@ public final class Voice {
             // → 又唤醒 → 又说「我在」→ 再被听回去……用户看到的就是"自己跟自己说话停不下来"。
             // 唤醒词模型对短句尤其敏感，光靠 ASR 那层过滤根本挡不住。
             if (withinSpeechGuard()) return;
-            // 环形缓冲只为人声准备：静音段没必要存（KWS 本身必须连续喂，
-            // 跳帧会把流式模型的上下文打断，唤醒词命中率会莫名其妙掉到 0）
-            if (rms >= MIN_RMS) appendRing(buf, n);
+            // 环形缓冲必须**按真实时间**记，静音也占位：补录是按"时间窗"取音频的，
+            // 只存有声音的帧会让 500ms 变成"最后 500ms 的说话声"，把上一句带进来。
+            // 代价只是一次 memcpy（10ms 一帧 320 个 short），可以忽略。
+            // （KWS 本身更要连续喂，跳帧会打断流式上下文，唤醒率直接掉。）
+            appendRing(buf, n);
             String kw;
             synchronized (lock) {
                 if (kws == null) return;
@@ -1186,12 +1225,11 @@ public final class Voice {
         // 注意：这里跑在**采集线程**上，绝不能在这里加载 ASR（1~2 秒，会让麦克风断流，
         // 用户唤醒后立刻说的「打开」就全丢了）。只置请求，让控制线程去开识别，
         // 期间环形缓冲继续填 —— 补录靠它。
-        // 只保留最后一段：唤醒词本身没必要送进 ASR，但要留够"下一个字的开头"，
-        // 否则用户唤醒后立刻说「打开音乐」，「打」字会被切掉 → 识别成「开音乐」→ 匹配不上。
-        // 300ms 实测不够（车机上「打」被吃掉是高频错法），放到 500ms；
-        // 多带出来的唤醒词尾巴由 VoiceIntent.cleanWake() 剥掉。
-        int keep = VoiceMic.SR * 500 / 1000;
-        if (ringLen > keep) ringLen = keep;
+        // 记下唤醒时刻：补录时只喂「这一刻往前 PRE_ROLL_MS」之后的音频。
+        // 老实现是「把缓冲里现有的截到 500ms」，但缓冲在常驻态只存有声音的帧，
+        // 那 500ms 是「最后 500ms 的语音」而不是「最后 500ms 的时间」——
+        // 于是用户唤醒前跟人说的半句话，会被当成命令开头送进识别器。
+        wakeAt = SystemClock.elapsedRealtime();
         partial = "";
         pushState("在听…", null);
         listenReq = true;

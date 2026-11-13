@@ -94,6 +94,16 @@ public final class PerfMon {
                         .append(' ').append(pane.msSinceLastFrame()).append("ms")
                         .append(" st=").append(pane.displayState());
             }
+            // 单画专用屏也要记：用户报「打开百度地图汽车版就卡」，而单画走的是独立虚拟屏，
+            // 原来这一路一个帧数都没有，日志里根本看不出它出帧多少 —— 没法判断"卡"是
+            // 屏内应用自己慢，还是它在拖着整个窗口重绘。
+            PipPane single = p.singlePane();
+            if (single != null) {
+                b.append(" ps=").append(single.pkg() == null ? "idle" : single.pkg())
+                        .append(" f=").append(single.frames())
+                        .append(' ').append(single.msSinceLastFrame()).append("ms")
+                        .append(" st=").append(single.displayState());
+            }
         }
         String line = b.toString();
         Log.i(TAG, line);
