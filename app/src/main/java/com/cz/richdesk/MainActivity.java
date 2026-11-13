@@ -2554,7 +2554,8 @@ public class MainActivity extends AppCompatActivity
     }
 
     @Override
-    public void onVoiceCandidates(String phrase, List<AppInfo> cands) {
+    public void onVoiceCandidates(String phrase, List<AppInfo> cands,
+                                  boolean hasPrev, boolean hasNext) {
         // 先无条件收掉上一张：cands 为空代表语音侧说了「都不是」要取消，
         // 旧版这里直接 return，卡片会一直挂在屏幕上。
         if (voiceCandMenu != null) {
@@ -2562,14 +2563,25 @@ public class MainActivity extends AppCompatActivity
             voiceCandMenu = null;
         }
         if (cands == null || cands.isEmpty()) return;
-        List<String> items = new ArrayList<>(cands.size() + 2);
+        // 翻页项按需出现：只有一页、或已在首/尾页时不该显示 —— 点了没反应的按钮等于骗人。
+        // 索引不能写死成 size+1：上一页可能不存在，所有下标都要现算。
+        final int base = cands.size();
+        final int iPrev = hasPrev ? base : -1;
+        final int iNone = base + (hasPrev ? 1 : 0);
+        final int iNext = hasNext ? iNone + 1 : -1;
+        List<String> items = new ArrayList<>(base + 3);
         for (AppInfo a : cands) items.add(a.label);
+        if (hasPrev) items.add("‹ 上一页");
         items.add("都不是");
-        items.add("下一页 ›");
+        if (hasNext) items.add("下一页 ›");
         voiceCandMenu = GlassMenu.show(this, "「" + phrase + "」是哪个？说序号 / 说名字也行", items, which -> {
             voiceCandMenu = null;
-            if (which == cands.size() + 1) {      // 翻页：完整候选按 9 个一页，列表和序号一起换
+            if (which == iNext) {                  // 翻页：完整候选按 9 个一页，列表和序号一起换
                 Voice.get().flipPickPage(1);
+                return;
+            }
+            if (which == iPrev) {
+                Voice.get().flipPickPage(-1);
                 return;
             }
             if (which < 0 || which >= cands.size()) return;   // 「都不是」：静默取消

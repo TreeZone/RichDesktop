@@ -126,8 +126,14 @@ public final class Voice {
         /** 要执行的动作：pkg 是真实包名或 pipdesk:// 内置伪包名 */
         void onVoiceAction(String pkg);
 
-        /** 听不准，给候选让用户点；点完会记成别名 */
-        void onVoiceCandidates(String phrase, List<AppInfo> cands);
+        /**
+         * 听不准，给候选让用户点；点完会记成别名。
+         *
+         * `hasPrev / hasNext` 决定菜单里显不显示翻页项 —— 只有一页或者已经在最后一页时
+         * 不该出现「下一页 ›」：点了没反应等于骗人，用户明确要求去掉。
+         */
+        void onVoiceCandidates(String phrase, List<AppInfo> cands,
+                               boolean hasPrev, boolean hasNext);
 
         /** 用嘴选了第几个（说完「第一个」）：把候选列表收掉 */
         default void onVoiceCandidatesPicked(String phrase, AppInfo pick) { }
@@ -159,6 +165,15 @@ public final class Voice {
     private volatile boolean listenReq;
     private volatile int state = S_OFF;
     private volatile String partial = "";
+    /**
+     * 推到界面上的那一版字幕（与 `partial` 分开）。
+     *
+     * sherpa 的流式结果偶尔会把已经吐出来的字**往回改**（改字 / 变短），
+     * 直接照搬的话用户看到的是字幕来回缩，比慢一点更晃眼。
+     * 这里只增不减：新结果不比当前显示的短才换。
+     * 匹配和执行仍用 `partial` / `asr.text()`，显示稳定不影响识别结果。
+     */
+    private volatile String uiText = "";
     private volatile int level;
     private volatile long deadline;
     /** "没识别出文字"的计时起点（TTS 的「我在」念完才开始算） */
@@ -167,6 +182,16 @@ public final class Voice {
     private volatile long lastTextAt;
     /** 本轮开始聆听的时刻（识别器为 null 时的兜底判定） */
     private volatile long listenSince;
+    /**
+     * 本轮里**被播报守卫挡掉的累计毫秒**。
+     *
+     * 播报期间我们不喂 ASR，所以那段时间用户说的话本来就不会有结果；
+     * 但它一直算在 `listenSince / listenAnchor` 里 —— 唤醒后 TTS 说一句「我在」
+     * （~0.7s）、报候选时说「要选第几个？」（~3s），用户的真实说话窗口被白白吃掉。
+     * 反应稍慢一点就听到「没听清」，用户会以为是"没听清"其实压根没听。
+     * 这里把这段时间累出来，超时判定时扣掉。
+     */
+    private volatile long guardMs;
     /** 本轮把识别结果当成「自我回采」丢掉的次数 */
     private int echoHits;
     /** 最近一次 TTS 播报的文本与时刻：用来识别「自己刚说的话又被麦克风听回去」 */
@@ -355,6 +380,7 @@ public final class Voice {
         awaitingPick = false;
         pickCands = null;
         partial = "";
+        uiText = "";
         gotUsefulText = false;
         cooldownUntil = 0;
         ringLen = 0;
@@ -558,13 +584,18 @@ public final class Voice {
                     // 本轮一个有用字都没出现过 → 从 listenSince 起算满 3 秒就退出，
                     // 不受 endpoint 重置 anchor / 噪音乱码续命的影响。
                     boolean noUsefulYet = !gotUsefulText;
+                    // 扣掉播报期（TTS 说话那几秒麦克风根本没进 ASR）：不扣的话
+                    // 「我在」0.7 秒 + 用户反应时间就把 3 秒窗口吃光了。
+                    long heard = guardMs;
                     boolean timedOut = noUsefulYet
-                            ? (now - listenSince >= NO_TEXT_TIMEOUT_MS)
-                            : (now - anchor >= NO_TEXT_TIMEOUT_MS);
+                            ? (now - listenSince - heard >= NO_TEXT_TIMEOUT_MS)
+                            : (now - anchor - heard >= NO_TEXT_TIMEOUT_MS);
                     if (timedOut) {
                         FileLog.append("VOICE " + (noUsefulYet
-                                ? (now - listenSince) + "ms 没有任何有用文字 → 没听清，直接退出"
-                                : (now - anchor) + "ms 没有新的有用文字 → 收工")
+                                ? (now - listenSince - heard) + "ms 没有任何有用文字"
+                                : (now - anchor - heard) + "ms 没有新的有用文字")
+                                + (heard > 0 ? "（已扣播报 " + heard + "ms）" : "")
+                                + (noUsefulYet ? " → 没听清，直接退出" : " → 收工")
                                 + (hasText ? "（停在「" + cur + "」）" : "（环境噪音？）"));
                         if (noUsefulYet) {
                             // 【需求二.3】没听清就立刻退出这一轮，不再走 finish() 的
@@ -649,8 +680,9 @@ public final class Voice {
         long cap = (st == S_LISTEN && awaitingPick)
                 ? PICK_WAIT_MS + 4_000L      // 候选多时 TTS 报读更久，别把列表提前收掉
                 : (hasText ? HARD_MAX_MS + 1_000L : HARD_MAX_MS);
-        if (now - since <= cap) return false;
-        FileLog.append("VOICE 本轮已 " + (now - since) + "ms 超过上限（state=" + st
+        if (now - since - guardMs <= cap) return false;
+        FileLog.append("VOICE 本轮已 " + (now - since) + "ms（有效 " + (now - since - guardMs)
+                + "ms）超过上限（state=" + st
                 + "，字幕=\"" + (partial == null ? "" : partial) + "\"）→ 强制收工");
         cancelListening();
         return true;
@@ -979,11 +1011,13 @@ public final class Voice {
         // 一进来就计时：准备阶段（加载模型/开麦）也要算在硬闸里，
         // 否则 S_LOADING 用的是上一轮的时间戳，或者干脆没人管
         listenSince = SystemClock.elapsedRealtime();
+        guardMs = 0;
         echoHits = 0;
         gotUsefulText = false;
         state = S_LOADING;
         pushState("准备聆听…", null);
         partial = "";
+        uiText = "";
 
         // 上一轮收工时麦克风可能正被别人占着（读到的是死寂数据）。不先处理，
         // 这一轮从头到尾都是白听 —— 用户看到的就是"点了语音图标却没反应"。
@@ -1088,21 +1122,28 @@ public final class Voice {
 
     /** 唤醒后补录环形缓冲 */
     /**
-     * 把「唤醒前 500ms 到现在」的音频补喂给识别器。
+     * 把「唤醒词起点之后到现在」的音频补喂给识别器。
      *
-     * 为什么不能整段倒进去：环形缓冲在常驻状态原来只记 rms 超门限的帧，
-     * 它等价于「最近若干秒的**说话声**」，而不是「最近若干秒」。用户在唤醒前
-     * 正跟副驾说话时，那半句的尾巴就混在缓冲头部 → 识别结果前面挂一句无关的字
-     * （现场日志：唤醒补录 40000 样本（2500ms），"听到的"其实是上一句话）。
+     * 两代修法：
+     *   · 0.23.33 把缓冲从「只记说话帧」改成按真实时间记（静音占位），并且只往前补 500ms ——
+     *     解决了「整段倒进去」的放大版问题；
+     *   · 现在（0.23.47）用户实测还有：**上一句话的末尾挂在新指令开头**。
+     *     原因很直白：固定往前补 500ms，如果用户说完上一句、隔一会儿才喊唤醒词，
+     *     那 500ms 里躺的正是上一句的尾巴。补录本身没错（唤醒词检出有 200~400ms 延迟，
+     *     不补会把紧跟的「打」字切掉），错在"往前补多远"是拍死的。
      *
-     * 现在缓冲按真实时间记，长度按「唤醒时刻之后过了多久 + 500ms」算，
-     * 静音段照喂（识别器自己会跳过），但绝不会往前多带一句。
+     * 现在的做法：从缓冲末尾往前扫，**找到最近的一段连续静音**（≥120ms），
+     * 从这段静音之后开始喂 —— 那正是唤醒词的起点。上一句尾巴在静音的另一侧，
+     * 天然被排除。整段都没有静音（用户连着一句接一句说）才退回原来的 500ms 口径。
      */
     private void feedRing() {
         if (asr == null || ringLen <= 0) return;
         int pre = VoiceMic.SR * PRE_ROLL_MS / 1000;
         long elapsed = wakeAt > 0
                 ? SystemClock.elapsedRealtime() - wakeAt : PRE_ROLL_MS;
+        // **不能给 want 设小上限**：识别模型冷加载要 4 秒多，用户唤醒后立刻说的那句
+        // 全在这几秒里，上限设小了等于把开头丢光（0.23.33 就吃过这个亏）。
+        // 靠静音回溯来保证"不带上一句"，而不是靠截短长度。
         long want = elapsed * VoiceMic.SR / 1000 + pre;
         int feedLen = (int) Math.min(Math.min(want, ringLen), ring.length);
         if (feedLen <= 0) {
@@ -1112,18 +1153,74 @@ public final class Voice {
         short[] tmp = new short[feedLen];
         int start = (ringPos - feedLen + ring.length) % ring.length;
         for (int i = 0; i < feedLen; i++) tmp[i] = ring[(start + i) % ring.length];
+
+        // 静音回溯：cut = 唤醒词的起点（静音段结束后的第一个有声样本）
+        int cut = silenceCut(tmp);
+        int off = 0;
+        // 切完至少还得剩 300ms，否则宁可不切（切太狠等于把唤醒词和指令一起丢了）
+        if (cut > 0 && feedLen - cut >= VoiceMic.SR * 300 / 1000) off = cut;
+
+        int fed = 0;
         // 一次喂完容易让 zipformer 的 chunk 对齐错位，按 100ms 切片喂
         int chunk = VoiceMic.SR / 10;
-        for (int off = 0; off < tmp.length; off += chunk) {
-            int n = Math.min(chunk, tmp.length - off);
+        for (int p = off; p < tmp.length; p += chunk) {
+            int n = Math.min(chunk, tmp.length - p);
             short[] part = new short[n];
-            System.arraycopy(tmp, off, part, 0, n);
+            System.arraycopy(tmp, p, part, 0, n);
             asr.accept(part, n);
+            fed += n;
         }
-        FileLog.append("VOICE 唤醒补录 " + feedLen + " 样本（"
-                + (feedLen * 1000 / VoiceMic.SR) + "ms）"
-                + " 唤醒后 " + elapsed + "ms（只喂唤醒点往后，样本数接近 6000ms 就是异常）");
+        FileLog.append("VOICE 唤醒补录 " + fed + " 样本（"
+                + (fed * 1000 / VoiceMic.SR) + "ms）"
+                + " 唤醒后 " + elapsed + "ms"
+                + (off > 0 ? "，往前切掉 " + (off * 1000 / VoiceMic.SR) + "ms（上一句尾巴）"
+                           : "，未找到静音分界（连说）")
+                + (fed * 1000 / VoiceMic.SR >= RING_MS - 200 ? "【异常：补录接近缓冲上限】" : ""));
         ringLen = 0;
+    }
+
+    /**
+     * 从尾部往前找「最近一段够长的静音」，返回静音之后的第一个样本下标；找不到返回 -1。
+     *
+     * 扫法：从末尾往前，跳过有声段（正在说的指令 + 唤醒词），一旦进入静音就累加，
+     * 累计够 120ms 后继续往前，直到再次遇到有声 —— 那个边界就是唤醒词的起点。
+     *
+     * 门限用「绝对下限 400 或全段峰值 1/10 取大」，不写死具体数值：
+     * 车机底噪（空调/胎噪）和我们自己扬声器的残留在不同车上差很远。
+     */
+    private static int silenceCut(short[] a) {
+        if (a == null || a.length < VoiceMic.SR / 5) return -1;
+        int maxPeak = 0;
+        for (short v : a) {
+            int x = v < 0 ? -v : v;
+            if (x > maxPeak) maxPeak = x;
+        }
+        if (maxPeak <= 0) return -1;
+        int thr = Math.max(400, maxPeak / 10);
+        int frame = Math.max(1, VoiceMic.SR / 50);          // 20ms
+        int needSilent = Math.max(frame, VoiceMic.SR * 120 / 1000);
+        int silent = 0;
+        boolean inSilent = false;
+        for (int end = a.length; end > 0; end -= frame) {
+            int from = Math.max(0, end - frame);
+            int peak = 0;
+            for (int i = from; i < end; i++) {
+                int x = a[i] < 0 ? -a[i] : a[i];
+                if (x > peak) peak = x;
+            }
+            if (peak <= thr) {
+                silent += frame;
+                if (silent >= needSilent) inSilent = true;
+                continue;
+            }
+            if (inSilent) {
+                // 静音段到此结束，en 之后就是有声（唤醒词）：再往前留 100ms 保住起音
+                int guard = VoiceMic.SR / 10;
+                return Math.max(0, end - guard);
+            }
+            silent = 0;
+        }
+        return -1;
     }
 
     /** 采集线程回调 */
@@ -1148,12 +1245,16 @@ public final class Voice {
                     FileLog.append("VOICE 播报期屏蔽麦克风（本帧起不喂 ASR/KWS）");
                 }
                 partial = "";
+                uiText = "";
+                // 这段音频没进 ASR，也就不该算进「多久没说话」
+                guardMs += n * 1000L / VoiceMic.SR;
                 return;
             }
             if (speechGuardHeld) {
                 // 守卫刚解除：丢掉播报前残留的流式上下文，从干净状态开始听
                 speechGuardHeld = false;
                 partial = "";
+                uiText = "";
                 synchronized (lock) {
                     if (asr != null) asr.begin();
                 }
@@ -1179,9 +1280,11 @@ public final class Voice {
                 lastTextAt = now;
                 gotUsefulText = true;
             }
-            if (now - lastUiPush > 260) {          // 字幕别推太密，省 UI 线程
+            // 只增不减：模型把已出的字往回改时不跟着缩，等它追上来再换。
+            if (shown.length() >= uiText.length()) uiText = shown;
+            if (now - lastUiPush > 180) {          // 字幕推得比原来勤一点（260 → 180），跟手感更明显
                 lastUiPush = now;
-                pushState("请说指令", shown);
+                pushState("请说指令", uiText);
             }
             return;
         }
@@ -1232,6 +1335,7 @@ public final class Voice {
         // 于是用户唤醒前跟人说的半句话，会被当成命令开头送进识别器。
         wakeAt = SystemClock.elapsedRealtime();
         partial = "";
+        uiText = "";
         pushState("在听…", null);
         listenReq = true;
     }
@@ -1322,7 +1426,7 @@ public final class Voice {
                 pushState("已取消", shown);
                 ui.post(() -> {
                     Host hh = host;
-                    if (hh != null) hh.onVoiceCandidates(pickPhrase, null);
+                    if (hh != null) hh.onVoiceCandidates(pickPhrase, null, false, false);
                 });
                 endUtterance(600);
                 return;
@@ -1454,6 +1558,17 @@ public final class Voice {
      * 说「下一页」翻页，或直接说出名字在完整列表里搜 —— 数量不再有上限。
      */
     private void announcePickPage() {
+        announcePickPage(true);
+    }
+
+    /**
+     * @param speak 要不要念「要选第几个？」
+     *
+     * 翻页时**不念**：这句要念 3 秒左右，而播报期麦克风是不进 ASR 的 ——
+     * 用户翻完页立刻说「第三个」，整句正好撞在播报里被丢掉，表现就是
+     * "我说了它没反应"。翻页只给一声轻提示音，菜单和页码在屏幕上已经变了。
+     */
+    private void announcePickPage(boolean speak) {
         if (pickCands == null || pickCands.isEmpty()) return;
         int total = pickCands.size();
         int pages = (total + PICK_PAGE_SIZE - 1) / PICK_PAGE_SIZE;
@@ -1463,49 +1578,58 @@ public final class Voice {
         int to = Math.min(total, from + PICK_PAGE_SIZE);
         final List<AppInfo> page = new java.util.ArrayList<>(pickCands.subList(from, to));
         final String phrase = pickPhrase;
+        final boolean hasPrev = pickPage > 0;
+        final boolean hasNext = pickPage + 1 < pages;
 
-        // 只问序号，**不逐个念应用名**：念 5 个名字要十几秒，用户得干等着，
-        // 还容易被硬闸收掉；名字在屏幕上的候选菜单里看得见，念出来是纯浪费。
-        // 也**不报总数/页数**（用户明确要求）：一句短问就够，页数写在屏幕提示里。
-        say("要选第几个？");
         pushState(pages > 1
                 ? "第 " + (pickPage + 1) + "/" + pages + " 页 · 说序号 / 说名字，或直接点"
                 : "说序号 / 说名字，或直接点", "");
         ui.post(() -> {
             Host hh = host;
-            if (hh != null) hh.onVoiceCandidates(phrase, page);
+            if (hh != null) hh.onVoiceCandidates(phrase, page, hasPrev, hasNext);
         });
         // 重新进入聆听态（不结束这一轮）
         state = S_LISTEN;
         partial = "";
+        uiText = "";
         synchronized (lock) {
             if (asr != null) asr.begin();
         }
         long now = SystemClock.elapsedRealtime();
         deadline = now + PICK_WAIT_MS;
-        // 提示语要念几秒，这段时间收的是自己的 TTS，不算进「3 秒没听清」
-        // 播报文本固定是「要选第几个？」(6 字)，估算≈3000ms；播报期本身也已物理隔离。
-        listenAnchor = now + 3000L;
-        lastTextAt = listenAnchor;
         listenSince = now;
+        guardMs = 0;
+        if (speak) {
+            // 只问序号，**不逐个念应用名**：念 5 个名字要十几秒，用户得干等着，
+            // 还容易被硬闸收掉；名字在屏幕上的候选菜单里看得见，念出来是纯浪费。
+            // 也**不报总数/页数**（用户明确要求）：一句短问就够，页数写在屏幕提示里。
+            say("要选第几个？");
+            // 播报期本来就不进 ASR，这段时间已经由 guardMs 扣掉了（见 onPcm），
+            // 这里只留一点点"说完的尾巴"，不要重复补偿 3 秒 —— 否则候选卡片会多挂好几秒。
+            listenAnchor = now + 300L;
+        } else {
+            beep(false);            // 翻页成功：一声轻提示，不占麦克风
+            listenAnchor = now;
+        }
+        lastTextAt = listenAnchor;
     }
 
     /** 翻页：语音说「下一页」，或点菜单里的「下一页」 */
     void flipPickPage(int delta) {
         if (!awaitingPick || pickCands == null || pickCands.isEmpty()) return;
         int pages = (pickCands.size() + PICK_PAGE_SIZE - 1) / PICK_PAGE_SIZE;
-        if (pages <= 1) {
-            say("没有更多了");
-            return;
-        }
         int next = pickPage + delta;
-        if (next < 0 || next >= pages) {
-            say(delta > 0 ? "已经是最后一页了" : "已经是第一页了");
+        // 只有一页、或者已经到边界：统一回「没有更多了」。
+        // 旧版分两句（"已经是最后一页了"/"第一页了"），车机下面这句常被听成别的话。
+        if (pages <= 1 || next < 0 || next >= pages) {
+            say("没有更多了");
+            FileLog.append("VOICE 候选翻页到底（" + (pickPage + 1) + "/" + pages + " 页，delta="
+                    + delta + "）");
             return;
         }
         pickPage = next;
         FileLog.append("VOICE 候选翻到第 " + (next + 1) + "/" + pages + " 页");
-        announcePickPage();      // 会重建菜单（Host 侧先 dismiss 旧的那张）
+        announcePickPage(false);      // 会重建菜单（Host 侧先 dismiss 旧的那张）
     }
 
     /** 系统引擎回一句话（设置里可关；引擎不存在时静默） */
@@ -1753,6 +1877,7 @@ public final class Voice {
         awaitingPick = false;
         pickCands = null;
         partial = "";
+        uiText = "";
         synchronized (lock) {
             if (asr != null) asr.begin();
         }

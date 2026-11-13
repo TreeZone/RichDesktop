@@ -202,8 +202,32 @@ final class VoiceAsr {
             c.setDecodingMethod("greedy_search");
 
             c.setEnableEndpoint(true);
-            // 端点规则用默认值：说完 ~1.2s 静音就断句，单句上限 20s。
-            // 车机噪声大时"说完不等"比"等太久"更讨人厌，所以不把静音阈值调长。
+            /*
+             * 【端点调快，0.23.47】sherpa 默认 rule2 = 1.2s 静音 + ≥0.6s 语音，
+             * 也就是用户说完最后两个字，还要**干等 1.2 秒**才断句执行。
+             * 中文指令就 2~4 个字，这个 1.2 秒就是体感上"反应慢"的全部来源。
+             *
+             * 现在：rule2 收到 0.8s，同时把「至少 0.6s 语音」降到 0.3s ——
+             * 不降的话像「暂停」「静音」这种半秒级的短词根本走不到 rule2，
+             * 只能等 rule1 的 2.4 秒，短指令反而最慢。
+             * rule1 也从 2.4s 收到 1.6s（它是"必须有语音"的那条，兜住短词）。
+             *
+             * rule3 是**单句上限**（语音满 20s 强切），保持默认不动：
+             * 长指令（"打开网易云音乐然后播放每日推荐"）需要它。
+             *
+             * 风险：说话中途停顿超过 0.8s（想词）会被切成两句。中文短指令可接受，
+             * 真在车机上觉得太急，把这两个数调回 1.2 / 2.4 即可。
+             */
+            com.k2fsa.sherpa.onnx.EndpointConfig ep = c.getEndpointConfig();
+            if (ep != null) {
+                com.k2fsa.sherpa.onnx.EndpointRule r1 = ep.getRule1();
+                if (r1 != null) r1.setMinTrailingSilence(1.6f);
+                com.k2fsa.sherpa.onnx.EndpointRule r2 = ep.getRule2();
+                if (r2 != null) {
+                    r2.setMinTrailingSilence(0.8f);
+                    r2.setMinUtteranceLength(0.3f);
+                }
+            }
 
             OnlineRecognizer r = filesMode
                     ? new OnlineRecognizer(null, c)
