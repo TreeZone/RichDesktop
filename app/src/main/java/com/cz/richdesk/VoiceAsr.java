@@ -13,43 +13,39 @@ import com.k2fsa.sherpa.onnx.OnlineStream;
 import java.util.List;
 
 /**
- * 离线中文识别（只在"已经开始听"之后才工作）。
+ * 离线识别（只在"已经开始听"之后才工作）。
  *
- * <h3>模型（0.23.25 起）：streaming-zipformer-small-ctc-zh-int8-2025-04-01</h3>
- * 单文件 CTC（model.int8.onnx 25MB + tokens.txt），体积与旧的 14M 三件套（24MB）
- * **基本持平**，但准确率上一个档。同一批真实音频上的实测对比：
+ * <h3>模型（feature/bilingual-asr）：streaming-paraformer-bilingual-zh-en-int8</h3>
+ * 中英双语，**能直接吐出拉丁字母** —— 这正是"打开 QQ"念不清的根因：
+ * 纯中文模型的词表里一个字母都没有，QQ 只能被听成"扣扣/秋秋"。
+ *
+ * 同一批真实音频上的实测对比（本地 sherpa 2.0.1，与 APK 内 so 同版本）：
  *
  * <pre>
- *   1.wav   旧 14M：全球金融「动量」  ← 错        新 CTC：全球金融「动荡」  ← 对
- *   8k.wav  旧 14M：「身处的飞机分析」← 完全错     新 CTC：「深入的分析」   ← 对
+ *   wav        zipformer-small 双语(48MB)          paraformer 双语(227MB)
+ *   0.wav   昨天是 MONDAY TODAY IS THE AFTER…      昨天是 monday today is… the day after tomorrow 是星期
+ *   2.wav   这是频繁                                 这个是频繁的啊不认识接下来 frequently 频繁
+ *   4.wav   嗯 TIME是及时                            嗯 on time 标准是 in time 是及时叫他总是准时交他的作业…
+ *   46.wav  你好石刀                                 你好石头把厨房扫拖下
  * </pre>
- * 而且新 CTC 的识别结果与 154MB 的 zipformer-large（multi_zh-hans）**完全一致**，
- * 也就是说这个 25MB 模型已经把大模型的效果拿到了。
+ * 差距主要在中英混说的长句：小号几乎丢句子，paraformer 能整段接住。
  *
- * <h3>为什么它不像上次那样缺字</h3>
- * 上次的 multi_zh-hans 系列（154MB / 60MB 那个 transducer）用的是**完整汉字 BPE 词表**，
- * 只有 1687~1741 个汉字 token，「酷、抖、哔、哩、驶」都没有 → 「酷狗音乐」「抖音」
- * 直接念不出来。这个 small-ctc 的词表是**字节级 BPE**（token 形如 `▁ƌŕş`，
- * 一个 token 是一串 UTF-8 字节），理论上能拼出任何汉字，**不存在缺字**。
+ * <h3>代价（明确接受）</h3>
+ *   · 体积：encoder.int8 158MB + decoder.int8 69MB，APK 从 179MB 涨到约 380MB；
+ *   · CPU：本地 RTF 0.13~0.17（小号 0.06），车机弱得多，实时性是这版最大的风险点；
+ *   · 仍然**不能用热词**：ContextGraph 只存在于 transducer，paraformer 走自己的解码路径。
+ *     专有名词的容错继续靠匹配层（同音整名 96 分直通 / 声母骨架 / 候选确认）。
  *
- * <h3>代价：不能用热词（明确接受）</h3>
- * sherpa 的热词靠 ContextGraph 实现，而 ContextGraph **只存在于 transducer 解码器**
- * （见 online-recognizer-transducer-impl.h；online-recognizer.cc 里 hotwords-file
- * 也只允许配 modified_beam_search）。CTC 走的是另一条解码路径，完全不读热词。
- *
- * 所以这个版本**不再给识别器灌应用名热词** —— 留着只会白写文件、白重建识别器。
- * 补偿手段在匹配层：同音整名给 96 分直通（pinyin:exact）、声母骨架、覆盖率门槛、
- * 猜不中弹候选。换言之，专有名词的容错从"解码前偏置"挪到"解码后纠错"。
- *
- * <h3>还可能拖后腿的地方（已单独修，见 VoiceMic）</h3>
- * 录音侧采样率对齐到 16k（ROM 可能给 48k，以前会变成 3 倍速花栗鼠音）+
- * 系统降噪/自动增益。
+ * <h3>解码方法：必须 greedy_search</h3>
+ * 这一族模型换解码方法踩过两次 native exit(-1)（CTC+beam 直接杀进程，Java 拦不住）。
+ * paraformer 本地已用 greedy 跑通，不再尝试 modified_beam_search。
  */
 final class VoiceAsr {
 
     private static final String TAG = "PipDesk";
-    /** CTC 单文件模型（zipformer2-ctc） */
-    private static final String MODEL_FILE = "model.int8.onnx";
+    /** paraformer 双文件模型（encoder 出编码、decoder 出 CTC 式预测） */
+    private static final String ENCODER_FILE = "encoder.int8.onnx";
+    private static final String DECODER_FILE = "decoder.int8.onnx";
     private static final String TOKENS_FILE = "tokens.txt";
 
     private final Context ctx;
@@ -170,14 +166,16 @@ final class VoiceAsr {
             f.setSampleRate(VoiceMic.SR);
             f.setFeatureDim(80);
             OnlineModelConfig m = c.getModelConfig();
-            // 单文件 CTC（zipformer2-ctc）：只有 model + tokens，没有 encoder/decoder/joiner。
-            // 换成旧的 transducer 写法会直接建不起来（三个路径全空）。
-            com.k2fsa.sherpa.onnx.OnlineZipformer2CtcModelConfig z = m.getZipformer2Ctc();
-            if (z == null) {                       // Kotlin data class 默认值不保证非 null，判一下更稳
-                z = new com.k2fsa.sherpa.onnx.OnlineZipformer2CtcModelConfig(prefix + MODEL_FILE);
-                m.setZipformer2Ctc(z);
+            // 双语 paraformer：encoder + decoder 两个文件（没有 joiner）。
+            // 传错成 CTC / transducer 的槽位会直接建不起来（对应路径全空）。
+            com.k2fsa.sherpa.onnx.OnlineParaformerModelConfig pf = m.getParaformer();
+            if (pf == null) {                      // Kotlin data class 默认值不保证非 null，判一下更稳
+                pf = new com.k2fsa.sherpa.onnx.OnlineParaformerModelConfig(
+                        prefix + ENCODER_FILE, prefix + DECODER_FILE);
+                m.setParaformer(pf);
             } else {
-                z.setModel(prefix + MODEL_FILE);
+                pf.setEncoder(prefix + ENCODER_FILE);
+                pf.setDecoder(prefix + DECODER_FILE);
             }
             m.setTokens(prefix + TOKENS_FILE);
             // 2 线程：这台机器核多但有画中画在跑，给 2 个核能把一句话的延迟压到 0.5s 内，
@@ -216,8 +214,8 @@ final class VoiceAsr {
             loadError = null;
             String msg = "VOICE 识别模型加载完成 " + (loadedAt - t0) + "ms prefix=" + prefix
                     + (filesMode ? "（纯文件模式）" : "（assets 模式）")
-                    + " greedy"                       // CTC 只支持 greedy，别按 voiceBeam 走
-                    + " model=zipformer2-ctc hotwords=unsupported(CTC)";
+                    + " greedy"                       // paraformer 只验过 greedy，别试 beam
+                    + " model=paraformer-bi-zh-en hotwords=unsupported";
             Log.i(TAG, msg);
             FileLog.append(msg);
             return true;
@@ -260,7 +258,7 @@ final class VoiceAsr {
      *   三件套已经不用了，别再按那份清单校验，否则永远是 false。）
      */
     private static boolean asrModelsOk(String prefix) {
-        String[] names = {MODEL_FILE, TOKENS_FILE};
+        String[] names = {ENCODER_FILE, DECODER_FILE, TOKENS_FILE};
         for (String n : names) {
             java.io.File fp = new java.io.File(prefix + n);
             if (!fp.isFile() || fp.length() <= 0) return false;

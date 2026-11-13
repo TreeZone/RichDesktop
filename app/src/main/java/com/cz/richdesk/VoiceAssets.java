@@ -40,10 +40,11 @@ final class VoiceAssets {
      * 识别模型的解压目录一起清掉重拷，反过来换 ASR 模型又会把 139MB 的 TTS 重解压一次
      * （首次启动白等十几秒）。按目录各管各的指纹，互不牵连。
      *
-     * 0.23.25：14M transducer 三件套 → small-ctc 单文件模型，指纹必须跟着改，
-     * 否则手机上旧的 asr 解压目录会被当成"已解压"跳过，模型还是旧的。
+     * 0.23.30（feature/bilingual-asr）：中文 CTC → 中英双语 paraformer
+     * （encoder.int8 158MB + decoder.int8 69MB），能直接吐出拉丁字母。
+     * 指纹必须跟着改，否则手机上旧的 asr 解压目录会被当成"已解压"跳过，模型还是旧的。
      */
-    private static final String ASR_MODEL_TAG = "zh-small-ctc-2025-04-01-v1";
+    private static final String ASR_MODEL_TAG = "paraformer-bi-zh-en-int8-v1";
     private static final String KWS_MODEL_TAG = "kws-zh-wenetspeech-v1";
 
     private static String tagFor(String dir) {

@@ -1,3 +1,7 @@
+# 大模型文件不入库（asr 双语模型 227MB，进 git 会让 .git 永久膨胀、切分支变慢）
+# 取法见 app/src/main/assets/asr/README.md
+app/src/main/assets/asr/*.onnx
+
 # 构建产物
 build/
 app/build/

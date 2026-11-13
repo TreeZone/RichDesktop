@@ -7,6 +7,47 @@
 
 ---
 
+## 0.23.30 / vc174 — 换中英双语识别模型（feature/bilingual-asr 分支）
+
+**一句话：识别模型从「纯中文 CTC」换成 `streaming-paraformer-bilingual-zh-en-int8`，
+英文能直接吐出拉丁字母，"打开 QQ" 不用再靠猜读音。代价是 APK 179MB → 380MB、
+CPU 约 2~3 倍。**
+
+### 为什么换
+
+纯中文 CTC 的词表是字节级 BPE，**一个拉丁字母都没有**——说 "QQ" 只能被听成
+「扣扣/秋秋/酷酷」。0.23.29 用自动读音别名把这条路补了一半，但本质是"猜"。
+双语模型直接在词表里带 26 个字母（8404 条 token），识别结果就是 `qq`。
+
+### 本地实测对比（sherpa 2.0.1，与 APK 内 so 同版本，同一批音频）
+
+| 音频 | zipformer-small 双语（48MB） | paraformer 双语（227MB） |
+|---|---|---|
+| 0.wav | 昨天是 MONDAY TODAY IS THE AFTER TOMORROW是星期 | 昨天是 monday today is… the day after tomorrow 是星期 |
+| 2.wav | 这是频繁 | 这个是频繁的啊不认识接下来 **frequently** 频繁 |
+| 4.wav | 嗯 TIME是及时 | 嗯 **on time** 标准是 **in time** 是及时叫他总是准时交他的作业… |
+| 46.wav | 你好石刀 | 你好石头把厨房扫拖下 |
+
+- 小号（48MB）也能出英文，但中英混说的长句几乎整段丢；paraformer 能接住。
+- RTF：paraformer 0.13~0.17，小号 0.06（x86 单机，2 线程）。
+
+### 体积与风险
+
+- encoder.int8 158MB + decoder.int8 69MB → **APK 380MB**（原 179MB）。
+- 两个 .onnx **不入 git**（227MB 会让 `.git` 永久膨胀），取法见
+  `app/src/main/assets/asr/README.md`。
+- 最大风险是车机实时性：这颗展锐 SoC 比 x86 慢得多，若 RTF 超过 1 会出现
+  「说完半天不出字」。真出现就退回 48MB 的小号双语模型（代码只需换
+  `VoiceAssets.ASR_MODEL_TAG` 和资源文件）。
+- 仍然不支持热词（ContextGraph 只在 transducer）。
+
+### 解码方法
+
+`greedy_search`。这一族换解码方法踩过两次 native `exit(-1)`（CTC+beam 直接杀进程，
+Java 拦不住），paraformer 只用本地验过的 greedy，不试 beam。
+
+---
+
 ## 0.23.29 / vc173 — 「打开 QQ」能认了：英文字母自动转中文读音
 
 **一句话：识别模型是纯中文的（1000 条 BPE，零拉丁字母），说 "QQ" 只会被听成
