@@ -72,7 +72,11 @@ public final class PerfMon {
 
         StringBuilder b = new StringBuilder(160);
         b.append("PERF heap=").append(heapMb).append('M').append('/').append(maxMb).append('M')
-                .append(" pss=").append(pssKb()).append('K')
+                .append(" rss=").append(rssKb()).append('K')
+                // 系统可用内存：车机 RAM 小，这个掉到几十 MB 就是"越用越卡"的直接原因
+                // （系统和应用都在换页）。手机内存大永远看不到，所以只有车机日志才有意义。
+                .append(" avail=").append(availKb()).append('K')
+                .append(" win=").append(FocusAnchor.count())
                 .append(" threads=").append(threads)
                 .append(" fds=").append(fds)
                 .append(" displays=").append(displays)
@@ -134,11 +138,45 @@ public final class PerfMon {
         }
     }
 
-    private static long pssKb() {
-        try {
-            return android.os.Debug.getPss();
-        } catch (Throwable t) {
-            return -1;
+    /**
+     * 本进程实际驻留内存。
+     *
+     * 原来用 {@code android.os.Debug.getPss()}：它已废弃，而且实测读数 365MB，
+     * 与 {@code dumpsys meminfo} 的 PSS Total（101MB）差 3.5 倍 —— 拿它判断
+     * "有没有涨"会一直看到虚高值。直接读 /proc/self/status 的 VmRSS，和系统面板一致。
+     */
+    private static long rssKb() {
+        return statusKb("VmRSS:");
+    }
+
+    /** 系统可用内存（MemAvailable）：比 MemFree 真实，已扣掉不可回收的缓存 */
+    private static long availKb() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.FileReader("/proc/meminfo"))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.startsWith("MemAvailable:")) {
+                    String[] p = line.trim().split("\\s+");
+                    if (p.length >= 2) return Long.parseLong(p[1]);
+                }
+            }
+        } catch (Throwable ignored) {
         }
+        return -1;
+    }
+
+    private static long statusKb(String key) {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.FileReader("/proc/self/status"))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.startsWith(key)) {
+                    String[] p = line.trim().split("\\s+");
+                    if (p.length >= 2) return Long.parseLong(p[1]);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1;
     }
 }

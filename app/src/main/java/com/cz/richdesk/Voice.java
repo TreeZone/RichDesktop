@@ -381,8 +381,24 @@ public final class Voice {
                 VoicePerm.tryGrant(ctx);
             }
             if (wakeMode) {
+                /*
+                 * 【唤醒词模型延后 1.5 秒加载 —— 0.23.27】
+                 *
+                 * 原来是同步 ensureKws()：进程刚起来就把 3.3MB 的 KWS 模型读盘 + 初始化，
+                 * 实测 824~1180ms、2 线程占满。而这段时间正好和
+                 * 「首帧绘制 → 用户第一次点击」重叠，于是"第一次打开很卡"。
+                 * （埋点 BOOT onCreate→首帧 只有 76~263ms，说明慢的不是布局。）
+                 *
+                 * 改成先只开麦克风，把 kwsRetryAt 推到 1.5 秒后 ——
+                 * 控制循环里 `state == S_WAKE && kws == null && now >= kwsRetryAt`
+                 * 那条分支会自动补上加载，失败也会 5 秒后重试，不会再因为一次失败
+                 * 把整条语音链路锁在 S_ERROR。
+                 *
+                 * 代价：开机后 1.5 秒内喊唤醒词没反应。用户不会开机就喊，可以接受。
+                 */
+                kwsRetryAt = SystemClock.elapsedRealtime() + 1500;
                 synchronized (lock) {
-                    if (!ensureKws() || !ensureMic()) {
+                    if (!ensureMic()) {
                         state = S_ERROR;
                         pushState("麦克风不可用：" + lastError, null);
                         return;
@@ -1000,17 +1016,24 @@ public final class Voice {
             }
             asr.begin();
         } else {
-            // 常驻唤醒和这次聆听会抢资源：用户实测「开着唤醒词常驻就收不到声音，
-            // 关了就正常」。原因是 KWS 和 ASR 两个 sherpa 模型同时在采集线程里解码，
-            // 采集跟不上 → ASR 拿到的是延迟音频 → 一个字都识别不出来。
-            // 所以聆听期间把 KWS 整个放掉（回到待唤醒时控制循环会重建，约 0.4 秒），
-            // 保证同一时刻只有一个模型吃 CPU/内存。
+            /*
+             * 【不要在这里释放 KWS 模型 —— 0.23.27 改】
+             *
+             * 原来这里是 kws.release() + kws = null，理由是"KWS 和 ASR 同时在采集线程
+             * 解码，采集跟不上 → ASR 拿到延迟音频 → 一个字都识别不出来"。
+             *
+             * 但 onPcm 现在是 if/else 结构（见 `if (st == S_LISTEN) { ... return; }`），
+             * 聆听期间**根本不会调用 kws.accept()**，两个模型不存在同时解码。
+             * 所以释放只省十几 MB 内存，代价却是每次唤醒后回待唤醒都要重建模型：
+             * 现场日志实测 45 次「唤醒词模型加载完成」/ 17 次「聆听开始：KWS 已释放」，
+             * 每次重建 824~1180ms、2 线程吃满 —— 而这段正好落在"你说完话、等结果"
+             * 的当口，用户感知就是"点语音助手反应慢"。
+             *
+             * 只清解码状态（resetStream）就够了：避免上一句话的音频上下文残留
+             * 把下一次唤醒词的匹配带偏。
+             */
             synchronized (lock) {
-                if (kws != null) {
-                    kws.release();
-                    kws = null;
-                    FileLog.append("VOICE 聆听开始：KWS 已释放（避免与 ASR 抢资源）");
-                }
+                if (kws != null) kws.resetStream();
                 ensureAsr();
                 if (!asr.isReady() && !asr.load()) {
                     state = S_WAKE;      // 唤醒词还能用，只是这次听不了
