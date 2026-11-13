@@ -757,6 +757,10 @@ public final class VoiceIntent {
                     for (String x : rule[1].split("\\|")) set.add(x);
                 }
             }
+            // 【自动读音】名字里带字母的（QQ / QQ音乐 / B站…）按中文字母读法再生成一组别名：
+            // QQ → 扣扣/秋秋/酷酷。上面那张表覆盖不到的应用也能靠这一步命中，
+            // 而且不用维护——字母读音是有限的 26 个。
+            VoiceLatin.fillAliases(m, a.pkg, a.label);
         }
         return m;
     }
