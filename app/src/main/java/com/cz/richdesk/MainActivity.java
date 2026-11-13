@@ -160,6 +160,8 @@ public class MainActivity extends AppCompatActivity
 
     // 上次应用的配置，用于从设置页返回时做增量刷新
     private int appliedPaneCount = -1, appliedDpi = -1, appliedPipCorner = -1;
+    /** 上一次应用的「圆角用遮罩」取值：它单独变化时也要重算圆角（圆角数值可能没变） */
+    private boolean appliedCornerMask;
     private float appliedRenderScale = -1f;
     private int appliedDockCorner = -1, appliedDockCount = -1, appliedIconSize = -1;
     private int appliedDockIcon = -1;
@@ -602,6 +604,7 @@ public class MainActivity extends AppCompatActivity
         // 不会再出现"画面缩到左上角"（根因是 resize 不会让屏内应用重新 measure）。
         appliedRenderScale = Prefs.getRenderScale(this) / 100f;
         appliedPipCorner = Prefs.getPipCorner(this);
+        appliedCornerMask = Prefs.cornerByMask(this);
         appliedDockCorner = Prefs.getDockCorner(this);
         appliedDockCount = Prefs.getDockCount(this);
         appliedDockIcon = Prefs.getDockIcon(this);
@@ -3364,7 +3367,10 @@ public class MainActivity extends AppCompatActivity
         // 设置页那边会提示"重启桌面后生效"，并提供一键重启。
         appliedRenderScale = Prefs.getRenderScale(this) / 100f;
         // 圆角只有一套：画中画和 Dock 一起变（需求：调画中画圆角要同时改 Dock）
-        if (pipCorner != appliedPipCorner) {
+        boolean cornerMaskNow = Prefs.cornerByMask(this);
+        boolean cornerMaskChanged = cornerMaskNow != appliedCornerMask;
+        appliedCornerMask = cornerMaskNow;
+        if (pipCorner != appliedPipCorner || cornerMaskChanged) {
             pip.setCorner(pipCorner);
             if (dockRow != null) dockRow.setBackground(Ui.glass(this, pipCorner));
             appliedPipCorner = pipCorner;

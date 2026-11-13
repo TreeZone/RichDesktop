@@ -54,6 +54,10 @@ public class PipPane {
     private final TextureView texture;
     private final TextView hint;
     private final TextView loading;
+    /** 四角壁纸遮罩：替代整块圆角裁剪（见 {@link PaneCornerMask}） */
+    private PaneCornerMask cornerMask;
+    /** 当前是否用遮罩画圆角（false = 退回老的整体裁剪） */
+    private boolean useMask;
 
     private final Context app;
     private final DisplayManager dm;
@@ -125,14 +129,26 @@ public class PipPane {
 
         root = new FrameLayout(ctx);
         root.setBackground(Ui.glass(ctx, cornerDp));
-        Ui.clipRounded(root, cornerDp, ctx);
         root.setClipChildren(true);
+        useMask = shouldUseMask(ctx, cornerDp);
+        cornerMask = new PaneCornerMask(ctx);
+        cornerMask.onUnavailable = () -> {
+            if (!useMask) return;
+            Log.i(TAG, "拿不到壁纸位图，圆角退回整块裁剪");
+            useMask = false;
+            applyCorner();
+        };
 
         texture = new TextureView(ctx);
         texture.setOpaque(false);
         texture.setAlpha(0f);
         root.addView(texture, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+        // 四角遮罩必须在 texture 之上（它要盖住方形纹理露出来的四个角）
+        root.addView(cornerMask, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        applyCorner();
 
         // 兜底：insets 变化（状态栏/导航栏留白变化）后纹理尺寸变了但回调没来，
         // 虚拟屏就会停留在旧尺寸上，画面被横向压扁。布局后对齐一次。
@@ -235,12 +251,45 @@ public class PipPane {
     public void setCorner(int dp) {
         cornerDp = dp;
         root.setBackground(Ui.glass(root.getContext(), dp));
-        Ui.clipRounded(root, dp, root.getContext());
+        useMask = shouldUseMask(root.getContext(), dp);
+        applyCorner();
+    }
+
+    /**
+     * 圆角怎么画：遮罩（默认）还是整块裁剪。
+     *
+     * 遮罩只有在「拿得到壁纸位图」时才成立 —— 它靠重画壁纸来伪装圆角，
+     * 拿不到壁纸就只能退回裁剪，否则四角会变成纯色补丁。
+     */
+    private static boolean shouldUseMask(Context c, int dp) {
+        // 这里**不做**壁纸是否可用的检查：那会在主线程解码壁纸、拖慢启动。
+        // 真拿不到壁纸时，遮罩会回调 onUnavailable，当场切回裁剪（见 applyCorner）。
+        return dp > 0 && Prefs.cornerByMask(c);
+    }
+
+    /**
+     * 把当前圆角方案落到 View 上。
+     *
+     * 两种方案互斥：
+     *   · 遮罩 —— 不裁剪，四角交给 {@link PaneCornerMask} 画壁纸；
+     *   · 裁剪 —— 老做法，setClipToOutline 让 HWUI 对整块纹理做离屏裁剪。
+     */
+    private void applyCorner() {
+        if (useMask) {
+            root.setClipToOutline(false);
+            root.setOutlineProvider(null);
+            cornerMask.setRadiusPx(Ui.dp(root.getContext(), cornerDp));
+        } else {
+            cornerMask.setRadiusPx(0);
+            Ui.clipRounded(root, cornerDp, root.getContext());
+        }
+        root.invalidate();
     }
 
     /** 深浅色外观变化：玻璃底和提示文字一起换配色 */
     public void refreshAppearance() {
         root.setBackground(Ui.glass(root.getContext(), cornerDp));
+        if (cornerMask != null) cornerMask.invalidate();
         hint.setTextColor(Ui.tintHint());
         hint.setShadowLayer(4, 0, 1, Ui.shadow());
         loading.setTextColor(Ui.tintDim());

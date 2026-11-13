@@ -274,6 +274,10 @@ public class SettingsActivity extends AppCompatActivity {
         // 圆角只有一套：改这里画中画和 Dock 一起变（需求 1）
         seek("圆角（画中画 + Dock）", 0, Prefs.CORNER_MAX, 1, Prefs.getPipCorner(this),
                 v -> Prefs.setPipCorner(this, v), v -> v + " dp");
+        // 圆角怎么画：默认「四角壁纸遮罩」，只在四个角重画壁纸（约 1.4 万像素）；
+        // 关掉退回「整块裁剪」，HWUI 要把整块纹理先离屏再贴回（199 万像素/帧）。
+        toggle("画中画圆角用壁纸遮罩（省 GPU）", Prefs.cornerByMask(this),
+                b2 -> Prefs.setCornerByMask(this, b2));
         toggle("显示系统状态栏", Prefs.showStatusBar(this),
                 b -> Prefs.setShowStatusBar(this, b));
 

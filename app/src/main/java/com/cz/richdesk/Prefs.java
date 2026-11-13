@@ -539,6 +539,20 @@ public class Prefs {
         setPipCorner(c, dp);
     }
 
+    /**
+     * 画中画圆角用「四角壁纸遮罩」还是「整块裁剪」。
+     *
+     * 遮罩只在四个角重画壁纸（约 1.4 万像素），裁剪要把整块 199 万像素先离屏再贴回。
+     * 默认遮罩；裁剪作为回退（遮罩在某些壁纸上可能看出接缝，或拿不到壁纸位图）。
+     */
+    public static boolean cornerByMask(Context c) {
+        return sp(c).getBoolean("corner_mask", true);
+    }
+
+    public static void setCornerByMask(Context c, boolean b) {
+        sp(c).edit().putBoolean("corner_mask", b).apply();
+    }
+
     // ------------------------------------------------------------ 应用列表
 
     public static final int ICON_MIN = 24;

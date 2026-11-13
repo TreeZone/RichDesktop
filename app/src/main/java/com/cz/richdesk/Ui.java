@@ -293,6 +293,51 @@ public class Ui {
     /** 壁纸变了：清缓存（重新算），下一轮 updateAppearance 生效 */
     public static void invalidateWallpaper() {
         wallpaperDarkCache = null;
+        synchronized (Ui.class) {
+            wallpaperBmp = null;
+            wallpaperBmpLoaded = false;
+        }
+    }
+
+    // ------------------------------------------------------------ 壁纸位图（画中画四角遮罩用）
+
+    private static Bitmap wallpaperBmp;
+    private static boolean wallpaperBmpLoaded;
+
+    /**
+     * 系统壁纸位图（整屏坐标）。
+     *
+     * 只给「画中画四角遮罩」用：不做整块圆角裁剪，改成在四个角上重画壁纸 ——
+     * 必须拿到壁纸的**真实像素**，否则四角就是纯色补丁，和周围壁纸对不上。
+     *
+     * 失败返回 null（动态壁纸拿不到静态帧等），调用方要退回原来的裁剪方案。
+     * 位图本身不做缩放，缩放/对齐由调用方按屏幕尺寸算，避免两处各算一套。
+     */
+    public static Bitmap wallpaperBitmap(Context c) {
+        if (wallpaperBmpLoaded) return wallpaperBmp;
+        synchronized (Ui.class) {
+            if (wallpaperBmpLoaded) return wallpaperBmp;
+            Bitmap b = null;
+            try {
+                android.graphics.drawable.Drawable d =
+                        WallpaperManager.getInstance(c).getDrawable();
+                if (d instanceof BitmapDrawable) {
+                    b = ((BitmapDrawable) d).getBitmap();
+                } else if (d != null) {
+                    int w = Math.max(1, d.getIntrinsicWidth());
+                    int h = Math.max(1, d.getIntrinsicHeight());
+                    b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                    Canvas cv = new Canvas(b);
+                    d.setBounds(0, 0, w, h);
+                    d.draw(cv);
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "取壁纸位图失败，四角遮罩退回裁剪方案", t);
+            }
+            wallpaperBmp = b;
+            wallpaperBmpLoaded = true;
+            return b;
+        }
     }
 
     /** 文字/图标颜色：深色外观用白字，浅色外观用黑字 */
