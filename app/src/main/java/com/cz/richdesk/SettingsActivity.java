@@ -319,7 +319,7 @@ public class SettingsActivity extends AppCompatActivity {
             Voice.get().reloadWake();     // 阈值变了：丢掉旧模型，下次起麦按新值加载
         }, v -> v + "%（越小越容易唤醒）");
         toggle("提示音", Prefs.voiceBeep(this), b -> Prefs.setVoiceBeep(this, b));
-        toggle("语音回复（执行后说「好的」等，音色在下面选）", Prefs.voiceReply(this),
+        toggle("语音回复", Prefs.voiceReply(this),
                 b -> Prefs.setVoiceReply(this, b));
         action("语音引擎：" + voiceEngineLabel(), this::pickVoiceEngine);
         // 已选内置离线女声：打开设置页就后台预热模型，点试播不再等加载（消除「点击后等一下」）
@@ -338,20 +338,8 @@ public class SettingsActivity extends AppCompatActivity {
         micResult.setTextColor(Ui.tintHint());
         micResult.setShadowLayer(3, 0, 1, Ui.shadow());
         micResult.setPadding(Ui.dp(this, 4), Ui.dp(this, 8), 0, 0);
-        micResult.setText("自检结果会显示在这里，录音同时存到日志目录 mic-selftest.wav。");
+        micResult.setText("自检结果会显示在这里。");
         content.addView(micResult);
-        note("· 语音只认「应用列表里真实存在的应用」，外加返回 / 主页 / 应用列表 / 息屏这几个内置指令。\n"
-                + "· 「打开高德」「导航」都能命中：名字模糊匹配 + 常用别名；听不准时弹候选。\n"
-                + "· 中文识别模型吐不出英文字母：说「打开 GPSBridge」多半会变成一串不相干的汉字，\n"
-                + "  这时会直接说「找不到」，不会甩一屏无关应用出来。\n"
-                + "  点过的说法会存成别名，参与匹配打分（同音 / 声母骨架），\n"
-                + "  但不再写进解码器热词 —— 当前 CTC 识别模型没有热词通道。\n"
-                + "· 唤醒词完全跑在本地（3.3MB 模型），不联网；常驻约 1% 单核。\n"
-                + "· 唤醒词可以改成任意 2~6 个汉字：设置里改完立刻生效（汉字→拼音音素是本地换算的）。\n"
-                + "· 弹候选时**不念应用名，只问「要选第几个」**（念一串名字要十几秒，太拖）；\n"
-                + "  名字看屏幕上的列表，说「第一个 / 第二个」就能选，不用伸手点。\n"
-                + "· 车机 audio policy 允许多路并发录音：常驻唤醒词与高德 / 百度的语音助手\n"
-                + "  可以同时在线，不会主动停采让麦（只有真独占时才会短暂避让）。");
 
         // 画中画路由：活动画中画 + 每屏默认应用（替代原来的「多屏分配」：
         // 单应用固定屏位在长按图标里设置）
