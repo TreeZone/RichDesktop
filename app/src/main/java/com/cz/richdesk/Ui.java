@@ -67,6 +67,11 @@ public class Ui {
         return lowPerf;
     }
 
+    /** 当前是深色外观还是浅色（遮罩、面板底色按它取） */
+    public static boolean isDark() {
+        return dark;
+    }
+
     public static void syncPerfMode(Context c) {
         lowPerf = Prefs.perfLow(c);
     }

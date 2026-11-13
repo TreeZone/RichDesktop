@@ -249,12 +249,26 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     public void onHandleTap(int pair) {
         int n = panes.size();
         if (pair < 0 || pair + 1 >= n) return;
+        // 交换/恢复都会重排布局（两块的高度互换），纹理尺寸跟着变、buffer 也被系统改，
+        // 中间态一样会闪 —— 和拖动一样盖住，等对齐完再撤。
+        for (PipPane p : panes) p.showVeil();
         if (isCollapsed(pair) || isCollapsed(pair + 1)) {
             Log.i(TAG, "竖条轻点：边缘位置，恢复全部画中画");
             resetRatio();
+            hideVeilLater(260);      // 先让 220ms 吸附动画跑完（内部还会再等对齐）
             return;
         }
         swapContents(pair, pair + 1);
+        hideVeilLater(0);            // 立即开始计时，hideVeilWhenReady 内部会等对齐
+    }
+
+    /** 布局/对齐跑完后再撤遮罩（每个 pane 内部还会等"新画面出来一帧"） */
+    private void hideVeilLater(long delayMs) {
+        Runnable r = () -> {
+            for (PipPane p : panes) p.hideVeilWhenReady();
+        };
+        if (delayMs <= 0) container.post(r);
+        else container.postDelayed(r, delayMs);
     }
 
     /** 只交换两块屏上的应用（顺序互换），分屏比例保持不变 */
@@ -472,6 +486,12 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     }
 
     // ---- PaneBox.Listener：拖动/动画时同步状态 ----
+
+    @Override
+    public void onDragStart() {
+        // 开始拖就盖住：拖动过程中画面必然在被拉伸，与其让它露出来不如像"正在调整"
+        for (PipPane p : panes) p.showVeil();
+    }
 
     @Override
     public void onRatioChanging(float[] w) {

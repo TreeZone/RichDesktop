@@ -103,6 +103,42 @@ public class PipPane {
      * 新 buffer 到了之后再换回 MATCH_PARENT（数值相同，换回也不会有任何变化）。
      */
     private boolean pendingExitPreview;
+    /**
+     * 拖动/交换期间的遮挡层。
+     *
+     * 缩放过程中画面被拉伸、松手瞬间布局与 buffer 又不可能绝对同帧，
+     * 与其和这些中间态死磕，不如按用户建议直接盖住：看起来像"画中画正在调整"，
+     * 尺寸对齐、新画面出来之后再淡出。
+     */
+    private View veil;
+    /** 遮罩已挂"等新帧"的等待中（等到了就淡出） */
+    private boolean veilWaiting;
+    private long veilFrameBase;
+    /** 遮罩代次：淡出动画结束时用它判断"这期间有没有又盖上新的" */
+    private int veilGen;
+    /**
+     * 松手后遮罩**最少**再盖这么久。
+     *
+     * 这个时间必须覆盖「防抖 180ms → VirtualDisplay.resize → 屏内应用重新 measure/layout」，
+     * 少于它就会在应用还没重排完时把遮罩撤掉 —— 撤的那一帧露出的正是中间态，
+     * 也就是用户看到的"松手闪一下"。
+     */
+    private static final long VEIL_MIN_MS = 420;
+    /** 对齐完成后再等这么久兜底淡出（静态页面可能一直不出新帧） */
+    private static final long VEIL_MAX_WAIT_MS = 900;
+    private final Runnable veilWaitTask = new Runnable() {
+        @Override public void run() {
+            if (isSurfaceAligned()) {
+                hideVeilNow();
+            } else {
+                veilWaiting = true;
+                veilFrameBase = frames;
+            }
+        }
+    };
+    private final Runnable veilTimeoutTask = new Runnable() {
+        @Override public void run() { hideVeilNow(); }
+    };
     private final Runnable pendingExitTask = new Runnable() {
         @Override public void run() {
             if (pendingExitPreview) finishExitPreview();
@@ -215,6 +251,17 @@ public class PipPane {
         root.addView(loading, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
 
+        // 遮挡层放最上面：拖动/交换时盖住正在变形的画面，对齐完成后淡出
+        veil = new View(ctx);
+        veil.setClickable(false);
+        veil.setFocusable(false);
+        veil.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        veil.setAlpha(0f);
+        veil.setVisibility(View.GONE);
+        root.addView(veil, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        applyVeilColor();
+
         texture.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
             @Override
             public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) {
@@ -270,6 +317,7 @@ public class PipPane {
                 }
                 frames++;
                 lastFrameAt = now;
+                if (veilWaiting && frames > veilFrameBase && isSurfaceAligned()) hideVeilNow();
             }
         });
 
@@ -293,6 +341,7 @@ public class PipPane {
     /** 深浅色外观变化：玻璃底和提示文字一起换配色 */
     public void refreshAppearance() {
         root.setBackground(Ui.glass(root.getContext(), cornerDp));
+        applyVeilColor();
         hint.setTextColor(Ui.tintHint());
         hint.setShadowLayer(4, 0, 1, Ui.shadow());
         loading.setTextColor(Ui.tintDim());
@@ -429,6 +478,71 @@ public class PipPane {
         root.postDelayed(pendingExitTask, 300);       // 兜底：尺寸本来就相等时不会有 layout 回调
     }
 
+    /**
+     * 遮罩配色：**直接取玻璃底色的不透明版本**。
+     *
+     * 这样深色/浅色、低性能（纯色）模式全都自动跟随，不用另写一套判断；
+     * 盖上时看着就是"这块画中画变成了空玻璃"，而不是糊了一块突兀的色块。
+     */
+    private void applyVeilColor() {
+        if (veil == null) return;
+        int[] gc = Ui.glassColors();
+        int base = (gc != null && gc.length > 0) ? gc[0] : 0xFF2B3446;
+        veil.setBackgroundColor(0xFF000000 | (base & 0x00FFFFFF));
+    }
+
+    /** 立刻盖上遮罩（拖动开始 / 交换开始时调用） */
+    public void showVeil() {
+        if (veil == null) return;
+        veilGen++;
+        veilWaiting = false;
+        root.removeCallbacks(veilTimeoutTask);
+        veil.animate().cancel();
+        veil.setVisibility(View.VISIBLE);
+        veil.setAlpha(1f);
+    }
+
+    /**
+     * 等新画面真的出来一帧再淡出遮罩。
+     *
+     * 不能按固定时长撤：屏内应用重排的时间不可控（车机上 200ms~1s 都见过），
+     * 撤早了就又露出中间态。所以等 `frames` 增加，同时留一个 900ms 兜底
+     * （静态页面可能一直不刷新帧）。
+     */
+    public void hideVeilWhenReady() {
+        if (veil == null || veil.getVisibility() != View.VISIBLE) return;
+        veilWaiting = false;
+        root.removeCallbacks(veilWaitTask);
+        root.removeCallbacks(veilTimeoutTask);
+        // 先干等 VEIL_MIN_MS：这段时间里才会发生 resize + 应用重排，撤早了就是把中间态露出来
+        root.postDelayed(veilWaitTask, VEIL_MIN_MS);
+        root.postDelayed(veilTimeoutTask, VEIL_MIN_MS + VEIL_MAX_WAIT_MS);
+    }
+
+    /** buffer 与虚拟屏的尺寸是否都已经对齐到 TextureView 当前尺寸 */
+    private boolean isSurfaceAligned() {
+        int w = texture.getWidth();
+        int h = texture.getHeight();
+        if (w <= 0 || h <= 0) return false;
+        int bw = buf(w), bh = buf(h);
+        if (bufferW != bw || bufferH != bh) return false;
+        return vd == null || (displayW == bw && displayH == bh);
+    }
+
+    /** 淡出遮罩 */
+    private void hideVeilNow() {
+        veilWaiting = false;
+        root.removeCallbacks(veilTimeoutTask);
+        if (veil == null) return;
+        veil.animate().cancel();
+        final int gen = veilGen;
+        veil.animate().alpha(0f).setDuration(180)
+                .withEndAction(() -> {
+                    if (gen == veilGen) veil.setVisibility(View.GONE);
+                })
+                .start();
+    }
+
     /** 纹理尺寸已追平 pane：此时 scale 天然就是 1，撤掉不会有任何可见变化 */
     private void finishExitPreview() {
         pendingExitPreview = false;
@@ -438,6 +552,8 @@ public class PipPane {
         texture.setScaleY(1f);
         // 整次拖动只在这里对齐一次 buffer 与虚拟屏
         scheduleSurfaceSize();
+        // 等重排后的新画面出来，再把遮罩淡掉
+        hideVeilWhenReady();
     }
 
     /**

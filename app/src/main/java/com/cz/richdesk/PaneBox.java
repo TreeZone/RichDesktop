@@ -47,6 +47,17 @@ public class PaneBox extends FrameLayout {
         void onRatioSettled(float[] weights);
         /** 单击分隔条：交换它左右（上下）两块画中画的顺序 */
         void onHandleTap(int pair);
+
+        /**
+         * 真的开始拖了（越过死区）。
+         *
+         * 和 {@link #onRatioChanging} 分开是因为后者在"恢复折叠屏"的吸附动画里也会被调，
+         * 那种 220ms 的动画不该盖遮罩（一闪反而更花）。只有手指拖动才需要遮罩。
+         */
+        default void onDragStart() { }
+
+        /** 松手（吸附动画开始前）；遮罩要等到尺寸对齐完成才撤，见 PipPane.hideVeilWhenReady */
+        default void onDragEnd() { }
     }
 
     /** 2 屏时能压到的下限（3 屏是"整条吃掉最边上那块"，没有下限） */
@@ -460,6 +471,7 @@ public class PaneBox extends FrameLayout {
                         // 拖动生效距离：手指没走过 dead 之前一律不理（太灵敏会一碰就乱跳）
                         if (Math.abs(delta) < dead) return true;
                         dragging = true;
+                        if (listener != null) listener.onDragStart();
                     }
                     // 扣掉这段"死区"，手指和分隔条才不会在开始的一瞬间错位
                     dragTo(delta - Math.signum(delta) * dead);
@@ -470,6 +482,7 @@ public class PaneBox extends FrameLayout {
                     boolean was = dragging;
                     dragging = false;
                     pressed = false;
+                    if (was && listener != null) listener.onDragEnd();
                     if (getParent() != null) getParent().requestDisallowInterceptTouchEvent(false);
                     invalidate();
                     if (was) {
