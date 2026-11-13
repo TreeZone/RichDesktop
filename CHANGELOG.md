@@ -7,6 +7,52 @@
 
 ---
 
+## 0.23.39 / vc183 — 放弃四角遮罩，圆角回到裁剪；窗口改不透明自绘壁纸
+
+**一句话：四角遮罩这条路走不通（壁纸复刻不可能准），
+按用户决定整段删掉、圆角回到原来的 `clipToOutline`，只新增「窗口不透明」这一个性能开关。**
+
+### 为什么遮罩必须放弃（实测，不再是推测）
+
+手机截图逐像素量出来的色差：
+
+| 位置 | RGB |
+|---|---|
+| 外围真实背景 | (103,133,189) |
+| 遮罩画的壁纸 | (116,150,199) |
+
+差了一整档亮度。根因不在坐标（0.23.38 已修对），而在**数据源本身不准**：
+
+```
+$ adb shell dumpsys wallpaper
+mWallpaperComponent=com.miui.miwallpaper/...ImageWallpaper
+mWidth=2400  mHeight=2400
+```
+
+- 屏幕上是**壁纸服务实时渲染的 Surface**（动态、带视差、带系统调色）；
+- `WallpaperManager.getDrawable()` 拿的是**静态快照**，两者不是同一帧、同一像素。
+
+所以"猜出底下是什么再画一份"这条路，对静态壁纸勉强、对动态壁纸必然错。
+要绝对准确只有让桌面自己画壁纸（= 窗口不透明），那就不需要遮罩了。
+
+### 改动
+
+- 删除 `PaneCornerMask.java`（含 `Path.op` 求差、BitmapShader 映射那套）；
+- `PipPane` 圆角回到 `Ui.clipRounded(root, ...)`，`setCorner` / `refreshAppearance` 一并简化；
+- 删除 `Prefs.cornerByMask`、设置页「画中画圆角用壁纸遮罩」开关、`MainActivity.appliedCornerMask`；
+- 新增 `Prefs.opaqueWindow`（**默认开**）+ 设置页「桌面窗口不透明（自绘壁纸，需重启桌面）」；
+- 开启时：`getWindow().setFormat(PixelFormat.OPAQUE)`（必须在 `setContentView` 之前，
+  否则 surface 已按 TRANSLUCENT 建好，改背景只是"不透明底 + 仍然 alpha 混合"），
+  窗口底色 `0xFF0B0F14` 兜底，根布局异步加载 `Ui.wallpaperCover()` 铺壁纸（center-crop）。
+
+### 效果与代价
+
+- 省掉合成器每帧一次的「壁纸图层 × 桌面窗口」alpha 混合；
+- 代价：壁纸改由桌面画，画中画每出帧都会连带把壁纸重画一遍；动态壁纸/视差失效；
+- 手机实测：桌面启动后壁纸正常、无黑屏，画中画四角为标准圆弧、弧外壁纸连续无色块。
+
+---
+
 ## 0.23.38 / vc182 — 修圆角遮罩的坐标基准（这次真出来了）
 
 **一句话：`onDraw` 的 canvas 原点在 View 左上角，我却在 Path 里用了窗口绝对坐标，

@@ -160,8 +160,6 @@ public class MainActivity extends AppCompatActivity
 
     // 上次应用的配置，用于从设置页返回时做增量刷新
     private int appliedPaneCount = -1, appliedDpi = -1, appliedPipCorner = -1;
-    /** 上一次应用的「圆角用遮罩」取值：它单独变化时也要重算圆角（圆角数值可能没变） */
-    private boolean appliedCornerMask;
     private float appliedRenderScale = -1f;
     private int appliedDockCorner = -1, appliedDockCount = -1, appliedIconSize = -1;
     private int appliedDockIcon = -1;
@@ -398,8 +396,17 @@ public class MainActivity extends AppCompatActivity
         // 负责盖住开机时的最近任务界面。真实窗口一创建就**一次性**换回透明，
         // 之后绝不再动窗口背景。0.17.12 把这一步放在首帧回调里，赶上 Activity
         // 反复重建就变成「深色 ↔ 透明」来回切 —— 用户看到的持续闪烁。
-        getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(
-                android.graphics.Color.TRANSPARENT));
+        // 不透明模式（性能开关）：窗口 format 必须在 setContentView 之前定，
+        // 否则 ViewRootImpl 已经按 TRANSLUCENT 建好 surface，改背景只会变成
+        // "不透明色打底 + 依旧 alpha 混合"，白忙一场。
+        if (Prefs.opaqueWindow(this)) {
+            getWindow().setFormat(android.graphics.PixelFormat.OPAQUE);
+            getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(
+                    0xFF0B0F14));
+        } else {
+            getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(
+                    android.graphics.Color.TRANSPARENT));
+        }
         // 桌面窗口要不要放弃输入焦点。默认不放弃 —— 0.22.8 实测过：放弃焦点并不能
         // 阻止那次全局 pause（放手后照样冻），所以只留作现场对照开关。
         if (deskGivesUpFocus()) {
@@ -479,6 +486,19 @@ public class MainActivity extends AppCompatActivity
             return insets;
         });
         setContentView(root);
+        // 不透明模式下系统不再垫壁纸，得自己画。异步解码：壁纸动辄几 MB，
+        // 在 onCreate 里同步取会把首帧推迟几百毫秒。取到之前先用兜底底色。
+        if (Prefs.opaqueWindow(this)) {
+            final android.view.View bgRoot = root;
+            new Thread(() -> {
+                final android.graphics.drawable.Drawable w = Ui.wallpaperCover(getApplicationContext());
+                if (w == null) {
+                    Log.w("PipDesk", "不透明窗口：拿不到壁纸，保留兜底底色");
+                    return;
+                }
+                bgRoot.post(() -> bgRoot.setBackground(w));
+            }, "wallpaper-bg").start();
+        }
         root.requestApplyInsets();
 
         // 调试钩子：以 uid 1000 执行一条系统命令（调分辨率/密度用）
@@ -604,7 +624,6 @@ public class MainActivity extends AppCompatActivity
         // 不会再出现"画面缩到左上角"（根因是 resize 不会让屏内应用重新 measure）。
         appliedRenderScale = Prefs.getRenderScale(this) / 100f;
         appliedPipCorner = Prefs.getPipCorner(this);
-        appliedCornerMask = Prefs.cornerByMask(this);
         appliedDockCorner = Prefs.getDockCorner(this);
         appliedDockCount = Prefs.getDockCount(this);
         appliedDockIcon = Prefs.getDockIcon(this);
@@ -3367,10 +3386,7 @@ public class MainActivity extends AppCompatActivity
         // 设置页那边会提示"重启桌面后生效"，并提供一键重启。
         appliedRenderScale = Prefs.getRenderScale(this) / 100f;
         // 圆角只有一套：画中画和 Dock 一起变（需求：调画中画圆角要同时改 Dock）
-        boolean cornerMaskNow = Prefs.cornerByMask(this);
-        boolean cornerMaskChanged = cornerMaskNow != appliedCornerMask;
-        appliedCornerMask = cornerMaskNow;
-        if (pipCorner != appliedPipCorner || cornerMaskChanged) {
+        if (pipCorner != appliedPipCorner) {
             pip.setCorner(pipCorner);
             if (dockRow != null) dockRow.setBackground(Ui.glass(this, pipCorner));
             appliedPipCorner = pipCorner;

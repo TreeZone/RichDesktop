@@ -305,13 +305,16 @@ public class Ui {
     private static boolean wallpaperBmpLoaded;
 
     /**
-     * 系统壁纸位图（整屏坐标）。
+     * 系统壁纸位图。
      *
-     * 只给「画中画四角遮罩」用：不做整块圆角裁剪，改成在四个角上重画壁纸 ——
-     * 必须拿到壁纸的**真实像素**，否则四角就是纯色补丁，和周围壁纸对不上。
+     * 给「桌面窗口不透明」用：窗口一旦不透明，系统就不再帮我们垫壁纸，
+     * 必须由桌面把壁纸画进自己的窗口 buffer（见 {@link #wallpaperCover}）。
      *
-     * 失败返回 null（动态壁纸拿不到静态帧等），调用方要退回原来的裁剪方案。
-     * 位图本身不做缩放，缩放/对齐由调用方按屏幕尺寸算，避免两处各算一套。
+     * 注意：动态壁纸（如 MIUI miwallpaper）这里拿到的是**静态快照**，与屏幕上
+     * 实时渲染的那一帧并非同一像素，所以它只适合当"整屏背景"，不适合用来
+     * 精确复刻局部（曾经拿它画过画中画四角，色差明显，已废弃）。
+     *
+     * 失败返回 null，调用方要能用兜底颜色顶上。
      */
     public static Bitmap wallpaperBitmap(Context c) {
         if (wallpaperBmpLoaded) return wallpaperBmp;
@@ -332,12 +335,49 @@ public class Ui {
                     d.draw(cv);
                 }
             } catch (Throwable t) {
-                Log.w(TAG, "取壁纸位图失败，四角遮罩退回裁剪方案", t);
+                Log.w(TAG, "取壁纸位图失败，窗口改为兜底底色", t);
             }
             wallpaperBmp = b;
             wallpaperBmpLoaded = true;
             return b;
         }
+    }
+
+    /**
+     * 壁纸铺满整个 View 的 Drawable（center-crop，等比不拉伸）。
+     *
+     * 拿不到壁纸返回 null：调用方保留兜底底色就行。
+     * 绘制只有一次 drawBitmap（壁纸位图通常就是屏幕尺寸，1:1 采样，很便宜），
+     * 不在这里做任何缩放计算以外的活。
+     */
+    public static Drawable wallpaperCover(Context c) {
+        final Bitmap bmp = wallpaperBitmap(c);
+        if (bmp == null) return null;
+        return new Drawable() {
+            private final android.graphics.Paint paint =
+                    new android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG);
+            private final android.graphics.Rect src = new android.graphics.Rect();
+            private final android.graphics.Rect dst = new android.graphics.Rect();
+
+            @Override
+            public void draw(Canvas cv) {
+                android.graphics.Rect bb = getBounds();
+                if (bb.isEmpty()) return;
+                float s = Math.max(bb.width() / (float) bmp.getWidth(),
+                        bb.height() / (float) bmp.getHeight());
+                int w = Math.round(bmp.getWidth() * s);
+                int h = Math.round(bmp.getHeight() * s);
+                int l = bb.left + (bb.width() - w) / 2;
+                int t = bb.top + (bb.height() - h) / 2;
+                src.set(0, 0, bmp.getWidth(), bmp.getHeight());
+                dst.set(l, t, l + w, t + h);
+                cv.drawBitmap(bmp, src, dst, paint);
+            }
+
+            @Override public void setAlpha(int alpha) { }
+            @Override public void setColorFilter(android.graphics.ColorFilter cf) { }
+            @Override public int getOpacity() { return android.graphics.PixelFormat.OPAQUE; }
+        };
     }
 
     /** 文字/图标颜色：深色外观用白字，浅色外观用黑字 */

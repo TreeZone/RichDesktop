@@ -545,12 +545,21 @@ public class Prefs {
      * 遮罩只在四个角重画壁纸（约 1.4 万像素），裁剪要把整块 199 万像素先离屏再贴回。
      * 默认遮罩；裁剪作为回退（遮罩在某些壁纸上可能看出接缝，或拿不到壁纸位图）。
      */
-    public static boolean cornerByMask(Context c) {
-        return sp(c).getBoolean("corner_mask", true);
+    /**
+     * 桌面窗口是否改成不透明（自绘壁纸）。
+     *
+     * 透明窗口时，系统把「壁纸图层」和「桌面窗口」交给硬件合成器各叠一次；
+     * 不透明后壁纸由我们画进窗口 buffer，合成器只处理一层，但画中画每出帧
+     * 都会连带把壁纸重画一遍 —— 哪边更省要看 GPU，做成开关让用户自己对比。
+     *
+     * 代价：动态壁纸 / 壁纸视差会消失（只剩静态快照）。
+     */
+    public static boolean opaqueWindow(Context c) {
+        return sp(c).getBoolean("opaque_window", true);
     }
 
-    public static void setCornerByMask(Context c, boolean b) {
-        sp(c).edit().putBoolean("corner_mask", b).apply();
+    public static void setOpaqueWindow(Context c, boolean b) {
+        sp(c).edit().putBoolean("opaque_window", b).apply();
     }
 
     // ------------------------------------------------------------ 应用列表
