@@ -267,12 +267,18 @@ final class VoiceAsr {
     }
 
     /** 开始一句话：清空上文的解码状态 */
+    /** 本轮喂进去的样本数 / 解码耗的纳秒：只为了算 RTF（车机上能不能实时，见 rtfText） */
+    private long fedSamples;
+    private long decodeNanos;
+
     void begin() {
         if (rec == null) return;
         try {
             if (stream == null) stream = rec.createStream("");
             else rec.reset(stream);
             recognized = "";
+            fedSamples = 0;
+            decodeNanos = 0;
         } catch (Throwable t) {
             Log.e(TAG, "asr begin", t);
         }
@@ -291,8 +297,11 @@ final class VoiceAsr {
         try {
             float[] f = new float[n];
             for (int i = 0; i < n; i++) f[i] = pcm[i] / 32768f;
+            long t0 = System.nanoTime();
             st.acceptWaveform(f, VoiceMic.SR);
             while (r.isReady(st)) r.decode(st);
+            decodeNanos += System.nanoTime() - t0;
+            fedSamples += n;
             OnlineRecognizerResult res = r.getResult(st);
             if (res != null && res.getText() != null) recognized = res.getText().trim();
             return recognized;
@@ -301,6 +310,21 @@ final class VoiceAsr {
             FileLog.append("VOICE 识别异常 " + t);
             return recognized;
         }
+    }
+
+    /**
+     * 本轮「解码耗时 / 音频时长」：RTF &lt; 1 才可能实时。
+     *
+     * 车机的这颗 SoC 比开发机慢得多（本地 x86 两线程 RTF≈0.24），所以这条数字必须在
+     * 真机上看得见 —— 拿到车机日志就能直接判断「双语大模型能不能留」，
+     * 不用再靠猜。没有样本（这一轮没喂到音频）时返回 null。
+     */
+    String rtfText() {
+        if (fedSamples <= 0 || decodeNanos <= 0) return null;
+        double audioSec = fedSamples / (double) VoiceMic.SR;
+        double decodeSec = decodeNanos / 1e9;
+        return String.format(java.util.Locale.US, "音频%.1fs 解码%.2fs RTF=%.2f",
+                audioSec, decodeSec, decodeSec / audioSec);
     }
 
     /** 是否已经断句（说完静音足够长 / 单句超长） */

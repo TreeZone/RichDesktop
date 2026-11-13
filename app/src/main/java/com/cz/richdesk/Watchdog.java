@@ -67,7 +67,7 @@ public final class Watchdog {
         if (started) return;
         // 默认不跑：每 800ms 给主线程塞一个空任务、永远不停，纯属「隐形埋点」式的常驻开销。
         // 只有排查时才开：/sdcard/pipdesk_dump 或 /sdcard/pipdesk_verbose 存在。
-        if (!PipDebug.VERBOSE && !new java.io.File(TRIGGER_FILE).exists()) {
+        if (!PipDebug.DIAG) {
             Log.i(TAG, "看门狗未启用（需要 /sdcard/pipdesk_dump 或 pipdesk_verbose）");
             return;
         }

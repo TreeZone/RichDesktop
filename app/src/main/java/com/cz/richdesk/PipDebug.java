@@ -14,9 +14,27 @@ package com.cz.richdesk;
 public final class PipDebug {
 
     private static final String TRIGGER = "/sdcard/pipdesk_verbose";
+    private static final String TRIGGER_DUMP = "/sdcard/pipdesk_dump";
 
     /** 是否输出高频日志（触摸轨迹、手势判定、注入细节） */
     public static final boolean VERBOSE = detect();
+
+    /**
+     * 「要不要跑诊断线程」的统一开关：高频日志 或 日志包模式（/sdcard/pipdesk_dump）。
+     *
+     * 这类诊断（AudioProbe 每 15s 一次 AudioService 往返、Watchdog 每 800ms 一次
+     * 主线程 ping）只在排查时有用，正常使用纯属常驻开销 —— 全部收敛到这里，
+     * 排查完删掉文件、重启桌面就彻底停掉，不会再出现「测试开关忘了删，一直拖慢车机」。
+     */
+    public static final boolean DIAG = VERBOSE || dumpMode();
+
+    private static boolean dumpMode() {
+        try {
+            return new java.io.File(TRIGGER_DUMP).exists();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
 
     private PipDebug() { }
 

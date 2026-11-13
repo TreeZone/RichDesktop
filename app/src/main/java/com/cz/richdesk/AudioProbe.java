@@ -53,6 +53,12 @@ public final class AudioProbe {
         if (started) return;
         started = true;
         if (am == null) return;
+        // 默认不跑：每 15s 一次 AudioService binder 往返 + 监控线程每 700ms 醒一次，
+        // 都是纯诊断开销。只在 /sdcard/pipdesk_verbose 或 /sdcard/pipdesk_dump 存在时启用。
+        if (!PipDebug.DIAG) {
+            Log.i(TAG, "音频控制面探针未启用（需要 /sdcard/pipdesk_dump）");
+            return;
+        }
         newCaller();
         Thread mon = new Thread(AudioProbe::monitor, "pipdesk-audio-mon");
         mon.setDaemon(true);

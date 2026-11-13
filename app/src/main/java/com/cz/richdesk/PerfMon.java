@@ -28,6 +28,8 @@ public final class PerfMon {
     private static volatile PipManager pip;
     private static volatile Context app;
     private static long lastFileLog;
+    /** /proc/meminfo 在车机上常被 SELinux 拒（每次拒绝都会写一条审计）：拒一次就改用官方 API */
+    private static boolean procMemBlocked;
 
     private PerfMon() { }
 
@@ -149,8 +151,32 @@ public final class PerfMon {
         return statusKb("VmRSS:");
     }
 
-    /** 系统可用内存（MemAvailable）：比 MemFree 真实，已扣掉不可回收的缓存 */
+    /**
+     * 系统可用内存（MemAvailable）：比 MemFree 真实，已扣掉不可回收的缓存。
+     *
+     * /proc/meminfo 被 SELinux 拒的设备（实测展锐车机）退回 ActivityManager.MemoryInfo：
+     * 数值语义相同（都是「还能拿到多少」），而且不需要读 proc、不产生审计拒绝。
+     */
     private static long availKb() {
+        if (!procMemBlocked) {
+            long v = availKbFromProc();
+            if (v >= 0) return v;
+        }
+        try {
+            Context c = app;
+            if (c == null) return -1;
+            android.app.ActivityManager am =
+                    (android.app.ActivityManager) c.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) return -1;
+            android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
+            am.getMemoryInfo(mi);
+            return mi.availMem / 1024L;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    private static long availKbFromProc() {
         try (java.io.BufferedReader r = new java.io.BufferedReader(
                 new java.io.FileReader("/proc/meminfo"))) {
             String line;
@@ -160,7 +186,9 @@ public final class PerfMon {
                     if (p.length >= 2) return Long.parseLong(p[1]);
                 }
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            procMemBlocked = true;      // 拒一次就够，之后一直走 AM
+            Log.i(TAG, "读不到 /proc/meminfo（" + t.getClass().getSimpleName() + "），改用 AM");
         }
         return -1;
     }

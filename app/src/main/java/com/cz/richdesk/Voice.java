@@ -1326,7 +1326,9 @@ public final class Voice {
         Host h = host;
         List<AppInfo> apps = h == null ? null : h.apps();
         final VoiceIntent.Result r = VoiceIntent.parse(t, apps, aliasMap());
-        FileLog.append("VOICE 判定 " + VoiceIntent.describe(r) + "（说法=\"" + r.text + "\"）");
+        String rtf = asr == null ? null : asr.rtfText();
+        FileLog.append("VOICE 判定 " + VoiceIntent.describe(r) + "（说法=\"" + r.text + "\""
+                + (rtf == null ? "" : "，" + rtf) + "）");
 
         if (r.kind == VoiceIntent.APP || r.kind == VoiceIntent.CMD) {
             final String pkg = r.pkg;

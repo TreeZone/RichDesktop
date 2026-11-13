@@ -69,6 +69,30 @@ public final class PerfOverlay {
     private static long gpuNextProbeAt;         // 探测失败时节流，别每秒扫目录
     private static boolean gpuSuTried;          // su 探测只试一次，失败就不再反复起进程
 
+    /*
+     * 【在车机上 /proc 可能根本读不到，被拒了就别再试】
+     *
+     * 实测（展锐车机，SELinux domain 为 zygote）：/proc/stat、/proc/meminfo、
+     * /sys/class/misc 全部 `avc: denied`。而悬浮窗是每秒采样一次 —— 8 分钟日志里
+     * 光 pipdesk-perf-ov 一条线程就产生 580 条拒绝记录，每条都要内核审计 +
+     * auditd 落盘，等于**开着悬浮窗就在给 system_server 白白加活**。
+     *
+     * 所以这里做负缓存：第一次失败就永久改用兜底数据源，不再重试同一个文件。
+     *   · CPU → 自身进程 /proc/self/stat（自己的文件一定能读）的差分；
+     *   · 内存 → ActivityManager.MemoryInfo（官方 API，无 SELinux 问题）。
+     */
+    private static boolean procStatBlocked;
+    private static boolean procMemBlocked;
+    /** 自身进程 CPU 差分：/proc/self/stat 的 utime+stime（jiffies，USER_HZ=100） */
+    private static long lastSelfJiffies;
+    private static long lastSelfAt;
+    private static boolean selfStatBlocked;
+    /** 这一帧的 CPU 数是「整机」还是「本进程」 */
+    private static boolean cpuIsSelf;
+    /** GPU 探测连续失败次数：读不到节点的设备别每 5 秒扫一次目录 */
+    private static int gpuProbeFails;
+    private static boolean gpuGiveUp;
+
     /** 每块画中画上次的累计帧数（算每秒 fps 用） */
     private static long[] lastFrames = new long[0];
     /** 落盘用的采样计数（每 5 秒写一行，便于事后翻日志） */
@@ -191,7 +215,7 @@ public final class PerfOverlay {
 
         // CPU：整体 + 每核（读不到差分就只显示整体）
         int cpu = cpuUsage();
-        b.append("CPU ").append(cpu < 0 ? "-" : cpu + "%");
+        b.append(cpuIsSelf ? "APP CPU " : "CPU ").append(cpu < 0 ? "-" : cpu + "%");
         int[] cores = coreUsages();
         if (cores != null) {
             for (int i = 0; i < cores.length; i++) {
@@ -270,18 +294,73 @@ public final class PerfOverlay {
         return (int) Math.max(0, Math.min(100, (dAll - dIdle) * 100 / dAll));
     }
 
-    /** 系统整体 CPU 占用（相邻两次采样差分；首次返回 -1） */
+    /** 系统整体 CPU 占用（相邻两次采样差分；首次返回 -1）
+     *
+     *  /proc/stat 被 SELinux 拒的设备上自动退回「本进程 CPU」——那个数和
+     *  「桌面自己有没有在烧 CPU」其实是同一个问题，比整机占比更能定位到我们头上。
+     */
     private static int cpuUsage() {
-        try (BufferedReader r = new BufferedReader(new FileReader("/proc/stat"))) {
-            long[] cur = readCpuLine(r.readLine());
-            if (cur == null) return -1;
-            if (lastCpu == null) {
+        if (!procStatBlocked) {
+            try (BufferedReader r = new BufferedReader(new FileReader("/proc/stat"))) {
+                long[] cur = readCpuLine(r.readLine());
+                if (cur == null) return -1;
+                if (lastCpu == null) {
+                    lastCpu = cur;
+                    return -1;
+                }
+                int v = pct(cur[0] - lastCpu[0], cur[1] - lastCpu[1]);
                 lastCpu = cur;
-                return -1;
+                cpuIsSelf = false;
+                return v;
+            } catch (Throwable t) {
+                procStatBlocked = true;         // 拒绝一次就够，别再每秒往审计日志里灌
+                lastCpu = null;
+                Log.i(TAG, "读不到 /proc/stat（" + t.getClass().getSimpleName()
+                        + "），CPU 改用本进程统计");
             }
-            int v = pct(cur[0] - lastCpu[0], cur[1] - lastCpu[1]);
-            lastCpu = cur;
-            return v;
+        }
+        cpuIsSelf = true;
+        return selfCpuUsage();
+    }
+
+    /**
+     * 本进程 CPU 占用（占单核百分比，可 >100）：/proc/self/stat 的 utime+stime 差分。
+     *
+     * 只读自己的文件，SELinux 不会拦。USER_HZ 按 100 算（arm64 / x86 的 Android 都是 100），
+     * 1 jiffy = 10ms，所以「jiffies 增量 × 10 / 实际经过毫秒」就是占单核的百分比 ×100。
+     */
+    private static int selfCpuUsage() {
+        if (selfStatBlocked) return -1;
+        long j = selfJiffies();
+        long now = android.os.SystemClock.uptimeMillis();
+        if (j < 0) {
+            selfStatBlocked = true;
+            return -1;
+        }
+        if (lastSelfAt == 0) {
+            lastSelfJiffies = j;
+            lastSelfAt = now;
+            return -1;
+        }
+        long dj = j - lastSelfJiffies;
+        long dt = now - lastSelfAt;
+        lastSelfJiffies = j;
+        lastSelfAt = now;
+        if (dt <= 0 || dj < 0) return -1;
+        return (int) Math.max(0, Math.min(999, dj * 1000 / dt));
+    }
+
+    /** /proc/self/stat 的 utime+stime（jiffies）；comm 里可能有空格和括号，从最后一个 ')' 往后数 */
+    private static long selfJiffies() {
+        try (BufferedReader r = new BufferedReader(new FileReader("/proc/self/stat"))) {
+            String line = r.readLine();
+            if (line == null) return -1;
+            int i = line.lastIndexOf(')');
+            if (i < 0 || i + 2 >= line.length()) return -1;
+            String[] p = line.substring(i + 2).trim().split("\\s+");
+            // p[0] 是 state（第 3 个字段）→ utime 是第 14 个 = p[11]，stime 第 15 个 = p[12]
+            if (p.length < 13) return -1;
+            return Long.parseLong(p[11]) + Long.parseLong(p[12]);
         } catch (Throwable t) {
             return -1;
         }
@@ -289,6 +368,7 @@ public final class PerfOverlay {
 
     /** 每核 CPU 占用：cpu0..cpuN 差分（核数变化/读不到会自动重建） */
     private static int[] coreUsages() {
+        if (procStatBlocked) return null;       // 已经确认读不到：别再每秒试一次
         try (BufferedReader r = new BufferedReader(new FileReader("/proc/stat"))) {
             String line;
             int n = 0;
@@ -323,6 +403,7 @@ public final class PerfOverlay {
             }
             return out;
         } catch (Throwable t) {
+            procStatBlocked = true;
             return null;
         }
     }
@@ -331,6 +412,7 @@ public final class PerfOverlay {
 
     /** 已知 GPU 节点形态：单列百分比 / busy total 两列 / 文本行里带 load xx% */
     private static String probeGpuNode() {
+        if (gpuGiveUp) return null;
         // 探测失败时不要每秒全扫（列目录 + 读文件在车机上不算便宜），5 秒重试一次
         long now = android.os.SystemClock.uptimeMillis();
         if (now < gpuNextProbeAt) return null;
@@ -409,7 +491,14 @@ public final class PerfOverlay {
                 }
             }
         }
-        return null;                            // 一条都读不到：下个采样周期重试
+        // 一条都读不到：给 3 次机会（有的设备节点要等 GPU 驱动初始化完才出现），
+        // 还不行就彻底放弃 —— 展锐这类把节点全锁死的机器上，每 5 秒扫一遍目录
+        // 本身就是白白多出来的活，而且每次列 /sys/class/misc 都会加一条审计拒绝。
+        if (++gpuProbeFails >= 3) {
+            gpuGiveUp = true;
+            Log.i(TAG, "GPU 占用读不到（节点被锁），悬浮窗不再探测");
+        }
+        return null;
     }
 
     private static String gpuUsage() {
@@ -529,6 +618,7 @@ public final class PerfOverlay {
     }
 
     private static long[] memFromProc() {
+        if (procMemBlocked) return null;        // 已经确认读不到：直接走 AM 兜底
         try (BufferedReader r = new BufferedReader(new FileReader("/proc/meminfo"))) {
             long total = -1, avail = -1;
             String line;
@@ -547,6 +637,11 @@ public final class PerfOverlay {
             if (total <= 0 || avail < 0) return null;
             return new long[]{Math.max(0, total - avail), total};
         } catch (Throwable t) {
+            // 车机上这条是常态（SELinux 拒 /proc/meminfo）：标记一次，之后只用 AM，
+            // 不再每秒制造一条 audit 拒绝记录
+            procMemBlocked = true;
+            Log.i(TAG, "读不到 /proc/meminfo（" + t.getClass().getSimpleName()
+                    + "），RAM 改用 ActivityManager");
             return null;
         }
     }
