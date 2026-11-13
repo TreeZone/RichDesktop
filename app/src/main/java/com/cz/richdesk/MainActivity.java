@@ -716,7 +716,7 @@ public class MainActivity extends AppCompatActivity
         if (pip != null) pip.primeTouch();
 
         // 常驻监控 / 测试悬浮窗
-        PaneDoctor.start(this, pip);
+        PaneGuard.start(this, pip);
         AudioProbe.start(this, pip);
         PerfMon.start(this, pip);
         PerfOverlay.apply(this, pip);       // 性能悬浮窗：按设置开关恢复显示
@@ -3228,6 +3228,7 @@ public class MainActivity extends AppCompatActivity
     @Override
     protected void onStop() {
         super.onStop();
+        PaneGuard.setForeground(false);
         // 遮罩模式下离开桌面就别留着一张黑屏：回来时必须能看到内容
         if (ScreenOff.curtainShown(this)) ScreenOff.dismissCurtain(this);
         Log.i(TAG, "LIFE onStop " + paneSnapshot());
@@ -3252,6 +3253,8 @@ public class MainActivity extends AppCompatActivity
     @Override
     protected void onResume() {
         super.onResume();
+        PaneGuard.setForeground(true);
+        PaneGuard.arm("桌面回到前台");
         AppState.mainResumed = true;
         // 屏幕已经亮着（人醒了/被唤醒）：把息屏兜底闹钟撤掉，免得待会儿又亮一次
         ScreenOff.cancelGuard(this);
@@ -3464,7 +3467,7 @@ public class MainActivity extends AppCompatActivity
         // 静态变量里挂着本 Activity 的东西全部摘掉：后台线程（听诊器/探针/心跳）
         // 原来只在 start 时赋值一次，recreate 之后还指着**旧**的 PipManager ——
         // 整棵旧视图树（3 个 TextureView）跟着泄漏，重启几次桌面就能吃掉几十 MB 显存。
-        PaneDoctor.detach();
+        PaneGuard.detach();
         AudioProbe.detach();
         PerfMon.detach();
         UiJank.stop();                      // 主线程抖动监测跟着桌面停（重建后再 start）

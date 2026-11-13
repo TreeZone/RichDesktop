@@ -7,6 +7,52 @@
 
 ---
 
+## 0.23.28 / vc172 — 换成「全员静止 → 一次探测」：卡死检测从常驻轮询改成事件驱动
+
+**一句话：原来每块屏每 1.2~30 秒扫一遍全系统 task（车机日志实测 8 分钟 110 次全校举），
+本身就是负载；现在只看每块屏「最后一帧的时刻」，所有屏同时静止才探一次，稳态零 binder。**
+
+### 为什么换
+
+车机日志（`LSPosed_20261112_130304`）里，8 分钟出现 `findTask(...) 命中 (getRunningTasks)`
+110 次、`OBS ... taskState=2/run0` 55 次，而被观测的那块蓝牙屏 8 分钟只出 2 帧。
+也就是说：**画中画出帧极少，我们却在不停扫全系统 task 列表**。这类开销压在
+system_server 和内核调度上，本进程 CPU 统计看不出来 —— 表现为「CPU 正常但整机越用越慢」。
+
+### 新判据（`PaneGuard`）
+
+- 只读 `PipPane.lastFrameAt()`（`onSurfaceTextureUpdated` 里维护，改成 volatile）。
+- **全员静止** = 所有有应用的屏都超过阈值没出帧：窗口外 500ms、窗口内（用户刚操作过）1.2s。
+- 一次静止期只探一次；有新帧就重开一期。
+- 探测：一条线程、**一次** task 扫描（`PipPane.taskDisplays` 批量）+ 一次进程表扫描，
+  所有屏共用；然后只对真正需要的屏动作。
+- 武装（arm）时机：触摸画中画 / 打开应用 / 音频播放状态变化 / 桌面回前台，窗口 10 秒。
+
+### 恢复动作不变，但「无感知」是有边界的
+
+仍然走 `forceToDisplay` 的分流（不动 move-stack，见该方法的实测教训）：
+
+- **task 还在这块虚拟屏上、只是 activity 被系统 stop** → 只补一次 resume，
+  画面从冻住那一帧继续，这条是真无感知；
+- **task 已被系统拽到主屏** → 删 task 在本屏重建，必然有一次应用重建，做不到无感知。
+
+### 删掉的（约 400 行）
+
+`PaneDoctor.java` 整个文件（`checkStall` + `stall` 表 + 指数退避 + 每 8 秒 ANR 全校举 +
+32 秒 `FRAMES` 心跳 + `watchPlayback/kick/fastMode` 快巡检）、
+`PipPane.probeAndRevive` 及 `observeOnly`（`/data/local/tmp/pipdesk_observe` 观察模式）、
+逐屏 `probing` 闸门、`moveTries/lastReviveAt/lastForeignAt` 那套节流、
+`Watchdog` 的常驻 800ms 主线程 ping（改成有 `/sdcard/pipdesk_dump` 或 `pipdesk_verbose` 才跑）。
+
+### 待车机验证
+
+1. 删掉车机上残留的 `/data/local/tmp/pipdesk_observe`、`/data/local/tmp/pipdesk_desk_nofocus`
+   （这两个是 11-11 排查时留下的，观察模式会禁掉自愈并且每 2 秒扫一遍全系统）。
+2. 卡的时候看日志里 `FREEZE ...` / `REVIVE-ALL ...` 是否出现、从静止到恢复多久。
+3. 对比 `PERF` 行的 `p0=..f=` 与 8 分钟内 `findTask` 次数（应从 110 次降到接近 0）。
+
+---
+
 ## 0.23.27 / vc171 — 性能：唤醒词不再反复重建 + 增加长跑诊断埋点
 
 **一句话：语音每次唤醒后都要重建唤醒词模型（0.8~1.2 秒、2 线程吃满），正好落在「你说完话等结果」的当口；已改成常驻。启动也不再抢占首屏。**

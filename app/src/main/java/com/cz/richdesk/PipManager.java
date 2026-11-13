@@ -841,6 +841,9 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         // 手指按下就先给这块屏备好"焦点锚"脉冲：屏内系统蓝牙/音乐点一下就会 relaunch
         // 自己（切播放主题），那一瞬间窗口真空 → 焦点塌回主屏 → 全局 pause → 全部卡死。
         // 脉冲提前顶住焦点，900ms 后自动放开把焦点还给应用（否则蓝牙不切音源 = 没声音）。
+        // 手指按下去就进快判窗口：这一下正好是系统最容易重算焦点、把整屏 activity
+        // 一起 stop 的时刻。窗口内全员静止 1.2 秒 PaneGuard 就会探一次并接回画面。
+        if (ev.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) PaneGuard.arm("触摸画中画");
         if (ev.getActionMasked() == android.view.MotionEvent.ACTION_DOWN
                 && FocusAnchor.needsAnchor(p.pkg())) {
             FocusAnchor.pulse(app, display, p.index, FocusAnchor.PULSE_MS);
@@ -874,6 +877,7 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
 
     @Override
     public void onPaneOpened(PipPane pane, String pkg) {
+        PaneGuard.arm("打开应用");
         Log.i(TAG, "pane " + pane.index + " opened " + pkg);
         if (listener != null) listener.onOpened(pane.index, pkg);
     }
