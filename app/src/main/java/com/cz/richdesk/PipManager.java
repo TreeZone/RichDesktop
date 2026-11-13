@@ -476,8 +476,16 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
     @Override
     public void onRatioChanging(float[] w) {
         weights = w;
-        // 动画期间冻结虚拟屏 resize：只让纹理拉伸，结束时一次性对齐
-        for (PipPane p : panes) p.setDeferResize(true);
+        // 拖动/动画期间：冻结虚拟屏 resize **并且冻结纹理布局**。
+        //
+        // 只冻结前者是不够的 —— pane 的 View 尺寸每帧在变，TextureView 会跟着变，
+        // 系统顺手把纹理 buffer 也改成新尺寸，而虚拟屏停在旧尺寸，于是屏内应用
+        // 把旧尺寸的画面画在新 buffer 的左上角（= 拖动时"缩到左上角"）。
+        // 打开预览模式后纹理尺寸冻结、只做 scale 拉伸，buffer 与虚拟屏始终一致。
+        for (PipPane p : panes) {
+            p.setDeferResize(true);
+            p.setPreviewMode(true);
+        }
         syncCollapsed();
     }
 
@@ -492,7 +500,10 @@ public class PipManager implements PipPane.Callback, PaneBox.Listener {
         // 立刻 resize 会差几个像素（而且最后还会被布局回调再改一次）
         for (PipPane p : panes) p.setDeferResize(true);
         container.post(() -> {
-            for (PipPane p : panes) p.setDeferResize(false);   // 内部按最终尺寸对齐虚拟屏
+            for (PipPane p : panes) {
+                p.setPreviewMode(false);   // 恢复 MATCH_PARENT，让布局回到自动尺寸
+                p.setDeferResize(false);   // 清冻结标记，并按最终尺寸对齐虚拟屏（防抖后执行）
+            }
         });
         Log.i(TAG, "分屏比例落定 " + java.util.Arrays.toString(weights));
     }

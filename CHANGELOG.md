@@ -7,6 +7,67 @@
 
 ---
 
+## 0.23.41 / vc185 — 拖动时冻结纹理布局，只做缩放（真正修掉「缩左上角」）
+
+**一句话：0.23.40 只冻结了虚拟屏，没冻结纹理本身 —— 拖动时 TextureView 跟着 pane 变大变小，
+系统顺手把纹理 buffer 尺寸也改了，而虚拟屏停在旧尺寸，于是屏内应用把旧尺寸的画面画在新 buffer
+的左上角。现在拖动期间冻结纹理布局、只做 `scaleX/scaleY` 拉伸，buffer 与虚拟屏永远一致。**
+
+### 0.23.40 为什么没修好
+
+- 0.23.40 的防抖只保证「虚拟屏不在拖动中 resize」；
+- 但 `TextureView` 的**布局尺寸**仍然跟着 pane 每帧变化，系统据此改了它的 buffer 尺寸；
+- 结果：`buffer = 新尺寸`、`虚拟屏 = 旧尺寸` → 屏内应用按旧尺寸绘制，画面只占左上角。
+
+### 改动（`PipPane` 新增 previewMode）
+
+- `setPreviewMode(true)`（拖动/比例动画开始）：
+  - 把 `TextureView` 的 LayoutParams 从 `MATCH_PARENT` 改成**当前绝对像素**，
+    布局不再改它 → buffer 不变；
+  - `pivot` 设为 (0,0)，用 `scaleX/scaleY = pane尺寸 / 冻结尺寸` 贴合，视觉上仍是铺满的；
+- `onSurfaceTextureSizeChanged`：预览期间若系统改了 buffer，**立刻设回冻结尺寸**；
+- `onLayoutChange`：预览期间只更新缩放，不排 resize；
+- `setPreviewMode(false)`（松手/动画结束）：恢复 `MATCH_PARENT`，再排一次防抖对齐 ——
+  整次拖动**只发生一次** `resizeDisplay`；
+- `PipManager.onRatioChanging/onRatioSettled` 接上这两个调用。
+
+### 附带修正
+
+- `applySurfaceSize` 的对齐判断改用 **SurfaceTexture 真实 buffer 尺寸**（`bufferW/bufferH`）：
+  之前拿 `buf()` 和 `displayW` 比，比的是两个「期望值」，永远相等 → 永远不修。
+- `setDeferResize(false)` 不再立即对齐，改为排防抖（避免布局还没跑就按旧尺寸 resize）。
+
+---
+
+## 0.23.40 / vc184 — 拖分隔条时不再每帧 resize 虚拟屏（修「画面缩左上角」）
+
+**一句话：拖双画中间的分隔条时，View 尺寸每帧都在变，
+而代码在每帧都去 `VirtualDisplay#resize` —— 屏内应用收到新像素尺寸、自己却还按旧尺寸排版，
+于是只画左上角那一块，松手重新 measure 才恢复。现在改成「尺寸停下来 180ms 才对齐一次」。**
+
+### 现象与根因
+
+- 现象（70% 渲染分辨率下最明显）：按住双画之间的分隔条拖动，画中画里的应用缩到左上角，
+  松开、比例落定后又自己恢复。
+- 根因：`onSurfaceTextureSizeChanged` / `onLayoutChange` 里**直接**调 `resizeDisplay`。
+  拖动一帧调一次 → 屏内应用被连续 resize，画面处在「新 buffer + 旧排版」的中间态。
+- 原有的 `deferResize` 只能挡住"提前知道要变"的路径，挡不住所有来源。
+
+### 改动
+
+- `PipPane` 新增 `SIZE_SETTLE_MS = 180` 的尺寸防抖：
+  - `onLayoutChange` / `onSurfaceTextureSizeChanged` 不再直接 resize，只调 `scheduleSurfaceSize()`；
+  - `scheduleSurfaceSize()` 每次重新计时，尺寸静止 180ms 后才真正对齐一次；
+  - `deferResize`（比例动画中）把延迟放宽到 3 倍作为兜底，**不再直接 return** ——
+    避免某条路径漏清标记导致尺寸被永久冻住。
+- 对齐判断加严：除了视图尺寸，还要比 `buf(w)/buf(h)` 与 `displayW/displayH`。
+  只比视图尺寸是不够的 —— TextureView 自己也可能把 buffer 改成 view 尺寸（100%），
+  那会把 70% 的分辨率设置悄悄冲掉。
+- 结果：一次拖动只会给屏内应用一次 config change，中间态不再出现；
+  拖动过程中画面是先等比拉伸（View 变形），松手 180ms 内归位。
+
+---
+
 ## 0.23.39 / vc183 — 放弃四角遮罩，圆角回到裁剪；窗口改不透明自绘壁纸
 
 **一句话：四角遮罩这条路走不通（壁纸复刻不可能准），

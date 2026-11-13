@@ -77,6 +77,22 @@ public class PipPane {
 
     private boolean surfaceReady;
     private int surfaceW, surfaceH;
+    /** SurfaceTexture **真实**的 buffer 像素尺寸（系统回调给的），用来发现"被系统改回 view 尺寸" */
+    private int bufferW, bufferH;
+    /**
+     * 拖动分隔条 / 比例动画中的"预览模式"。
+     *
+     * 打开后：TextureView 的**布局尺寸被冻结**在开始拖动那一刻的大小，
+     * 改由 `scaleX/scaleY` 拉伸到 pane 的新尺寸去贴合。
+     *
+     * 为什么必须这么做：拖动时 pane 的 View 尺寸每帧都变，TextureView 会跟着变，
+     * 系统顺手把它的 buffer 尺寸也改成新的 view 尺寸；而虚拟屏这边是冻结的（不该
+     * 每帧 resize）。于是「buffer 是新尺寸、屏内画面还是旧尺寸」——屏内应用把
+     * 70% 的画面画在 buffer 左上角，右边和下边一片黑，就是你看到的"缩到左上角"。
+     * 冻结纹理布局后，buffer 和虚拟屏都不动，比例永远一致，只是画面被拉伸。
+     */
+    private boolean previewMode;
+    private int previewW, previewH;
     /** 纹理出帧计数 / 最后一次出帧时刻：画面"冻结"的判断依据（重启日志里带上） */
     private long frames;
     /** 最后一帧的时刻（uptimeMillis），0 = 还没出过帧。跨线程读，必须 volatile */
@@ -102,6 +118,18 @@ public class PipPane {
      * TextureView 拉伸预览，动画结束再一次性对齐虚拟屏尺寸。
      */
     private boolean deferResize;
+    /**
+     * 尺寸对齐的防抖延后：拖分隔条时 View 尺寸每帧都在变，**每一帧都去 resize 虚拟屏**
+     * 就是「画中画里的应用缩在左上角」的直接原因 —— 屏内应用收到的是新像素尺寸，
+     * 但它自己还按旧尺寸排版，于是只画左上角那一块，松手后才重新 measure 回来。
+     *
+     * `deferResize` 本来想挡住这种情况，但只能挡住"提前知道要变化"的路径；
+     * 这里是兜底：不管谁触发的，尺寸连续变化时都不动虚拟屏，等静止 180ms 再对齐一次。
+     */
+    private static final int SIZE_SETTLE_MS = 180;
+    private final Runnable sizeApplyTask = new Runnable() {
+        @Override public void run() { applySurfaceSize(); }
+    };
     /** 被折叠隐藏（权重 0）：整块不参与触摸，但虚拟屏与 TextureView 都留着，恢复是热的 */
     private boolean collapsed;
 
@@ -139,15 +167,7 @@ public class PipPane {
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
             int w = texture.getWidth();
             int h = texture.getHeight();
-            if (w > 0 && h > 0 && !deferResize && (w != surfaceW || h != surfaceH)) {
-                surfaceW = w;
-                surfaceH = h;
-                android.graphics.SurfaceTexture st = texture.getSurfaceTexture();
-                if (st != null) st.setDefaultBufferSize(buf(w), buf(h));
-                // resize 只是"调尺寸"，失败也不重建屏 —— 重建会换 displayId，
-                // 屏内 task 就再也回不到这块屏上（= 卡死）。宁可让纹理拉伸一下。
-                if (vd != null) resizeDisplay(buf(w), buf(h), density());
-            }
+            if (w > 0 && h > 0 && (w != surfaceW || h != surfaceH)) scheduleSurfaceSize();
         });
 
         hint = new TextView(ctx);
@@ -173,6 +193,8 @@ public class PipPane {
             @Override
             public void onSurfaceTextureAvailable(SurfaceTexture st, int w, int h) {
                 st.setDefaultBufferSize(buf(w), buf(h));
+                bufferW = buf(w);
+                bufferH = buf(h);
                 surfaceReady = true;
                 surfaceW = w;
                 surfaceH = h;
@@ -185,18 +207,22 @@ public class PipPane {
             @Override
             public void onSurfaceTextureSizeChanged(SurfaceTexture st, int w, int h) {
                 surfaceReady = true;
-                // 比例动画/拖动中：不改 buffer 尺寸，纹理先拉伸（结束由 applyDeferredResize 对齐）
-                if (deferResize) return;
-                st.setDefaultBufferSize(buf(w), buf(h));
-                if (w != surfaceW || h != surfaceH) {
-                    surfaceW = w;
-                    surfaceH = h;
-                    // 旋转/分屏/拖拽：原地 resize（等价于设备旋转，应用收到 config change）。
-                    // 失败也不重建屏 —— 重建会换 displayId，屏内 task 会掉回主屏（= 卡死）。
-                    if (vd != null && (buf(w) != displayW || buf(h) != displayH)) {
-                        resizeDisplay(buf(w), buf(h), density());
+                bufferW = w;
+                bufferH = h;
+                if (previewMode) {
+                    // 预览期间系统会把 buffer 改成 TextureView 的新尺寸，必须拉回来：
+                    // 视觉上的拉伸由 scaleX/scaleY 负责，buffer 不能跟着变。
+                    int bw = buf(previewW), bh = buf(previewH);
+                    if (w != bw || h != bh) {
+                        st.setDefaultBufferSize(bw, bh);
+                        bufferW = bw;
+                        bufferH = bh;
                     }
+                    return;
                 }
+                // 非预览：不在这里直接 resize（拖动会每帧回调，每帧重排就是缩左上角），
+                // 统一交给防抖，等尺寸停下来再对齐一次。
+                scheduleSurfaceSize();
             }
 
             @Override
@@ -312,11 +338,84 @@ public class PipPane {
         }
         if (!deferResize) return;
         deferResize = false;
-        applyDeferredResize();
+        scheduleSurfaceSize();
     }
 
-    /** 把虚拟屏尺寸对齐到 TextureView 的当前尺寸（比例动画结束后调用） */
+    /**
+     * 排一次「尺寸对齐」，延后 {@link #SIZE_SETTLE_MS} 执行；期间再有变化就重新计时。
+     *
+     * 拖动分隔条会连续几十帧改变尺寸 —— 只在尺寸**停下来**之后才真的去 resize，
+     * 屏内应用因此只会收到一次 config change，看不到"缩在左上角"的中间态。
+     */
+    private void scheduleSurfaceSize() {
+        // deferResize（比例动画中）本该什么都不做；但万一有路径没清掉这个标记，
+        // 也不能永久冻住尺寸，所以给它一个更长的兜底延迟，而不是直接 return。
+        long delay = deferResize ? SIZE_SETTLE_MS * 3L : SIZE_SETTLE_MS;
+        if (root.getHandler() == null) return;
+        root.removeCallbacks(sizeApplyTask);
+        root.postDelayed(sizeApplyTask, delay);
+    }
+
+    /**
+     * 进入/退出"拖动预览"模式（见字段 {@link #previewMode}）。
+     *
+     * 进入：冻结 TextureView 的布局尺寸，之后用 scaleX/scaleY 贴合 pane 的新尺寸；
+     * 退出：恢复 MATCH_PARENT 并排一次尺寸对齐（延迟到布局稳定之后）。
+     */
+    public void setPreviewMode(boolean on) {
+        if (on == previewMode) return;
+        if (on) {
+            int w = texture.getWidth();
+            int h = texture.getHeight();
+            if (w <= 0 || h <= 0) return;      // 还没布局，等下一次
+            previewW = w;
+            previewH = h;
+            previewMode = true;
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) texture.getLayoutParams();
+            lp.width = w;
+            lp.height = h;
+            lp.gravity = Gravity.TOP | Gravity.START;
+            texture.setLayoutParams(lp);
+            texture.setPivotX(0f);
+            texture.setPivotY(0f);
+            updatePreviewScale();
+        } else {
+            previewMode = false;
+            texture.setScaleX(1f);
+            texture.setScaleY(1f);
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) texture.getLayoutParams();
+            lp.width = FrameLayout.LayoutParams.MATCH_PARENT;
+            lp.height = FrameLayout.LayoutParams.MATCH_PARENT;
+            lp.gravity = Gravity.NO_GRAVITY;
+            texture.setLayoutParams(lp);
+            // 布局跑完、尺寸定了再对齐虚拟屏（这是本次拖动唯一一次 resize）
+            scheduleSurfaceSize();
+        }
+    }
+
+    /** 把冻结的纹理等比拉伸到 pane 当前大小（拖动预览用） */
+    private void updatePreviewScale() {
+        if (!previewMode || previewW <= 0 || previewH <= 0) return;
+        int rw = root.getWidth();
+        int rh = root.getHeight();
+        if (rw <= 0 || rh <= 0) return;
+        texture.setScaleX(rw / (float) previewW);
+        texture.setScaleY(rh / (float) previewH);
+    }
+
+    /** 把虚拟屏尺寸对齐到 TextureView 的当前尺寸（比例动画结束后也会直接调用） */
     public void applyDeferredResize() {
+        root.removeCallbacks(sizeApplyTask);
+        applySurfaceSize();
+    }
+
+    /**
+     * 真正执行一次尺寸对齐。
+     *
+     * resize 只是"改尺寸"，失败也不重建屏 —— 重建会换 displayId，屏内 task
+     * 就再也回不到这块屏上（= 卡死），宁可让纹理拉伸一下。
+     */
+    private void applySurfaceSize() {
         if (deferResize) return;
         int w = texture.getWidth();
         int h = texture.getHeight();
@@ -325,13 +424,27 @@ public class PipPane {
         // 否则屏内应用会被踢成畸形配置（下次恢复还要重新排版）。留着旧尺寸，恢复时再对齐。
         int min = Ui.dp(app, 24);
         if (w < min || h < min) return;
-        if (w == surfaceW && h == surfaceH) return;
+        // 视图尺寸没变、虚拟屏像素也和 buf() 一致，才算"已经对齐"。
+        // 只比视图尺寸是不够的：TextureView 自己也可能把 buffer 改成 view 尺寸（100%），
+        // 那会把 70% 的分辨率设置悄悄冲掉。
+        int wantBufW = buf(w);
+        int wantBufH = buf(h);
+        boolean bufferOk = (bufferW == wantBufW && bufferH == wantBufH);
+        boolean displayOk = (vd == null) || (displayW == wantBufW && displayH == wantBufH);
+        if (bufferOk && displayOk) {
+            surfaceW = w;
+            surfaceH = h;
+            return;
+        }
         surfaceW = w;
         surfaceH = h;
         SurfaceTexture st = texture.getSurfaceTexture();
-        if (st != null) st.setDefaultBufferSize(buf(w), buf(h));
-        // 同上：尺寸对不齐也不重建屏，避免换 displayId 把屏内 task 甩到主屏
-        if (vd != null) resizeDisplay(buf(w), buf(h), density());
+        if (st != null && !bufferOk) {
+            st.setDefaultBufferSize(wantBufW, wantBufH);
+            bufferW = wantBufW;
+            bufferH = wantBufH;
+        }
+        if (vd != null && !displayOk) resizeDisplay(wantBufW, wantBufH, density());
     }
 
     /**
