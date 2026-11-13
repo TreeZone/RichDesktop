@@ -62,6 +62,22 @@ public class Prefs {
         sp(c).edit().putBoolean("perf_low", low).apply();
     }
 
+    // ------------------------------------------------------------ 语音「静音」
+
+    /**
+     * 静音前的 STREAM_MUSIC 音量（0 = 没记过）。
+     *
+     * 不能靠 `ADJUST_UNMUTE` 恢复：有的 ROM 在音量为 0 时 unmute 还是 0，
+     * 用户会以为"静音之后再也放不出声"。这里自己记一份，取消静音时写回去。
+     */
+    public static int mediaVolumeBackup(Context c) {
+        return sp(c).getInt("media_vol_backup", 0);
+    }
+
+    public static void setMediaVolumeBackup(Context c, int v) {
+        sp(c).edit().putInt("media_vol_backup", v).apply();
+    }
+
     // ------------------------------------------------------------ 应用列表名称
 
     /**

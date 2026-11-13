@@ -38,12 +38,22 @@ public final class VoiceIntent {
         public int score;
         /** 命中的是哪一层：name / prefix / contains / edit / pinyin / alias:xxx */
         public String via = "";
+        /**
+         * 指令执行后要念的回话；null = 用默认的「好的」。
+         *
+         * 只有必须让用户知道结果的指令才给（静音 / 取消静音 —— 车机上没有音量条，
+         * 用户得从反馈里确认到底静没静）。
+         */
+        public String reply;
         public final List<AppInfo> candidates = new ArrayList<>();
     }
 
     private VoiceIntent() { }
 
-    /** 内置指令：说法 → 伪包名。全部走已有的 runBuiltin()，不需要新实现 */
+    /**
+     * 内置指令：说法 → 伪包名（可选第三列 = 执行后要念的回话）。
+     * 全部走已有的 runBuiltin()，不需要新实现。
+     */
     private static final String[][] COMMANDS = {
             {"回主页", AppInfo.HOME_PKG}, {"回到主页", AppInfo.HOME_PKG},
             {"回家", AppInfo.HOME_PKG}, {"主页", AppInfo.HOME_PKG},
@@ -62,6 +72,32 @@ public final class VoiceIntent {
             {"白天模式", AppInfo.THEME_PKG}, {"亮色模式", AppInfo.THEME_PKG},
             {"桌面设置", AppInfo.SETTINGS_PKG}, {"桌面设置页", AppInfo.SETTINGS_PKG},
             {"重启桌面", AppInfo.RESTART_PKG}, {"重启启动器", AppInfo.RESTART_PKG},
+            // ---- 媒体控制 ----
+            // 「停止播放」故意映射到暂停：走 stop() 会把 session 置 STOPPED，
+            // 不少播放器会连进度一起丢掉；用户说这句真正想要的是"先别响"。
+            {"播放", AppInfo.MEDIA_PLAY_PKG}, {"开始播放", AppInfo.MEDIA_PLAY_PKG},
+            {"继续播放", AppInfo.MEDIA_PLAY_PKG}, {"接着播", AppInfo.MEDIA_PLAY_PKG},
+            {"继续放", AppInfo.MEDIA_PLAY_PKG}, {"放歌", AppInfo.MEDIA_PLAY_PKG},
+            {"放音乐", AppInfo.MEDIA_PLAY_PKG}, {"播一下", AppInfo.MEDIA_PLAY_PKG},
+            {"暂停", AppInfo.MEDIA_PAUSE_PKG}, {"暂停播放", AppInfo.MEDIA_PAUSE_PKG},
+            {"暂停一下", AppInfo.MEDIA_PAUSE_PKG}, {"停一下", AppInfo.MEDIA_PAUSE_PKG},
+            {"停止播放", AppInfo.MEDIA_PAUSE_PKG}, {"别放了", AppInfo.MEDIA_PAUSE_PKG},
+            {"下一首", AppInfo.MEDIA_NEXT_PKG}, {"下一曲", AppInfo.MEDIA_NEXT_PKG},
+            {"下一首歌", AppInfo.MEDIA_NEXT_PKG}, {"切歌", AppInfo.MEDIA_NEXT_PKG},
+            {"换一首", AppInfo.MEDIA_NEXT_PKG}, {"换个歌", AppInfo.MEDIA_NEXT_PKG},
+            {"上一首", AppInfo.MEDIA_PREV_PKG}, {"上一曲", AppInfo.MEDIA_PREV_PKG},
+            {"上一首歌", AppInfo.MEDIA_PREV_PKG}, {"前一首", AppInfo.MEDIA_PREV_PKG},
+            // 静音是**切换**：说一次静音，再说一次恢复（和「深浅模式」一个套路）。
+            // 「打开声音 / 开声音」也得单独登记：「打开」会被 strip 剥成「声音」，剥完反而匹配不上。
+            {"静音", AppInfo.MEDIA_MUTE_PKG, "已静音"},
+            {"静音模式", AppInfo.MEDIA_MUTE_PKG, "已静音"},
+            {"关声音", AppInfo.MEDIA_MUTE_PKG, "已静音"},
+            {"关闭声音", AppInfo.MEDIA_MUTE_PKG, "已静音"},
+            {"声音关掉", AppInfo.MEDIA_MUTE_PKG, "已静音"},
+            {"取消静音", AppInfo.MEDIA_MUTE_PKG, "已恢复声音"},
+            {"恢复声音", AppInfo.MEDIA_MUTE_PKG, "已恢复声音"},
+            {"开声音", AppInfo.MEDIA_MUTE_PKG, "已恢复声音"},
+            {"打开声音", AppInfo.MEDIA_MUTE_PKG, "已恢复声音"},
     };
 
     /** 说「打开 X」时前面那串废话，长的排前面（先剥长的，避免只剥掉「打开」留下「一下XX」） */
@@ -85,12 +121,16 @@ public final class VoiceIntent {
 
         // 1) 内置指令：只认整句相等。带「打开」前缀的（"打开应用列表"）先剥前缀再比一次，
         //    但不做模糊 —— "返回"两个字被包含在某个应用名里时不应该执行按键。
+        //    第一轮额外接受「只剥掉尾巴」的形式：「打开声音吧」「暂停一下啊」也得命中，
+        //    否则「打开」被当废话剥掉之后「声音」就再也对不上了。
+        final String tailStripped = stripTail(t);
         for (String[] c : COMMANDS) {
-            if (c[0].equals(t)) {
+            if (c[0].equals(t) || c[0].equals(tailStripped)) {
                 r.kind = CMD;
                 r.pkg = c[1];
                 r.label = c[0];
                 r.text = t;
+                r.reply = c.length > 2 ? c[2] : null;
                 return r;
             }
         }
@@ -102,6 +142,7 @@ public final class VoiceIntent {
                 r.kind = CMD;
                 r.pkg = c[1];
                 r.label = c[0];
+                r.reply = c.length > 2 ? c[2] : null;
                 return r;
             }
         }
@@ -296,6 +337,23 @@ public final class VoiceIntent {
             if (pw.equals(p) || distance(pw, p, 2) <= 2) return s.substring(n);
             // 流式只出了前半截（≥2 字）：按拼音前缀剥
             if (pw.startsWith(p)) return s.substring(n);
+        }
+        return s;
+    }
+
+    /** 只剥后缀（吧 / 啊 / 一下 / 应用…），保留「打开」这类前缀 */
+    private static String stripTail(String t) {
+        String s = t;
+        boolean changed = true;
+        int guard = 0;
+        while (changed && guard++ < 4) {
+            changed = false;
+            for (String p : SUFFIXES) {
+                if (s.length() > p.length() && s.endsWith(p)) {
+                    s = s.substring(0, s.length() - p.length());
+                    changed = true;
+                }
+            }
         }
         return s;
     }
@@ -677,7 +735,8 @@ public final class VoiceIntent {
         // 优图布 该靠 YouTube 的谐音别名命中（模型吐不出英文字母）
         String[] cases = {"打开高德地图", "高德", "导航", "来点音乐", "网易云", "qq",
                 "打开应用列表", "返回", "息屏", "切换到百度地图",
-                "网亦云", "打开酷够", "比里比里", "优图布"};
+                "网亦云", "打开酷够", "比里比里", "优图布",
+                "暂停", "下一首", "静音", "打开声音吧"};
         StringBuilder b = new StringBuilder();
         for (String c : cases) {
             Result r = parse(c, apps, aliases);

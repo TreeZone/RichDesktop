@@ -1373,7 +1373,9 @@ public final class Voice {
             final String pkg = r.pkg;
             final String label = r.label;
             beep(false);
-            say(r.kind == VoiceIntent.APP ? "好的，打开" + label : "好的");
+            // 指令可以自带回话（静音 / 取消静音要让人知道结果），其余一句「好的」
+            say(r.kind == VoiceIntent.APP ? "好的，打开" + label
+                    : (r.reply != null ? r.reply : "好的"));
             pushState("→ " + label, shown);
             ui.post(() -> {
                 Host hh = host;

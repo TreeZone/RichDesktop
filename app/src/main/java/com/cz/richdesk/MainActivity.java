@@ -2473,6 +2473,24 @@ public class MainActivity extends AppCompatActivity
             showVolumeHud(Keys.volume(this, true), true);
         } else if (AppInfo.VOL_DOWN_PKG.equals(pkg)) {
             showVolumeHud(Keys.volume(this, false), false);
+        } else if (AppInfo.MEDIA_PLAY_PKG.equals(pkg)) {
+            Media.play(this);
+        } else if (AppInfo.MEDIA_PAUSE_PKG.equals(pkg)) {
+            Media.pause(this);
+        } else if (AppInfo.MEDIA_NEXT_PKG.equals(pkg)) {
+            Media.next(this);
+        } else if (AppInfo.MEDIA_PREV_PKG.equals(pkg)) {
+            Media.prev(this);
+        } else if (AppInfo.MEDIA_MUTE_PKG.equals(pkg)) {
+            // 静音是切换：说一次静音，再说一次恢复。语音播报这时自己也听不见了，
+            // 所以除了 toast 再浮一个音量条，让用户看得到当前音量。
+            Boolean muted = Media.toggleMute(this);
+            if (muted != null) {
+                toast(muted ? "已静音" : "已恢复声音");
+                showVolumeHud(Media.musicVolume(this), !muted);
+            } else {
+                toast("这台车机不允许改音量");
+            }
         }
     }
 

@@ -29,6 +29,17 @@ public class AppInfo {
     public static final String VOL_UP_PKG = "pipdesk://vol-up";
     /** 伪包名：音量减 */
     public static final String VOL_DOWN_PKG = "pipdesk://vol-down";
+    /*
+     * 下面五个是**只给语音用**的媒体控制伪包名（应用列表 / Dock 里不出现）：
+     * 播报式操作放按钮上没有意义，但「说一句就能控制」很实用。
+     * 走的是和其它内置快捷方式同一条 runBuiltin() 分发，见 Media.java。
+     */
+    public static final String MEDIA_PLAY_PKG = "pipdesk://media-play";
+    public static final String MEDIA_PAUSE_PKG = "pipdesk://media-pause";
+    public static final String MEDIA_NEXT_PKG = "pipdesk://media-next";
+    public static final String MEDIA_PREV_PKG = "pipdesk://media-prev";
+    /** 静音切换（说「静音」静音，再说一次恢复） */
+    public static final String MEDIA_MUTE_PKG = "pipdesk://media-mute";
     /**
      * 伪包名：语音助手（点一下开始听，说完自动收工；常驻唤醒词在设置里开）。
      * 它单独占一格快捷方式，是因为语音最需要「一眼能看到、一下能按到」，
