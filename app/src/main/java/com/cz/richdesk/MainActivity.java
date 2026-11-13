@@ -598,12 +598,8 @@ public class MainActivity extends AppCompatActivity
         appliedPaneCount = Prefs.getPaneCount(this);
         appliedOrientation = getResources().getConfiguration().orientation;
         appliedDpi = Prefs.getDpi(this);
-        // 「屏内渲染分辨率」入口已隐藏（部分车机上会让画中画停在旧尺寸、画面缩左上角），
-        // 旧配置里残留的 75/50 一律拉回 100，免得用户以为功能藏了效果还在。
-        if (Prefs.getRenderScale(this) != 100) {
-            Prefs.setRenderScale(this, 100);
-            Log.i("PipDesk", "屏内渲染分辨率已停用，强制回 100%");
-        }
+        // 「屏内渲染分辨率」重新开放：比例现在记在虚拟屏槽位上，比例一变就换屏重建，
+        // 不会再出现"画面缩到左上角"（根因是 resize 不会让屏内应用重新 measure）。
         appliedRenderScale = Prefs.getRenderScale(this) / 100f;
         appliedPipCorner = Prefs.getPipCorner(this);
         appliedDockCorner = Prefs.getDockCorner(this);

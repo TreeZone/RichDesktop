@@ -257,8 +257,16 @@ public class SettingsActivity extends AppCompatActivity {
                 }, v -> v + " 屏");
         seek("画中画 DPI", Prefs.DPI_MIN, Prefs.DPI_MAX, 20, Prefs.getDpi(this),
                 v -> Prefs.setDpi(this, v), String::valueOf);
-        // 「屏内渲染分辨率」「车机系统分辨率修复」等显示相关入口已全部去掉：
-        // 前者在部分车机上会让画面缩左上角，后者属于系统设置不该由桌面管。
+        // 屏内渲染分辨率：虚拟屏按这个比例建（像素和 dpi 同比例缩），屏内应用看到的
+        // dp 尺寸与 100% 完全一致，只是实际渲染的像素变少、再由纹理放大铺满 ——
+        // 是"全屏但略软"，不是"画面变小"。
+        //
+        // 早先这一项会把画面缩到左上角，原因不是分辨率本身，而是改比例时走了
+        // VirtualDisplay#resize（屏内应用不会重新 measure）。现在比例记在虚拟屏槽位上，
+        // 比例一变就换屏重建，应用第一次测量就是正确尺寸。详见 PipPane.createDisplay()。
+        seek("屏内渲染分辨率（越低越省 GPU）", 50, 100, 10, Prefs.getRenderScale(this),
+                v -> Prefs.setRenderScale(this, v), v -> v + "%");
+        // 「车机系统分辨率修复」等显示相关入口已去掉：属于系统设置，不该由桌面管。
         // 圆角只有一套：改这里画中画和 Dock 一起变（需求 1）
         seek("圆角（画中画 + Dock）", 0, Prefs.CORNER_MAX, 1, Prefs.getPipCorner(this),
                 v -> Prefs.setPipCorner(this, v), v -> v + " dp");

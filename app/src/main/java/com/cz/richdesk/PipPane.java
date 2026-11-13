@@ -736,6 +736,24 @@ public class PipPane {
         //    displayId 不变，屏内应用的 task 就不会被系统搬走，新 TextureView 接上就有画面。
         //    这就是"不再卡死"的关键：重建 pane 不再是"换一块屏"，只是"换一根线"。
         PipDisplays.Slot reuse = PipDisplays.slot(key());
+        // 渲染比例变了 → 这块屏必须换，**不能 resize**。
+        //
+        // 这就是当年「画面缩到左上角」的真正原因：比例改成 75% 后走的是
+        // VirtualDisplay#resize，它只改输出 buffer 的像素尺寸，屏内应用收不到
+        // 新的窗口尺寸（不会重新 measure），于是仍按旧像素画，整块画面缩在左上角。
+        // 现在把「比例」记进槽位：只要和当前比例不同，直接丢掉旧屏、按新尺寸新建，
+        // 应用在新屏上第一次 measure 就是正确尺寸 —— 不会再缩。
+        // 代价是屏内应用会被重新拉起一次（这本来就是"性能设置"，改一次可接受）。
+        if (reuse != null && Math.abs(reuse.scale - renderScale) > 0.001f) {
+            Log.i(TAG, "pane " + index + " 屏内渲染比例 " + reuse.scale + " → " + renderScale
+                    + "：换屏重建（resize 不会让屏内应用重新测量）");
+            FileLog.append("RENDERSCALE pane=" + index + " " + reuse.scale + "→" + renderScale
+                    + " 换屏重建");
+            PipDisplays.release(key());
+            reuse = null;
+            vd = null;              // 旧屏已真释放，别让后面的兜底路径读到悬垂引用
+            displayId = -1;
+        }
         if (reuse != null) {
             vd = reuse.vd;
             displayId = reuse.vd.getDisplay() == null ? -1 : reuse.vd.getDisplay().getDisplayId();
@@ -813,6 +831,7 @@ public class PipPane {
             s.w = w;
             s.h = h;
             s.dpi = dpi;
+            s.scale = renderScale;      // 记下建屏比例：之后比例变了要换屏，不能 resize
             PipDisplays.putOwned(key(), s, ownerToken);
             ignoreOrientationRequest(displayId);
             syncAnchor();

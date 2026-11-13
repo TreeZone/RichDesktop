@@ -45,6 +45,15 @@ final class PipDisplays {
          */
         Surface surface;
         /**
+         * 建这块屏时用的「屏内渲染分辨率」比例（1.0 = 满像素）。
+         *
+         * 为什么必须记：比例变了意味着这块屏的「像素 ↔ dp」换算整个变了。
+         * 这时候**不能**走 {@code VirtualDisplay#resize}（那只是改 buffer 尺寸，
+         * 屏内应用不会重新 measure，会停在旧像素尺寸上 —— 就是"画面缩到左上角"）。
+         * 只能丢掉这块屏、按新比例全新建一块。见 {@link PipPane#createDisplay()}。
+         */
+        float scale = 1f;
+        /**
          * 当前绑定这根 surface 的 pane 实例标识（每个 PipPane 构造时取一次，单调递增）。
          *
          * 为什么必须有它：桌面重建时新旧两个 MainActivity 会**同时**存在一小段时间
