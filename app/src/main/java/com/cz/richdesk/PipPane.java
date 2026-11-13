@@ -113,29 +113,46 @@ public class PipPane {
     private View veil;
     /** 遮罩已挂"等新帧"的等待中（等到了就淡出） */
     private boolean veilWaiting;
+    /**
+     * 「最近一次虚拟屏 resize 时刻」的纹理出帧计数。
+     *
+     * 撤遮罩**只看尺寸对齐是不够的**：resize 只改虚拟屏像素，屏内应用还要重新
+     * measure/layout。这段时间里 buffer 和虚拟屏的尺寸已经一致（`isSurfaceAligned`
+     * 早就为真），但里面画的还是重排前的旧内容 —— 这时候撤遮罩，看到的就是"闪一下"。
+     * 所以再加一条：resize 之后必须又出了 {@link #VEIL_MIN_FRAMES} 帧新画面。
+     * 窗口尺寸变了一定会重绘，静态页面也满足，不会白等兜底。
+     */
     private long veilFrameBase;
     /** 遮罩代次：淡出动画结束时用它判断"这期间有没有又盖上新的" */
     private int veilGen;
     /**
-     * 松手后遮罩**最少**再盖这么久。
+     * 盖上遮罩后**最少**再盖这么久。
      *
-     * 这个时间必须覆盖「防抖 180ms → VirtualDisplay.resize → 屏内应用重新 measure/layout」，
-     * 少于它就会在应用还没重排完时把遮罩撤掉 —— 撤的那一帧露出的正是中间态，
-     * 也就是用户看到的"松手闪一下"。
+     * 这个时间必须覆盖「防抖 180ms → VirtualDisplay.resize → 屏内应用重新
+     * measure/layout/首帧重绘」。420ms 在手机/车机上都不够：交换双画时尺寸
+     * 一次换两块屏，重排明显更慢，经常在应用还没画完就淡出 → 用户仍能看到闪烁。
+     * 按用户要求放宽到 760ms；对齐 + 新帧两个条件任一不满足还会继续等。
      */
-    private static final long VEIL_MIN_MS = 420;
+    private static final long VEIL_MIN_MS = 760;
     /** 对齐完成后再等这么久兜底淡出（静态页面可能一直不出新帧） */
-    private static final long VEIL_MAX_WAIT_MS = 900;
+    private static final long VEIL_MAX_WAIT_MS = 1100;
+    /** resize 之后至少还要出这么多帧**新**画面才允许撤（1 帧可能还是重排前的旧内容） */
+    private static final int VEIL_MIN_FRAMES = 2;
+    /** 淡出时长：稍微拉长一点，渐变柔和不显跳变 */
+    private static final long VEIL_FADE_MS = 220;
     private final Runnable veilWaitTask = new Runnable() {
         @Override public void run() {
-            if (isSurfaceAligned()) {
+            if (veilReady()) {
                 hideVeilNow();
             } else {
                 veilWaiting = true;
-                veilFrameBase = frames;
             }
         }
     };
+    /** 尺寸对齐 **且** resize 之后已经出了足够多帧新画面 → 才允许撤遮罩 */
+    private boolean veilReady() {
+        return isSurfaceAligned() && (frames - veilFrameBase) >= VEIL_MIN_FRAMES;
+    }
     private final Runnable veilTimeoutTask = new Runnable() {
         @Override public void run() { hideVeilNow(); }
     };
@@ -317,7 +334,7 @@ public class PipPane {
                 }
                 frames++;
                 lastFrameAt = now;
-                if (veilWaiting && frames > veilFrameBase && isSurfaceAligned()) hideVeilNow();
+                if (veilWaiting && veilReady()) hideVeilNow();
             }
         });
 
@@ -496,6 +513,8 @@ public class PipPane {
         if (veil == null) return;
         veilGen++;
         veilWaiting = false;
+        // 从这里开始算"新画面"：撤遮罩前要求 resize 之后再出 VEIL_MIN_FRAMES 帧
+        veilFrameBase = frames;
         root.removeCallbacks(veilTimeoutTask);
         veil.animate().cancel();
         veil.setVisibility(View.VISIBLE);
@@ -506,7 +525,8 @@ public class PipPane {
      * 等新画面真的出来一帧再淡出遮罩。
      *
      * 不能按固定时长撤：屏内应用重排的时间不可控（车机上 200ms~1s 都见过），
-     * 撤早了就又露出中间态。所以等 `frames` 增加，同时留一个 900ms 兜底
+     * 撤早了就又露出中间态。所以先干等 VEIL_MIN_MS，再要求
+     * 「尺寸对齐 + resize 之后出过新帧」，同时留 1100ms 兜底
      * （静态页面可能一直不刷新帧）。
      */
     public void hideVeilWhenReady() {
@@ -536,7 +556,11 @@ public class PipPane {
         if (veil == null) return;
         veil.animate().cancel();
         final int gen = veilGen;
-        veil.animate().alpha(0f).setDuration(180)
+        if (PipDebug.VERBOSE) {
+            Log.i(TAG, "pane " + index + " 撤遮罩（对齐=" + isSurfaceAligned()
+                    + " 新帧=" + (frames - veilFrameBase) + "）");
+        }
+        veil.animate().alpha(0f).setDuration(VEIL_FADE_MS)
                 .withEndAction(() -> {
                     if (gen == veilGen) veil.setVisibility(View.GONE);
                 })
@@ -664,6 +688,8 @@ public class PipPane {
             resizeMethod.invoke(vd, w, h, density);
             displayW = w;
             displayH = h;
+            // 屏内应用从这一刻才开始按新像素尺寸重排：新帧计数从这里重新算
+            veilFrameBase = frames;
             Log.i(TAG, "pane " + index + " resize -> " + w + "x" + h + " dpi=" + density);
             return true;
         } catch (Throwable t) {
