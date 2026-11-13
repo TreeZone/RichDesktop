@@ -278,20 +278,27 @@ public class PipPane {
     }
 
     /**
-     * 调整屏内渲染分辨率比例（设置页「屏内渲染分辨率」）。
-     * 建好屏后原地 resize + 改 buffer；比例没变或屏还没建就只记下来，
-     * 下次 createDisplay/onSurfaceTextureAvailable 自然按新比例走。
+     * 调整屏内渲染分辨率比例。
+     *
+     * **只改字段，不在线重建虚拟屏** —— 这是车机上实测过的硬结论：
+     * 无论走 `VirtualDisplay#resize` 还是"释放旧屏 + 建新屏 + 重新 startActivity"，
+     * 屏内应用都不会重新 measure：
+     *   · resize 只改输出 buffer 的像素尺寸，应用收不到新的窗口尺寸；
+     *   · 换屏后 displayId 变了，但应用 activity 实例还挂在旧屏的 token 上，
+     *     `startActivity` 走的是 START_DELIVERED_TO_TOP（只顶到前台、不 reparent），
+     *     除非 force-stop 成功把进程杀掉重来 —— 而这条在这台 ROM 上不稳定。
+     * 结果就是：比例调小 → 应用还按旧像素画 → 画面缩在左上角；调大 → 显示不全。
+     *
+     * 所以比例只在**建屏那一刻**生效（{@link #buf} / {@link #density()} 读它），
+     * 设置页那边明确提示"重启桌面后生效"并提供一键重启。
+     * 重启后 {@link PipPane} 构造时会重新读 Prefs，建出来的屏从一开始就是正确尺寸，
+     * 应用第一次测量就是对的 —— 不会再有"缩左上角"。
      */
     public void setRenderScale(float s) {
         s = Math.max(0.5f, Math.min(1f, s));
         if (Math.abs(s - renderScale) < 0.001f) return;
         renderScale = s;
-        Log.i(TAG, "pane " + index + " renderScale=" + renderScale);
-        if (vd == null || surfaceW <= 0 || surfaceH <= 0) return;
-        // 像素和 dpi 同时变：原地 resize 实测在这台车机上会让屏内应用卡在旧尺寸
-        // （只在左上角画自己那块，看起来就是「画面等比变小」）。重建虚拟屏才行，
-        // 应用会被重新拉起（这一项本来也是「性能设置」，改一次就够）。
-        scheduleRecreate();
+        Log.i(TAG, "pane " + index + " renderScale=" + renderScale + "（下次建屏生效）");
     }
 
     /**

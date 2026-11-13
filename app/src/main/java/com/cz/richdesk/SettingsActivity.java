@@ -266,6 +266,10 @@ public class SettingsActivity extends AppCompatActivity {
         // 比例一变就换屏重建，应用第一次测量就是正确尺寸。详见 PipPane.createDisplay()。
         seek("屏内渲染分辨率（越低越省 GPU）", 50, 100, 10, Prefs.getRenderScale(this),
                 v -> Prefs.setRenderScale(this, v), v -> v + "%");
+        // 这一项只能靠「重新建屏」生效：运行中改比例会留下中间态 ——
+        // 调小则屏内应用还按旧像素画（缩在左上角），调大则显示不全。
+        // 根因是车机上 resize / 换屏都不会让屏内应用重新 measure（详见 PipPane.setRenderScale）。
+        addRestartHint();
         // 「车机系统分辨率修复」等显示相关入口已去掉：属于系统设置，不该由桌面管。
         // 圆角只有一套：改这里画中画和 Dock 一起变（需求 1）
         seek("圆角（画中画 + Dock）", 0, Prefs.CORNER_MAX, 1, Prefs.getPipCorner(this),
@@ -1164,6 +1168,52 @@ public class SettingsActivity extends AppCompatActivity {
             @Override public void onStopTrackingTouch(SeekBar s) { }
         });
         return c;
+    }
+
+    /**
+     * 「改完要重启桌面才生效」的提示行 + 一键重启。
+     *
+     * 只给「必须重新建屏/重建进程才生效」的设置项用（目前是屏内渲染分辨率）。
+     * 不挂在这类项上的普通设置都是即时生效的，不需要这条。
+     */
+    private void addRestartHint() {
+        TextView t = new TextView(this);
+        t.setText("改完需重启桌面才生效　点这里立即重启");
+        t.setTextSize(12);
+        t.setTextColor(Ui.tintDim());
+        int pad = Ui.dp(this, 6);
+        t.setPadding(0, pad, 0, pad);
+        t.setGravity(Gravity.CENTER);
+        t.setOnClickListener(v -> restartDesktopNow());
+        content.addView(t);
+    }
+
+    /**
+     * 重启桌面。
+     *
+     * 桌面是默认 HOME 时直接杀进程最彻底：系统会立刻把桌面重新拉起，虚拟屏和屏内应用
+     * 全部从头建一遍，比例一次就对，绝不会出现"缩左上角"的中间态。
+     *
+     * 不是 HOME（用户还在用原车桌面）时**不能**杀进程 —— 杀完没人拉起它，桌面就没了。
+     * 这种情况只提示手动重启。
+     */
+    private void restartDesktopNow() {
+        boolean home = false;
+        try {
+            android.content.Intent i = new android.content.Intent(
+                    android.content.Intent.ACTION_MAIN)
+                    .addCategory(android.content.Intent.CATEGORY_HOME);
+            android.content.pm.ResolveInfo ri = getPackageManager().resolveActivity(i, 0);
+            home = ri != null && ri.activityInfo != null
+                    && getPackageName().equals(ri.activityInfo.packageName);
+        } catch (Throwable ignored) { }
+        if (!home) {
+            toast("当前不是默认桌面，请手动重启桌面");
+            return;
+        }
+        toast("正在重启桌面…");
+        content.postDelayed(() -> android.os.Process.killProcess(android.os.Process.myPid()),
+                400);
     }
 
     private static int clamp(int v, int lo, int hi) {

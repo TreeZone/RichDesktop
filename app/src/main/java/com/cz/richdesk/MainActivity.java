@@ -3356,12 +3356,13 @@ public class MainActivity extends AppCompatActivity
             pip.setDpi(dpi);
             appliedDpi = dpi;
         }
-        // 屏内渲染分辨率（性能设置）：改动后原地 resize 虚拟屏
-        float renderScale = Prefs.getRenderScale(this) / 100f;
-        if (Math.abs(renderScale - appliedRenderScale) > 0.001f) {
-            pip.setRenderScale(renderScale);
-            appliedRenderScale = renderScale;
-        }
+        // 屏内渲染分辨率：**只在建屏那一刻生效**（PipPane 构造时读 Prefs）。
+        //
+        // 不在线 apply。车机实测：resize 不会让屏内应用重新测量；换屏后 activity 实例
+        // 还挂在旧 display 上，startActivity 只做 START_DELIVERED_TO_TOP，也不 reparent。
+        // 两种做法都只会留下一个中间态 —— 调小缩在左上角、调大显示不全。
+        // 设置页那边会提示"重启桌面后生效"，并提供一键重启。
+        appliedRenderScale = Prefs.getRenderScale(this) / 100f;
         // 圆角只有一套：画中画和 Dock 一起变（需求：调画中画圆角要同时改 Dock）
         if (pipCorner != appliedPipCorner) {
             pip.setCorner(pipCorner);
