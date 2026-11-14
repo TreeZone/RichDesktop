@@ -204,8 +204,16 @@ final class VoiceAsr {
             c.setDecodingMethod("greedy_search");
 
             c.setEnableEndpoint(true);
-            // 端点规则用默认值：说完 ~1.2s 静音就断句，单句上限 20s。
-            // 车机噪声大时"说完不等"比"等太久"更讨人厌，所以不把静音阈值调长。
+            // 端点规则不能用默认值：默认出字后静音 1.2s 就断句，用户反映
+            // 「指令还没说完它就着急结束了」——长指令中间想词、喘口气都会停顿
+            // 超过 1.2 秒，直接被当成说完了。放宽为：
+            //   rule1 说话中停顿 2.5s 才允许断句（原 1.2s）——真正的元凶
+            //   rule2 全程静音 3.6s 断（等人说话阶段的兜底，原 2.4s）
+            //   rule3 单句上限 30s（原 20s，长指令别被腰斩）
+            com.k2fsa.sherpa.onnx.EndpointConfig ep = c.getEndpointConfig();
+            ep.setRule1(new com.k2fsa.sherpa.onnx.EndpointRule(true, 2.5f, 0f));
+            ep.setRule2(new com.k2fsa.sherpa.onnx.EndpointRule(false, 3.6f, 0f));
+            ep.setRule3(new com.k2fsa.sherpa.onnx.EndpointRule(true, 0f, 30f));
 
             OnlineRecognizer r = filesMode
                     ? new OnlineRecognizer(null, c)
