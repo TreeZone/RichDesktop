@@ -203,28 +203,26 @@ final class VoiceAsr {
 
             c.setEnableEndpoint(true);
             /*
-             * 【端点调快，0.23.47】sherpa 默认 rule2 = 1.2s 静音 + ≥0.6s 语音，
-             * 也就是用户说完最后两个字，还要**干等 1.2 秒**才断句执行。
-             * 中文指令就 2~4 个字，这个 1.2 秒就是体感上"反应慢"的全部来源。
+             * 【端点节奏，0.23.48 再调】0.23.47 为了反应快把断句压到 0.8s，
+             * 用户实测反馈「指令还没说完它就着急结束」——想词、喘口气超过 0.8s
+             * 就被切成两句提前执行了。往回放宽，两边都留余地：
              *
-             * 现在：rule2 收到 0.8s，同时把「至少 0.6s 语音」降到 0.3s ——
-             * 不降的话像「暂停」「静音」这种半秒级的短词根本走不到 rule2，
-             * 只能等 rule1 的 2.4 秒，短指令反而最慢。
-             * rule1 也从 2.4s 收到 1.6s（它是"必须有语音"的那条，兜住短词）。
+             *   rule1（有语音后的中途停顿）：1.6s → 2.5s
+             *     长指令中间想词很常见，2.5 秒内的停顿不当成说完了。
+             *   rule2（说完收尾）：0.8s → 1.5s，minUtteranceLength 保持 0.3s
+             *     「暂停」「静音」这类半秒级短词仍走得到 rule2，不会退化成
+             *     只能等 rule1；1.5s 的收尾比 0.8s 稳，又不至于让反应明显变钝。
+             *   rule3（单句上限 20s 强切）：保持默认，长指令靠它兜底。
              *
-             * rule3 是**单句上限**（语音满 20s 强切），保持默认不动：
-             * 长指令（"打开网易云音乐然后播放每日推荐"）需要它。
-             *
-             * 风险：说话中途停顿超过 0.8s（想词）会被切成两句。中文短指令可接受，
-             * 真在车机上觉得太急，把这两个数调回 1.2 / 2.4 即可。
+             * 如果还想更宽：rule1 → 3.0，rule2 → 2.0（再大反应就真的慢了）。
              */
             com.k2fsa.sherpa.onnx.EndpointConfig ep = c.getEndpointConfig();
             if (ep != null) {
                 com.k2fsa.sherpa.onnx.EndpointRule r1 = ep.getRule1();
-                if (r1 != null) r1.setMinTrailingSilence(1.6f);
+                if (r1 != null) r1.setMinTrailingSilence(2.5f);
                 com.k2fsa.sherpa.onnx.EndpointRule r2 = ep.getRule2();
                 if (r2 != null) {
-                    r2.setMinTrailingSilence(0.8f);
+                    r2.setMinTrailingSilence(1.5f);
                     r2.setMinUtteranceLength(0.3f);
                 }
             }

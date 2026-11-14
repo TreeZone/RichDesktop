@@ -66,14 +66,17 @@ public final class Voice {
     private static final long LISTEN_MAX_MS = 12_000L;
     /**
      * 硬闸：从这一轮开始（含准备/识别/匹配）算起，超过这个时长无条件收工。
-     * 5 秒是用户实测定下来的：说话指令一般 2~3 秒内说完，再挂着只会挡视线。
+     * 10 秒：说话指令一般 2~3 秒内说完，但**长指令**（报应用全名、连续几个动作）
+     * 实测会到 8 秒往上，原来的 5 秒（有字 6 秒）把它们拦腰砍断——
+     * 用户听到的是「指令还没说完，助手已经开跑了」。
+     * 10 秒仍远小于 LISTEN_MAX_MS 叠加各轮 TTS 的总时长，不会退化成"永远挂着"。
      *
      * 为什么需要它：3 秒「没有新的识别文字」只能覆盖 S_LISTEN 一种状态，而且噪音里
      * ASR 会不停吐出**不同的**乱码字（每次都"新"，计时器一直被续），端点也会把
      * 12 秒上限无限重置。用户看到的就是"识别不到字也不退出、卡片一直挂着"。
      * 这条闸不依赖识别结果，只看时钟，任何状态都逃不掉。
      */
-    private static final long HARD_MAX_MS = 5_000L;
+    private static final long HARD_MAX_MS = 10_000L;
     /** 自我回采最多容忍几次：超过就不是回采了，别再无限续命 */
     private static final int MAX_ECHO_HITS = 2;
     /**
@@ -85,9 +88,11 @@ public final class Voice {
      * 旧值是 2500ms 且从 TTS 念完（+1100ms）才开始算，实际要 3.6 秒才收，
      * 而且超时走 finish() →「没听清，再说一遍」+ 1.2 秒延迟收尾，不是「直接退出」。
      * 现在：本轮一个有用字都没出现过 → 满 3 秒直接 cancelListening() 退出；
-     * 已经出过字但 3 秒没有新字 → 视为说完，走 finish() 提交执行。
+     * 已经出过字但 5 秒没有新字 → 视为说完，走 finish() 提交执行。
+     * （出字后的等待从 3s 放宽到 5s：长指令中途停顿想词很常见，
+     *   3 秒会被用户感知成「指令还没说完它就收了」。0.23.48）
      */
-    private static final long NO_TEXT_TIMEOUT_MS = 3_000L;
+    private static final long NO_TEXT_TIMEOUT_MS = 5_000L;
     /** 报完候选后再给多久说「第几个」（比普通聆听短一点，别让卡片一直挂着） */
     private static final long PICK_WAIT_MS = 8_000L;
     /** 候选每页条数：语音序号只到 9，多了靠翻页；列表本身不截断 */
